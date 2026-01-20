@@ -36,7 +36,7 @@ pip install turbine-py-client
 Or install from source:
 
 ```bash
-git clone https://github.com/turbine/turbine-py-client.git
+git clone https://github.com/ojo-network/turbine-py-client.git
 cd turbine-py-client
 pip install -e .
 ```
@@ -175,8 +175,6 @@ turbine_py_client/
 
 ### Design Patterns
 
-Following Polymarket's proven patterns:
-
 1. **Modular Authentication** - Separate concerns for EIP-712 signing vs Bearer tokens
 2. **Builder Pattern** - OrderBuilder encapsulates order creation and signing
 3. **Dataclass Types** - Clean, serializable data structures with type hints
@@ -224,12 +222,6 @@ Some endpoints require Ed25519 bearer tokens:
 ```python
 # Token format: base64url(payload).base64url(signature)
 # Payload: {"kid": keyId, "ts": timestamp, "n": nonce}
-```
-
-**Generate API Keys:**
-```bash
-# Use Turbine CLI to generate keys
-./turbine genkey --name "my-market-maker" --owner 0x...
 ```
 
 ---
@@ -635,7 +627,7 @@ for pos in positions:
 
 ```bash
 # Clone repo
-git clone https://github.com/turbine/turbine-py-client.git
+git clone https://github.com/ojo-network/turbine-py-client.git
 cd turbine-py-client
 
 # Create virtual environment
@@ -716,5 +708,4 @@ MIT License - see [LICENSE](LICENSE)
 ## Links
 
 - [Turbine](https://turbine.markets)
-- [Request API Access](mailto:engineering@turbine.markets)
-- [GitHub Issues](https://github.com/turbine/turbine-py-client/issues)
+- [GitHub Issues](https://github.com/ojo-network/turbine-py-client/issues)

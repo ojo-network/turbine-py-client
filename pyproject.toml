@@ -46,10 +46,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://turbine.markets"
-Documentation = "https://docs.turbine.markets"
-Repository = "https://github.com/turbine/turbine-py-client"
-Issues = "https://github.com/turbine/turbine-py-client/issues"
+Homepage = "https://turbinefi.com"
+Documentation = "https://docs.ojolabs.xyz"
+Repository = "https://github.com/ojo-network/turbine-py-client"
+Issues = "https://github.com/ojo-network/turbine-py-client/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
