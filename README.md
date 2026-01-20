@@ -9,25 +9,21 @@ This client provides a clean, typed interface for:
 - Submitting orders to the Turbine orderbook
 - Managing positions and tracking fills
 - Subscribing to real-time orderbook updates via WebSocket
-- Multi-chain support (Base Sepolia, Polygon, etc.)
-
-Inspired by [Polymarket's py-clob-client](https://github.com/Polymarket/py-clob-client).
-
----
 
 ## Table of Contents
 
 1. [Installation](#installation)
-2. [Quick Start](#quick-start)
-3. [Architecture](#architecture)
-4. [Authentication](#authentication)
-5. [Order Management](#order-management)
-6. [Market Data](#market-data)
-7. [WebSocket Streaming](#websocket-streaming)
-8. [Data Types](#data-types)
-9. [API Reference](#api-reference)
-10. [Examples](#examples)
-11. [Development](#development)
+2. [Getting API Credentials](#getting-api-credentials)
+3. [Quick Start](#quick-start)
+4. [Architecture](#architecture)
+5. [Authentication](#authentication)
+6. [Order Management](#order-management)
+7. [Market Data](#market-data)
+8. [WebSocket Streaming](#websocket-streaming)
+9. [Data Types](#data-types)
+10. [API Reference](#api-reference)
+11. [Examples](#examples)
+12. [Development](#development)
 
 ---
 
@@ -45,18 +41,87 @@ cd turbine-py-client
 pip install -e .
 ```
 
-### Dependencies
+---
 
-- `eth-account>=0.13.0` - Ethereum account management and signing
-- `eth-utils>=4.1.1` - Ethereum utilities (keccak, address validation)
-- `httpx[http2]>=0.27.0` - HTTP client with HTTP/2 support
-- `websockets>=12.0` - WebSocket client
-- `pynacl>=1.5.0` - Ed25519 signing for bearer tokens
-- `python-dotenv>=1.0.0` - Environment variable management
+## Getting API Credentials
+
+To trade on Turbine, you need:
+
+1. **Wallet Private Key** - Your Ethereum wallet's private key for signing orders
+2. **API Key ID** - Identifier for your API key
+3. **API Private Key** - Ed25519 private key for authenticating API requests
+
+### Self-Service Registration
+
+You can register for API credentials directly using your wallet:
+
+```python
+from turbine_client import TurbineClient
+
+# Request API credentials (only need to do this once!)
+credentials = TurbineClient.request_api_credentials(
+    host="https://api.turbinefi.com",
+    private_key="your_wallet_private_key",
+)
+
+print(f"API Key ID: {credentials['api_key_id']}")
+print(f"API Private Key: {credentials['api_private_key']}")
+# SAVE THESE! The private key cannot be retrieved later.
+```
+
+This will:
+1. Sign a message with your wallet to prove ownership
+2. Generate new Ed25519 API credentials linked to your wallet
+3. Return the credentials (save the private key - it's only shown once!)
 
 ---
 
 ## Quick Start
+
+### Full Trading Example
+
+```python
+from turbine_client import TurbineClient
+from turbine_client.types import Outcome, Side
+
+# Initialize with all credentials
+client = TurbineClient(
+    host="https://api.turbinefi.com",
+    chain_id=137,  # Polygon mainnet
+    private_key="your_wallet_private_key",
+    api_key_id="your_api_key_id",
+    api_private_key="your_api_private_key",
+)
+
+# Get the latest BTC quick market
+market = client.get_quick_market("BTC")
+print(f"Market: {market.question}")
+
+# Place a limit buy order
+order = client.create_limit_buy(
+    market_id=market.market_id,
+    outcome=Outcome.YES,
+    price=500000,      # 50% (price scaled by 1e6)
+    size=1_000_000,    # 1 share (6 decimals)
+)
+
+result = client.post_order(order)
+print(f"Order submitted: {result['orderHash']}")
+
+# Check orderbook
+orderbook = client.get_orderbook(market.market_id)
+print(f"Best bid: {orderbook.bids[0].price / 10000:.2f}%")
+print(f"Best ask: {orderbook.asks[0].price / 10000:.2f}%")
+
+# Cancel the order
+client.cancel_order(
+    order_hash=result['orderHash'],
+    market_id=market.market_id,
+    side=Side.BUY,
+)
+
+client.close()
+```
 
 ### Read-Only Access (No Authentication)
 
@@ -65,8 +130,8 @@ from turbine_client import TurbineClient
 
 # Public endpoints - no auth required
 client = TurbineClient(
-    host="https://api.turbine.markets",
-    chain_id=84532  # Base Sepolia
+    host="https://api.turbinefi.com",
+    chain_id=137,
 )
 
 # Get all markets
@@ -77,54 +142,6 @@ orderbook = client.get_orderbook(market_id="0x...")
 
 # Get recent trades
 trades = client.get_trades(market_id="0x...")
-```
-
-### Trading with EIP-712 Signed Orders
-
-```python
-from turbine_client import TurbineClient, OrderArgs, Side, Outcome
-
-# Initialize with private key for order signing
-client = TurbineClient(
-    host="https://api.turbine.markets",
-    chain_id=84532,
-    private_key="0x...",  # Your wallet private key
-)
-
-# Create and sign an order
-order_args = OrderArgs(
-    market_id="0x1234...",
-    side=Side.BUY,
-    outcome=Outcome.YES,
-    price=500000,      # 50% (price scaled by 1e6)
-    size=1000000,      # 1 share (6 decimals)
-    expiration=int(time.time()) + 3600,  # 1 hour from now
-)
-
-signed_order = client.create_order(order_args)
-response = client.post_order(signed_order)
-print(f"Order submitted: {response['orderHash']}")
-```
-
-### With Bearer Token Authentication
-
-```python
-from turbine_client import TurbineClient
-
-# For authenticated endpoints (positions, user orders)
-client = TurbineClient(
-    host="https://api.turbine.markets",
-    chain_id=84532,
-    private_key="0x...",
-    api_key_id="abc123...",           # Ed25519 key ID
-    api_private_key="0x...",          # Ed25519 private key (hex)
-)
-
-# Get your positions
-positions = client.get_positions(user_address="0x...")
-
-# Get your open orders
-orders = client.get_orders(trader="0x...")
 ```
 
 ---
@@ -280,7 +297,7 @@ client.cancel_market_orders(market_id="0x...")
 markets = client.get_markets()
 
 # Filter by chain
-markets = client.get_markets(chain_id=84532)
+markets = client.get_markets(chain_id=137)
 
 # Single market
 market = client.get_market(market_id="0x...")
@@ -348,7 +365,7 @@ import asyncio
 from turbine_client import TurbineWSClient
 
 async def main():
-    ws = TurbineWSClient(host="wss://api.turbine.markets")
+    ws = TurbineWSClient(host="wss://api.turbinefi.com")
 
     async with ws.connect() as stream:
         # Subscribe to market
@@ -590,8 +607,8 @@ class SimpleMarketMaker:
 from turbine_client import TurbineClient
 
 client = TurbineClient(
-    host="https://api.turbine.markets",
-    chain_id=84532,
+    host="https://api.turbinefi.com",
+    chain_id=137,
     api_key_id="...",
     api_private_key="..."
 )
@@ -599,7 +616,7 @@ client = TurbineClient(
 # Get all positions
 positions = client.get_user_positions(
     address="0x...",
-    chain_id=84532
+    chain_id=137
 )
 
 for pos in positions:
@@ -652,10 +669,9 @@ ruff format turbine_py_client/
 
 ## Chain Configuration
 
-| Chain | Chain ID | Settlement Contract |
-|-------|----------|---------------------|
-| Base Sepolia (Testnet) | 84532 | TBD |
-| Polygon | 137 | TBD |
+| Chain | Chain ID |
+|-------|----------|
+| Polygon | 137 |
 
 ---
 
@@ -699,6 +715,6 @@ MIT License - see [LICENSE](LICENSE)
 
 ## Links
 
-- [Turbine Markets](https://turbine.markets)
-- [API Documentation](https://docs.turbine.markets)
+- [Turbine](https://turbine.markets)
+- [Request API Access](mailto:engineering@turbine.markets)
 - [GitHub Issues](https://github.com/turbine/turbine-py-client/issues)

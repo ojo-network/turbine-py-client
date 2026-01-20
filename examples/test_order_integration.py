@@ -1,38 +1,55 @@
 """
-Integration test for order signing with dynamic settlement address.
+Integration test for order signing with self-service API credential registration.
 
-This example demonstrates that the client automatically fetches the
-market's settlement address when creating orders.
+This example demonstrates:
+1. Requesting API credentials using wallet signature (self-service)
+2. Creating and signing orders
+3. Submitting orders to the API
 
-Run locally with environment variables:
-    INTEGRATION_WALLET_PRIVATE_KEY=... \
-    INTEGRATION_API_KEY_ID=... \
-    INTEGRATION_API_PRIVATE_KEY=... \
-    python examples/test_order_integration.py
+Run locally with environment variable:
+    INTEGRATION_WALLET_PRIVATE_KEY=... python examples/test_order_integration.py
 """
 
 import os
 import sys
 
 from turbine_client import TurbineClient
-from turbine_client.types import Outcome
+from turbine_client.types import Outcome, Side
 
-# Get credentials from environment variables
+HOST = "https://api.turbinefi.com"
+CHAIN_ID = 137  # Polygon mainnet
+
+# Get wallet private key from environment
 WALLET_PRIVATE_KEY = os.environ.get("INTEGRATION_WALLET_PRIVATE_KEY")
-API_KEY_ID = os.environ.get("INTEGRATION_API_KEY_ID")
-API_PRIVATE_KEY = os.environ.get("INTEGRATION_API_PRIVATE_KEY")
 
-if not all([WALLET_PRIVATE_KEY, API_KEY_ID, API_PRIVATE_KEY]):
-    print("ERROR: Missing required environment variables:")
+if not WALLET_PRIVATE_KEY:
+    print("ERROR: Missing required environment variable:")
     print("  INTEGRATION_WALLET_PRIVATE_KEY")
-    print("  INTEGRATION_API_KEY_ID")
-    print("  INTEGRATION_API_PRIVATE_KEY")
     sys.exit(1)
 
-# Create authenticated client
+print("=" * 60)
+print("STEP 1: Request API credentials (self-service)")
+print("=" * 60)
+
+credentials = TurbineClient.request_api_credentials(
+    host=HOST,
+    private_key=WALLET_PRIVATE_KEY,
+)
+print("API credentials obtained!")
+print(f"  API Key ID: {credentials['api_key_id']}")
+print(f"  API Private Key: {credentials['api_private_key'][:32]}...")
+API_KEY_ID = credentials["api_key_id"]
+API_PRIVATE_KEY = credentials["api_private_key"]
+
+print()
+
+print("=" * 60)
+print("STEP 2: Create authenticated client")
+print("=" * 60)
+
 client = TurbineClient(
-    host="https://api.turbinefi.com",
-    chain_id=137,  # Polygon mainnet
+    host=HOST,
+    chain_id=CHAIN_ID,
     private_key=WALLET_PRIVATE_KEY,
     api_key_id=API_KEY_ID,
     api_private_key=API_PRIVATE_KEY,
@@ -41,21 +58,25 @@ client = TurbineClient(
 print(f"Wallet address: {client.address}")
 print()
 
+print("=" * 60)
+print("STEP 3: Get market and create order")
+print("=" * 60)
+
 # Get a market to test with
 markets = client.get_markets()
 if not markets:
     print("No markets available")
     client.close()
-    exit(1)
+    sys.exit(1)
 
 market = markets[0]
-print(f"=== Testing with market: {market.question} ===")
-print(f"Market ID: {market.id}")
-print(f"Settlement Address: {market.settlement_address}")
+print(f"Testing with market: {market.question}")
+print(f"  Market ID: {market.id}")
+print(f"  Settlement Address: {market.settlement_address}")
 print()
 
-# Create an order - pass the settlement address from the market
-print("Creating order with market's settlement address...")
+# Create an order
+print("Creating limit buy order...")
 order = client.create_limit_buy(
     market_id=market.id,
     outcome=Outcome.YES,
@@ -64,31 +85,51 @@ order = client.create_limit_buy(
     settlement_address=market.settlement_address,
 )
 
-print(f"Order created successfully!")
-print(f"  Market ID: {order.market_id}")
+print(f"Order created!")
 print(f"  Side: {'BUY' if order.side == 0 else 'SELL'}")
 print(f"  Outcome: {'YES' if order.outcome == 0 else 'NO'}")
 print(f"  Price: {order.price / 10000:.2f}%")
 print(f"  Size: {order.size / 1_000_000:.6f} shares")
-print(f"  Nonce: {order.nonce}")
 print(f"  Order Hash: {order.order_hash}")
-print(f"  Signature: {order.signature[:20]}...")
 print()
 
-# Debug: print what we're sending
-import json
-print("Payload being sent:")
-print(json.dumps(order.to_dict(), indent=2))
-print()
+print("=" * 60)
+print("STEP 4: Submit order to API")
+print("=" * 60)
 
-# Try to post the order
-print("Submitting order to API...")
+print("Submitting order...")
 try:
     result = client.post_order(order)
     print(f"Order submitted successfully!")
-    print(f"  Result: {result}")
+    print(f"  Status: {result.get('status')}")
+    print(f"  Order Hash: {result.get('orderHash')}")
+    print(f"  Matches: {result.get('matches', 0)}")
+    order_hash = result.get("orderHash", order.order_hash)
 except Exception as e:
     print(f"Order submission failed: {e}")
+    client.close()
+    sys.exit(1)
+
+print()
+
+print("=" * 60)
+print("STEP 5: Cancel order")
+print("=" * 60)
+
+print(f"Cancelling order {order_hash[:20]}...")
+try:
+    cancel_result = client.cancel_order(
+        order_hash=order_hash,
+        market_id=market.id,
+        side=Side.BUY,
+    )
+    print(f"Order cancelled: {cancel_result}")
+except Exception as e:
+    print(f"Cancel failed (may already be filled): {e}")
+
+print()
 
 client.close()
-print("\nDone!")
+print("=" * 60)
+print("Integration test complete!")
+print("=" * 60)

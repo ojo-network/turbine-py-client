@@ -686,3 +686,100 @@ class TurbineClient:
             "amount": str(amount),
         }
         return self._http.post(ENDPOINTS["ctf_redemption"], data=data, authenticated=True)
+
+    # =========================================================================
+    # API Key Registration (Self-Service Credentials)
+    # =========================================================================
+
+    @staticmethod
+    def request_api_credentials(
+        host: str,
+        private_key: str,
+        name: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Request API credentials by proving wallet ownership.
+
+        This is a self-service endpoint that generates new API credentials
+        for a wallet address. The wallet must sign a message to prove ownership.
+
+        Args:
+            host: The API host URL (e.g., "https://api.turbinefi.com").
+            private_key: The wallet private key (for signing the auth message).
+            name: Optional friendly name for the API key.
+
+        Returns:
+            Dictionary with:
+                - api_key_id: The API key identifier
+                - api_private_key: The Ed25519 private key (save this!)
+                - message: Success message
+
+        Raises:
+            TurbineApiError: If registration fails.
+
+        Example:
+            >>> creds = TurbineClient.request_api_credentials(
+            ...     host="https://api.turbinefi.com",
+            ...     private_key="your_wallet_private_key",
+            ... )
+            >>> print(f"API Key ID: {creds['api_key_id']}")
+            >>> print(f"API Private Key: {creds['api_private_key']}")
+        """
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+
+        # Create account from private key
+        if private_key.startswith("0x"):
+            private_key = private_key[2:]
+        account = Account.from_key(private_key)
+        address = account.address
+
+        # Sign the registration message
+        message = f"Register API key for Turbine: {address}"
+        signable = encode_defunct(text=message)
+        signed = account.sign_message(signable)
+        signature = signed.signature.hex()
+
+        # Make the request
+        import httpx
+
+        url = f"{host.rstrip('/')}/api/v1/api-keys"
+        data = {
+            "address": address,
+            "signature": f"0x{signature}",
+        }
+        if name:
+            data["name"] = name
+
+        response = httpx.post(url, json=data, timeout=30.0)
+
+        if response.status_code == 409:
+            # Already has a key
+            result = response.json()
+            raise TurbineApiError(
+                f"API key already exists for {address}. Key ID: {result.get('api_key_id', 'unknown')}",
+                status_code=409,
+            )
+
+        if response.status_code != 200:
+            try:
+                error_data = response.json()
+                error_msg = error_data.get("error", response.text)
+            except Exception:
+                error_msg = response.text
+            raise TurbineApiError(
+                f"Failed to register API key: {error_msg}",
+                status_code=response.status_code,
+            )
+
+        result = response.json()
+        if not result.get("success"):
+            raise TurbineApiError(
+                f"Failed to register API key: {result.get('error', 'Unknown error')}",
+                status_code=response.status_code,
+            )
+
+        return {
+            "api_key_id": result["api_key_id"],
+            "api_private_key": result["api_private_key"],
+            "message": result.get("message", "API key created successfully"),
+        }
