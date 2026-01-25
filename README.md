@@ -2,6 +2,14 @@
 
 A Python client for market makers to interact with the Turbine CLOB (Central Limit Order Book) prediction markets API.
 
+## Claude Skill
+
+We have a Claude skill published that can help you write a trading bot. Run this command to get started:
+
+```bash
+curl -sSL turbinefi.com/claude | bash
+```
+
 ## Overview
 
 This client provides a clean, typed interface for:
