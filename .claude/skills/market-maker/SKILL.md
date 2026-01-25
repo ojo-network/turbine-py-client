@@ -137,30 +137,39 @@ TURBINE_API_PRIVATE_KEY={api_private_key}
 
 Present the user with these trading algorithm options for prediction markets:
 
-**Option 1: Simple Spread Market Maker (Recommended for beginners)**
+**Option 1: Price Action Trader (Recommended)**
+- Uses real-time BTC price from Pyth Network (same oracle Turbine uses)
+- Compares current price to the market's strike price
+- If BTC is above strike price → buy YES (bet it stays above)
+- If BTC is below strike price → buy NO (bet it stays below)
+- Adjusts confidence based on how far price is from strike
+- Best for: Beginners, following price momentum
+- Risk: Medium - follows current price action
+
+**Option 2: Simple Spread Market Maker**
 - Places bid and ask orders around the mid-price with a fixed spread
 - Best for: Learning the basics, stable markets
 - Risk: Medium - can accumulate inventory in trending markets
 
-**Option 2: Inventory-Aware Market Maker**
+**Option 3: Inventory-Aware Market Maker**
 - Adjusts quotes based on current position to reduce inventory risk
 - Skews prices to encourage trades that reduce position
 - Best for: Balanced exposure, risk management
 - Risk: Lower - actively manages inventory
 
-**Option 3: Momentum-Following Trader**
+**Option 4: Momentum-Following Trader**
 - Detects price direction from recent trades
 - Buys when momentum is up, sells when momentum is down
 - Best for: Trending markets, breakouts
 - Risk: Higher - can be wrong on reversals
 
-**Option 4: Mean Reversion Trader**
+**Option 5: Mean Reversion Trader**
 - Fades large moves expecting price to revert
 - Buys after dips, sells after spikes
 - Best for: Range-bound markets, overreactions
 - Risk: Higher - can fight strong trends
 
-**Option 5: Probability-Weighted Trader**
+**Option 6: Probability-Weighted Trader**
 - Uses distance from 50% as a signal
 - Bets on extremes reverting toward uncertainty
 - Best for: Markets with overconfident pricing
@@ -197,6 +206,7 @@ import re
 import time
 from pathlib import Path
 from dotenv import load_dotenv
+import httpx  # For Price Action Trader - fetching BTC price from Pyth Network
 
 from turbine_client import TurbineClient, TurbineWSClient, Outcome, Side
 from turbine_client.exceptions import TurbineApiError, WebSocketError
@@ -275,6 +285,7 @@ class MarketMakerBot:
         self.market_id: str | None = None
         self.settlement_address: str | None = None  # For USDC permits
         self.contract_address: str | None = None  # For claiming winnings
+        self.strike_price: int = 0  # BTC price when market created (8 decimals) - used by Price Action Trader
         self.current_position = 0
         self.active_orders: dict[str, str] = {}  # order_hash -> side
         self.running = True
@@ -282,13 +293,13 @@ class MarketMakerBot:
         self.traded_markets: dict[str, str] = {}  # market_id -> contract_address
         # Algorithm state...
 
-    async def get_active_market(self) -> tuple[str, int]:
+    async def get_active_market(self) -> tuple[str, int, int]:
         """
         Get the currently active BTC quick market.
-        Returns (market_id, end_time) tuple.
+        Returns (market_id, end_time, start_price) tuple.
         """
         quick_market = self.client.get_quick_market("BTC")
-        return quick_market.market_id, quick_market.end_time
+        return quick_market.market_id, quick_market.end_time, quick_market.start_price
 
     async def cancel_all_orders(self, market_id: str) -> None:
         """Cancel all active orders on a market before switching."""
@@ -303,10 +314,15 @@ class MarketMakerBot:
             except TurbineApiError as e:
                 print(f"Failed to cancel order {order_id}: {e}")
 
-    async def switch_to_new_market(self, new_market_id: str) -> None:
+    async def switch_to_new_market(self, new_market_id: str, start_price: int = 0) -> None:
         """
         Switch liquidity and trading to a new market.
         Called when a new BTC 15-minute market becomes active.
+
+        Args:
+            new_market_id: The new market ID to switch to.
+            start_price: The BTC price when market was created (8 decimals).
+                         Used by Price Action Trader to compare against current price.
         """
         old_market_id = self.market_id
 
@@ -327,6 +343,7 @@ class MarketMakerBot:
 
         # Update to new market
         self.market_id = new_market_id
+        self.strike_price = start_price  # Store for Price Action Trader
         self.active_orders = {}
 
         # Fetch settlement and contract addresses from markets list
@@ -342,7 +359,10 @@ class MarketMakerBot:
         except Exception as e:
             print(f"Warning: Could not fetch market addresses: {e}")
 
+        strike_usd = start_price / 1e8 if start_price else 0
         print(f"Now trading on market: {new_market_id[:8]}...")
+        if strike_usd > 0:
+            print(f"Strike price: ${strike_usd:,.2f}")
 
     async def monitor_market_transitions(self) -> None:
         """
@@ -353,11 +373,11 @@ class MarketMakerBot:
 
         while self.running:
             try:
-                new_market_id, end_time = await self.get_active_market()
+                new_market_id, end_time, start_price = await self.get_active_market()
 
                 # Check if market has changed
                 if new_market_id != self.market_id:
-                    await self.switch_to_new_market(new_market_id)
+                    await self.switch_to_new_market(new_market_id, start_price)
 
                 # Log time remaining periodically
                 time_remaining = end_time - int(time.time())
@@ -406,8 +426,8 @@ async def main():
     bot = MarketMakerBot(client)
 
     try:
-        # Initialize with the current market
-        await bot.switch_to_new_market(quick_market.market_id)
+        # Initialize with the current market (pass start_price for Price Action Trader)
+        await bot.switch_to_new_market(quick_market.market_id, quick_market.start_price)
 
         # Run the main trading loop (starts background tasks internally)
         await bot.run("https://api.turbinefi.com")
@@ -442,8 +462,10 @@ TURBINE_API_PRIVATE_KEY=
 
 2. Install dependencies by running:
 ```bash
-pip install -e . python-dotenv
+pip install -e . python-dotenv httpx
 ```
+
+Note: `httpx` is used by the Price Action Trader to fetch real-time BTC prices from Pyth Network.
 
 ## Step 7: Explain How to Run
 
@@ -524,6 +546,177 @@ async def run(self, host: str) -> None:
 ## Algorithm Implementation Details
 
 When generating bots, use these implementations:
+
+### Price Action Trader (Recommended)
+
+This algorithm fetches the current BTC price from **Pyth Network** (the same oracle Turbine uses) and compares it to the market's strike price to make trading decisions.
+
+```python
+import httpx
+
+# Pyth Network Hermes API - same price source Turbine uses
+PYTH_HERMES_URL = "https://hermes.pyth.network/v2/updates/price/latest"
+PYTH_BTC_FEED_ID = "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"
+
+# Configuration
+PRICE_THRESHOLD_BPS = 50  # 0.5% threshold before taking action
+MIN_CONFIDENCE = 0.6  # Minimum confidence to place a trade
+MAX_CONFIDENCE = 0.9  # Cap confidence at 90%
+PRICE_POLL_SECONDS = 10  # How often to check price
+
+class PriceActionBot:
+    def __init__(self, client: TurbineClient):
+        self.client = client
+        self.market_id: str | None = None
+        self.strike_price: int = 0  # BTC price when market created (8 decimals)
+        self.current_position = 0
+        self.active_orders: dict[str, str] = {}
+        self.running = True
+        self.traded_markets: dict[str, str] = {}
+        self.settlement_address: str | None = None
+        self.contract_address: str | None = None
+
+    def get_current_btc_price(self) -> float:
+        """Fetch current BTC price from Pyth Network (same source as Turbine)."""
+        try:
+            response = httpx.get(
+                PYTH_HERMES_URL,
+                params={"ids[]": PYTH_BTC_FEED_ID},
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if not data.get("parsed"):
+                print("No price data from Pyth")
+                return 0.0
+
+            price_data = data["parsed"][0]["price"]
+            price_int = int(price_data["price"])
+            expo = price_data["expo"]  # Usually -8 for BTC
+
+            # Convert Pyth price to USD: price * 10^expo
+            return price_int * (10 ** expo)
+
+        except Exception as e:
+            print(f"Failed to fetch BTC price from Pyth: {e}")
+            return 0.0
+
+    def calculate_signal(self) -> tuple[str, float]:
+        """
+        Calculate trading signal based on current price vs strike price.
+
+        Returns:
+            (action, confidence) where action is "BUY_YES", "BUY_NO", or "HOLD"
+        """
+        current_price = self.get_current_btc_price()
+        if current_price <= 0:
+            return "HOLD", 0.0
+
+        # Convert strike price from 8 decimals to USD
+        strike_usd = self.strike_price / 1e8
+
+        # Calculate percentage difference
+        price_diff_pct = ((current_price - strike_usd) / strike_usd) * 100
+
+        # Threshold check (0.5% = 50 bps)
+        threshold_pct = PRICE_THRESHOLD_BPS / 100
+
+        if abs(price_diff_pct) < threshold_pct:
+            # Price too close to strike, hold
+            return "HOLD", 0.0
+
+        # Calculate confidence based on distance from strike
+        # Further from strike = higher confidence (capped)
+        raw_confidence = min(abs(price_diff_pct) / 2, MAX_CONFIDENCE)
+        confidence = max(raw_confidence, MIN_CONFIDENCE) if abs(price_diff_pct) >= threshold_pct else 0.0
+
+        if price_diff_pct > 0:
+            # BTC is above strike → bet YES (will end above)
+            print(f"BTC ${current_price:,.2f} is {price_diff_pct:+.2f}% above strike ${strike_usd:,.2f}")
+            return "BUY_YES", confidence
+        else:
+            # BTC is below strike → bet NO (will end below)
+            print(f"BTC ${current_price:,.2f} is {price_diff_pct:+.2f}% below strike ${strike_usd:,.2f}")
+            return "BUY_NO", confidence
+
+    async def execute_signal(self, action: str, confidence: float) -> None:
+        """Execute the trading signal."""
+        if action == "HOLD" or confidence < MIN_CONFIDENCE:
+            return
+
+        # Check position limits
+        if abs(self.current_position) >= MAX_POSITION:
+            print("Position limit reached")
+            return
+
+        # Get orderbook to determine price
+        orderbook = self.client.get_orderbook(self.market_id)
+
+        if action == "BUY_YES":
+            # Buy YES outcome
+            if not orderbook.asks:
+                return
+            # Pay slightly above best ask to ensure fill
+            price = min(orderbook.asks[0].price + 5000, 999000)
+            outcome = Outcome.YES
+        else:
+            # Buy NO outcome
+            if not orderbook.asks:
+                return
+            price = min(orderbook.asks[0].price + 5000, 999000)
+            outcome = Outcome.NO
+
+        try:
+            order = self.client.create_limit_buy(
+                market_id=self.market_id,
+                outcome=outcome,
+                price=price,
+                size=ORDER_SIZE,
+                expiration=int(time.time()) + 300,
+                settlement_address=self.settlement_address,
+            )
+
+            # Sign USDC permit for gasless execution
+            buyer_cost = (ORDER_SIZE * price) // 1_000_000
+            permit_amount = (buyer_cost * 120) // 100  # 20% margin
+            permit = self.client.sign_usdc_permit(
+                value=permit_amount,
+                settlement_address=self.settlement_address,
+            )
+            order.permit_signature = permit
+
+            result = self.client.post_order(order)
+            outcome_str = "YES" if outcome == Outcome.YES else "NO"
+            print(f"Placed {outcome_str} order @ {price / 10000:.1f}% (confidence: {confidence:.0%})")
+
+            # Track position
+            self.current_position += ORDER_SIZE if outcome == Outcome.YES else -ORDER_SIZE
+            self.active_orders[order.order_hash] = action
+
+        except TurbineApiError as e:
+            print(f"Order failed: {e}")
+
+    async def price_action_loop(self) -> None:
+        """Main loop that monitors price and executes trades."""
+        while self.running and self.market_id:
+            try:
+                action, confidence = self.calculate_signal()
+                if action != "HOLD":
+                    await self.execute_signal(action, confidence)
+                await asyncio.sleep(PRICE_POLL_SECONDS)
+            except Exception as e:
+                print(f"Price action error: {e}")
+                await asyncio.sleep(PRICE_POLL_SECONDS)
+```
+
+**Key points for Price Action Trader:**
+- Uses Pyth Network Hermes API (same oracle Turbine uses) to get real-time BTC price
+- Compares current price to strike price (stored in `quick_market.start_price`)
+- If BTC > strike by threshold → buy YES
+- If BTC < strike by threshold → buy NO
+- Confidence scales with distance from strike (capped at 90%)
+- Polls price every 10 seconds by default
 
 ### Simple Spread Market Maker
 ```python
@@ -723,8 +916,13 @@ class MarketMakerBot:
 When switching to a new market, save the old market for later claiming:
 
 ```python
-async def switch_to_new_market(self, new_market_id: str, start_price: int) -> None:
-    """Switch liquidity to a new market."""
+async def switch_to_new_market(self, new_market_id: str, start_price: int = 0) -> None:
+    """Switch liquidity to a new market.
+
+    Args:
+        new_market_id: The new market ID.
+        start_price: BTC strike price (8 decimals) - used by Price Action Trader.
+    """
     old_market_id = self.market_id
 
     # Track old market for claiming winnings later
@@ -736,6 +934,7 @@ async def switch_to_new_market(self, new_market_id: str, start_price: int) -> No
         await self.cancel_all_orders()
 
     self.market_id = new_market_id
+    self.strike_price = start_price  # Store for Price Action Trader
     self.active_orders = {}
 
     # Fetch settlement and contract addresses
@@ -745,6 +944,9 @@ async def switch_to_new_market(self, new_market_id: str, start_price: int) -> No
             self.settlement_address = market.settlement_address
             self.contract_address = market.contract_address
             break
+
+    if start_price:
+        print(f"Strike price: ${start_price / 1e8:,.2f}")
 ```
 
 ### Background Task for Claiming
@@ -846,3 +1048,11 @@ async def run(self, host: str) -> None:
 **Outcome Values**:
 - Outcome.YES (0) = BTC ends ABOVE strike price
 - Outcome.NO (1) = BTC ends BELOW strike price
+
+**Strike Price (for Price Action Trader)**:
+- Available via `quick_market.start_price` (8 decimals)
+- Example: 9500000000000 = $95,000.00
+- Current BTC price fetched from Pyth Network (same oracle Turbine uses):
+  - URL: `https://hermes.pyth.network/v2/updates/price/latest?ids[]=0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43`
+  - BTC Feed ID: `0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43`
+- If current > strike → buy YES, if current < strike → buy NO
