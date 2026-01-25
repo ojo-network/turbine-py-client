@@ -178,6 +178,8 @@ Based on the user's algorithm choice, generate a complete bot file. The bot shou
 6. Cancel orders on shutdown
 7. **Automatically detect new BTC markets and switch liquidity/trades to them**
 8. Handle market expiration gracefully with seamless transitions
+9. **Sign USDC permits for gasless order execution** (no separate approval transaction needed)
+10. **Track traded markets and automatically claim winnings when they resolve**
 
 Use this template structure for all bots:
 
@@ -266,14 +268,18 @@ def _save_credentials_to_env(env_path: Path, api_key_id: str, api_private_key: s
 
 
 class MarketMakerBot:
-    """Market maker bot implementation with automatic market switching."""
+    """Market maker bot implementation with automatic market switching and winnings claiming."""
 
     def __init__(self, client: TurbineClient):
         self.client = client
         self.market_id: str | None = None
+        self.settlement_address: str | None = None  # For USDC permits
+        self.contract_address: str | None = None  # For claiming winnings
         self.current_position = 0
-        self.active_orders: dict[str, dict] = {}
+        self.active_orders: dict[str, str] = {}  # order_hash -> side
         self.running = True
+        # Track markets we've traded in for claiming winnings
+        self.traded_markets: dict[str, str] = {}  # market_id -> contract_address
         # Algorithm state...
 
     async def get_active_market(self) -> tuple[str, int]:
@@ -304,6 +310,11 @@ class MarketMakerBot:
         """
         old_market_id = self.market_id
 
+        # Track old market for claiming winnings later
+        if old_market_id and self.contract_address:
+            self.traded_markets[old_market_id] = self.contract_address
+            print(f"Tracking market {old_market_id[:8]}... for winnings claim")
+
         if old_market_id:
             print(f"\n{'='*50}")
             print(f"MARKET TRANSITION DETECTED")
@@ -318,8 +329,19 @@ class MarketMakerBot:
         self.market_id = new_market_id
         self.active_orders = {}
 
-        # Re-initialize any market-specific state
-        # (positions carry over, but orders don't)
+        # Fetch settlement and contract addresses from markets list
+        try:
+            markets = self.client.get_markets()
+            for market in markets:
+                if market.id == new_market_id:
+                    self.settlement_address = market.settlement_address
+                    self.contract_address = market.contract_address
+                    print(f"Settlement: {self.settlement_address[:16]}...")
+                    print(f"Contract: {self.contract_address[:16]}...")
+                    break
+        except Exception as e:
+            print(f"Warning: Could not fetch market addresses: {e}")
+
         print(f"Now trading on market: {new_market_id[:8]}...")
 
     async def monitor_market_transitions(self) -> None:
@@ -375,17 +397,19 @@ async def main():
     print(f"Initial market: BTC @ ${quick_market.start_price / 1e8:,.2f}")
     print(f"Market expires at: {quick_market.end_time}")
 
-    # Run the bot with automatic market switching
+    # Note gasless features
+    print("Orders will include USDC permit signatures for gasless trading")
+    print("Automatic winnings claim enabled for resolved markets")
+    print()
+
+    # Run the bot with automatic market switching and winnings claiming
     bot = MarketMakerBot(client)
 
     try:
-        # Start the market monitor as a background task
-        monitor_task = asyncio.create_task(bot.monitor_market_transitions())
-
         # Initialize with the current market
         await bot.switch_to_new_market(quick_market.market_id)
 
-        # Run the main trading loop
+        # Run the main trading loop (starts background tasks internally)
         await bot.run("https://api.turbinefi.com")
     except KeyboardInterrupt:
         print("\nShutting down...")
@@ -433,20 +457,27 @@ The bot will:
 - Automatically register API credentials on first run (saved to .env)
 - Connect to the current BTC 15-minute market
 - Start trading based on your chosen algorithm
+- Sign USDC permits for gasless order execution (no approval TX needed)
+- Automatically switch to new markets when they start
+- Track traded markets and claim winnings when they resolve
 
 To stop the bot, press Ctrl+C.
 ```
 
 ## Core Bot Run Method
 
-Every generated bot must include this `run()` method that handles WebSocket streaming with automatic market switching:
+Every generated bot must include this `run()` method that handles WebSocket streaming with automatic market switching and winnings claiming:
 
 ```python
 async def run(self, host: str) -> None:
     """
-    Main trading loop with WebSocket streaming and automatic market switching.
+    Main trading loop with WebSocket streaming, automatic market switching, and winnings claiming.
     """
     ws = TurbineWSClient(host)
+
+    # Start background tasks
+    monitor_task = asyncio.create_task(self.monitor_market_transitions())
+    claim_task = asyncio.create_task(self.claim_resolved_markets())
 
     while self.running:
         try:
@@ -457,12 +488,12 @@ async def run(self, host: str) -> None:
 
             current_market = self.market_id
 
-            async with ws.connect_with_retry() as stream:
+            async with ws.connect() as stream:
                 # Subscribe to the current market
                 await stream.subscribe(current_market)
                 print(f"Subscribed to market {current_market[:8]}...")
 
-                # Place initial quotes
+                # Place initial quotes (with USDC permits)
                 await self.place_quotes()
 
                 async for message in stream:
@@ -484,6 +515,10 @@ async def run(self, host: str) -> None:
         except Exception as e:
             print(f"Unexpected error: {e}")
             await asyncio.sleep(5)
+
+    # Cleanup background tasks
+    monitor_task.cancel()
+    claim_task.cancel()
 ```
 
 ## Algorithm Implementation Details
@@ -595,6 +630,199 @@ def find_edge(self, best_bid, best_ask):
 **Warning before expiration:**
 - When less than 60 seconds remain, the bot logs a warning
 - Orders are cancelled proactively to avoid stuck orders on expired markets
+
+## USDC Permit Signatures (Gasless Trading)
+
+**Every order must include a USDC permit signature** for gasless execution. Without this, orders will fail with "ERC20: transfer amount exceeds allowance".
+
+The `TurbineClient` provides `sign_usdc_permit()` to create EIP-2612 permit signatures:
+
+```python
+async def place_quotes(self) -> None:
+    """Place bid and ask orders with USDC permit signatures."""
+    bid_price, ask_price = self.calculate_quotes()
+
+    # Place bid (buy YES)
+    bid_order = self.client.create_limit_buy(
+        market_id=self.market_id,
+        outcome=Outcome.YES,
+        price=bid_price,
+        size=ORDER_SIZE,
+        expiration=int(time.time()) + QUOTE_REFRESH_SECONDS + 60,
+        settlement_address=self.settlement_address,
+    )
+
+    # Calculate permit amount for BUY orders:
+    # (size * price / 1e6) + 1% fee + 10% safety margin
+    buyer_cost = (ORDER_SIZE * bid_price) // 1_000_000
+    total_fee = ORDER_SIZE // 100  # 1% fee
+    permit_amount = ((buyer_cost + total_fee) * 110) // 100
+
+    # Sign and attach USDC permit
+    permit = self.client.sign_usdc_permit(
+        value=permit_amount,
+        settlement_address=self.settlement_address,
+    )
+    bid_order.permit_signature = permit
+
+    result = self.client.post_order(bid_order)
+
+    # Place ask (sell YES)
+    ask_order = self.client.create_limit_sell(
+        market_id=self.market_id,
+        outcome=Outcome.YES,
+        price=ask_price,
+        size=ORDER_SIZE,
+        expiration=int(time.time()) + QUOTE_REFRESH_SECONDS + 60,
+        settlement_address=self.settlement_address,
+    )
+
+    # Calculate permit amount for SELL orders: size + 10% margin
+    permit_amount = (ORDER_SIZE * 110) // 100
+
+    permit = self.client.sign_usdc_permit(
+        value=permit_amount,
+        settlement_address=self.settlement_address,
+    )
+    ask_order.permit_signature = permit
+
+    result = self.client.post_order(ask_order)
+```
+
+**Key points:**
+- BUY orders need permit for: `(size * price / 1e6) + fee`
+- SELL orders need permit for: `size` (for JIT token splitting)
+- Always add a 10% safety margin to permit amounts
+- Permits are signed per-order with the settlement address as spender
+
+## Automatic Winnings Claiming
+
+**Bots must track markets they've traded in and automatically claim winnings when markets resolve.**
+
+### Implementation Pattern
+
+Add these fields to your bot class:
+
+```python
+class MarketMakerBot:
+    def __init__(self, client: TurbineClient):
+        self.client = client
+        self.market_id: str | None = None
+        self.settlement_address: str | None = None
+        self.contract_address: str | None = None  # Current market contract
+        self.current_position = 0
+        self.active_orders: dict[str, str] = {}
+        self.running = True
+        # Track markets we've traded in for claiming winnings
+        # market_id -> contract_address
+        self.traded_markets: dict[str, str] = {}
+```
+
+### Track Markets When Switching
+
+When switching to a new market, save the old market for later claiming:
+
+```python
+async def switch_to_new_market(self, new_market_id: str, start_price: int) -> None:
+    """Switch liquidity to a new market."""
+    old_market_id = self.market_id
+
+    # Track old market for claiming winnings later
+    if old_market_id and self.contract_address:
+        self.traded_markets[old_market_id] = self.contract_address
+        print(f"Tracking market {old_market_id[:16]}... for winnings claim")
+
+    if old_market_id:
+        await self.cancel_all_orders()
+
+    self.market_id = new_market_id
+    self.active_orders = {}
+
+    # Fetch settlement and contract addresses
+    markets = self.client.get_markets()
+    for market in markets:
+        if market.id == new_market_id:
+            self.settlement_address = market.settlement_address
+            self.contract_address = market.contract_address
+            break
+```
+
+### Background Task for Claiming
+
+Add a background task that checks for resolved markets and claims winnings:
+
+```python
+async def claim_resolved_markets(self) -> None:
+    """Background task to claim winnings from resolved markets."""
+    while self.running:
+        try:
+            if not self.traded_markets:
+                await asyncio.sleep(30)
+                continue
+
+            markets_to_remove = []
+            for market_id, contract_address in list(self.traded_markets.items()):
+                try:
+                    # Check if market is resolved
+                    markets = self.client.get_markets()
+                    market_resolved = False
+                    for market in markets:
+                        if market.id == market_id and market.resolved:
+                            market_resolved = True
+                            break
+
+                    if market_resolved:
+                        print(f"\nMarket {market_id[:16]}... has resolved!")
+                        print(f"Attempting to claim winnings...")
+                        try:
+                            result = self.client.claim_winnings(contract_address)
+                            tx_hash = result.get("txHash", result.get("tx_hash", "unknown"))
+                            print(f"Winnings claimed! TX: {tx_hash}")
+                            markets_to_remove.append(market_id)
+                        except TurbineApiError as e:
+                            if "no winnings" in str(e).lower() or "no position" in str(e).lower():
+                                print(f"No winnings to claim for {market_id[:16]}...")
+                                markets_to_remove.append(market_id)
+                            else:
+                                print(f"Failed to claim winnings: {e}")
+                except Exception as e:
+                    print(f"Error checking market {market_id[:16]}...: {e}")
+
+            # Remove claimed markets from tracking
+            for market_id in markets_to_remove:
+                self.traded_markets.pop(market_id, None)
+
+        except Exception as e:
+            print(f"Claim monitor error: {e}")
+
+        await asyncio.sleep(30)  # Check every 30 seconds
+```
+
+### Start the Claim Task
+
+In the `run()` method, start the claim task alongside other background tasks:
+
+```python
+async def run(self, host: str) -> None:
+    """Main trading loop with automatic market switching and winnings claiming."""
+    ws = TurbineWSClient(host=host)
+
+    # Start background tasks
+    monitor_task = asyncio.create_task(self.monitor_market_transitions())
+    claim_task = asyncio.create_task(self.claim_resolved_markets())
+
+    try:
+        # ... main trading loop ...
+    finally:
+        monitor_task.cancel()
+        claim_task.cancel()
+```
+
+**Key points:**
+- `claim_winnings(contract_address)` uses gasless EIP-712 permits
+- The API handles all on-chain redemption via a relayer
+- Markets are removed from tracking after successful claim or if no position exists
+- Check every 30 seconds to catch resolutions promptly
 
 ## Important Notes for Users
 
