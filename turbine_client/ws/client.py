@@ -5,7 +5,7 @@ WebSocket client for real-time Turbine market data.
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Optional, Set
+from typing import Any, AsyncIterator, List, Optional, Set
 
 import websockets
 from websockets.asyncio.client import ClientConnection
@@ -98,41 +98,52 @@ class WSStream:
         """
         await self.subscribe(market_id)
 
-    def _parse_message(self, raw: str) -> WSMessage:
-        """Parse a raw WebSocket message.
+    def _parse_single_message(self, data: dict) -> WSMessage:
+        """Parse a single JSON message dict into a WSMessage."""
+        msg_type = data.get("type", "")
+
+        if msg_type == "orderbook":
+            return OrderBookUpdate(
+                type=msg_type,
+                market_id=data.get("marketId"),
+                data=data.get("data"),
+            )
+        elif msg_type == "trade":
+            return TradeUpdate(
+                type=msg_type,
+                market_id=data.get("marketId"),
+                data=data.get("data"),
+            )
+        elif msg_type == "quick_market":
+            return QuickMarketUpdate(
+                type=msg_type,
+                market_id=data.get("marketId"),
+                data=data.get("data"),
+            )
+        else:
+            return WSMessage.from_dict(data)
+
+    def _parse_message(self, raw: str) -> List[WSMessage]:
+        """Parse a raw WebSocket message (may contain multiple JSON objects).
 
         Args:
             raw: The raw message string.
 
         Returns:
-            A parsed WSMessage.
+            A list of parsed WSMessages.
         """
-        try:
-            data = json.loads(raw)
-            msg_type = data.get("type", "")
-
-            if msg_type == "orderbook":
-                return OrderBookUpdate(
-                    type=msg_type,
-                    market_id=data.get("marketId"),
-                    data=data.get("data"),
-                )
-            elif msg_type == "trade":
-                return TradeUpdate(
-                    type=msg_type,
-                    market_id=data.get("marketId"),
-                    data=data.get("data"),
-                )
-            elif msg_type == "quick_market":
-                return QuickMarketUpdate(
-                    type=msg_type,
-                    market_id=data.get("marketId"),
-                    data=data.get("data"),
-                )
-            else:
-                return WSMessage.from_dict(data)
-        except json.JSONDecodeError as e:
-            raise WebSocketError(f"Failed to parse message: {e}") from e
+        messages = []
+        # Handle newline-delimited JSON (multiple objects in one message)
+        for line in raw.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                messages.append(self._parse_single_message(data))
+            except json.JSONDecodeError as e:
+                raise WebSocketError(f"Failed to parse message: {e}") from e
+        return messages
 
     async def __aiter__(self) -> AsyncIterator[WSMessage]:
         """Iterate over incoming messages.
@@ -144,15 +155,16 @@ class WSStream:
             async for raw_message in self._connection:
                 if isinstance(raw_message, bytes):
                     raw_message = raw_message.decode("utf-8")
-                yield self._parse_message(raw_message)
+                for msg in self._parse_message(raw_message):
+                    yield msg
         except websockets.exceptions.ConnectionClosed:
             pass
 
-    async def recv(self) -> WSMessage:
-        """Receive a single message.
+    async def recv(self) -> List[WSMessage]:
+        """Receive messages from a single WebSocket frame.
 
         Returns:
-            The next message.
+            A list of messages (may contain multiple if server batches them).
 
         Raises:
             WebSocketError: If the connection is closed.

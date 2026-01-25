@@ -10,6 +10,7 @@ from turbine_client.types import (
     OrderArgs,
     OrderBookSnapshot,
     Outcome,
+    PermitSignature,
     Position,
     PriceLevel,
     Side,
@@ -34,6 +35,7 @@ __all__ = [
     # Types
     "OrderArgs",
     "SignedOrder",
+    "PermitSignature",
     "Side",
     "Outcome",
     "Market",

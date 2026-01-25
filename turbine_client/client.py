@@ -18,6 +18,7 @@ from turbine_client.types import (
     OrderArgs,
     OrderBookSnapshot,
     Outcome,
+    PermitSignature,
     PlatformStats,
     Position,
     QuickMarket,
@@ -627,8 +628,8 @@ class TurbineClient:
     def request_ctf_approval(
         self,
         owner: str,
-        spender: str,
-        value: int,
+        operator: str,
+        approved: bool,
         deadline: int,
         v: int,
         r: str,
@@ -638,30 +639,260 @@ class TurbineClient:
 
         Args:
             owner: The token owner address.
-            spender: The spender address.
-            value: The approval amount.
-            deadline: The permit deadline.
+            operator: The operator/settlement address to approve.
+            approved: Whether to approve or revoke.
+            deadline: The permit deadline timestamp.
             v: Signature v value.
-            r: Signature r value.
-            s: Signature s value.
+            r: Signature r value (hex string with 0x prefix).
+            s: Signature s value (hex string with 0x prefix).
 
         Returns:
-            The relayer response.
+            The relayer response with tx_hash on success.
 
         Raises:
             AuthenticationError: If no auth is configured.
         """
         self._require_auth()
         data = {
+            "chainId": self._chain_id,
             "owner": owner,
-            "spender": spender,
-            "value": str(value),
+            "operator": operator,
+            "approved": approved,
             "deadline": str(deadline),
             "v": v,
             "r": r,
             "s": s,
         }
         return self._http.post(ENDPOINTS["ctf_approval"], data=data, authenticated=True)
+
+    def approve_ctf_for_settlement(
+        self,
+        settlement_address: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Approve a settlement contract to transfer CTF tokens using gasless permit.
+
+        This signs an EIP-712 permit message and submits it to the relayer for
+        gasless execution. No gas is required from the user.
+
+        Args:
+            settlement_address: The settlement contract to approve. If not provided,
+                               uses the default for the chain.
+
+        Returns:
+            The relayer response with tx_hash on success.
+
+        Raises:
+            AuthenticationError: If no signer is configured.
+        """
+        self._require_signer()
+        self._require_auth()
+
+        import time
+        from eth_account import Account
+        from eth_account.messages import encode_typed_data
+
+        # Get addresses
+        owner = self._signer.address
+        operator = settlement_address or self._chain_config.settlement_address
+        ctf_address = self._chain_config.ctf_address
+
+        # Get nonce from CTF contract (we'll need to query this)
+        # For now, use 0 - the relayer should handle nonce management
+        # In production, you'd query the contract's nonces(owner) view function
+        nonce = self._get_ctf_nonce(owner, ctf_address)
+
+        # Set deadline to 1 hour from now
+        deadline = int(time.time()) + 3600
+
+        # Build EIP-712 typed data for SetApprovalForAll
+        typed_data = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "SetApprovalForAll": [
+                    {"name": "owner", "type": "address"},
+                    {"name": "operator", "type": "address"},
+                    {"name": "approved", "type": "bool"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "deadline", "type": "uint256"},
+                ],
+            },
+            "primaryType": "SetApprovalForAll",
+            "domain": {
+                "name": "ConditionalTokensWithPermit",
+                "version": "1",
+                "chainId": self._chain_id,
+                "verifyingContract": ctf_address,
+            },
+            "message": {
+                "owner": owner,
+                "operator": operator,
+                "approved": True,
+                "nonce": nonce,
+                "deadline": deadline,
+            },
+        }
+
+        # Sign the typed data
+        signed = Account.sign_typed_data(
+            self._signer._account.key,
+            full_message=typed_data,
+        )
+
+        # Extract v, r, s from signature
+        v = signed.v
+        r = hex(signed.r)
+        s = hex(signed.s)
+
+        # Pad r and s to 66 characters (0x + 64 hex chars)
+        r = "0x" + r[2:].zfill(64)
+        s = "0x" + s[2:].zfill(64)
+
+        print(f"Submitting CTF approval permit...")
+        print(f"  Owner: {owner}")
+        print(f"  Operator: {operator}")
+        print(f"  Deadline: {deadline}")
+
+        # Submit to relayer
+        return self.request_ctf_approval(
+            owner=owner,
+            operator=operator,
+            approved=True,
+            deadline=deadline,
+            v=v,
+            r=r,
+            s=s,
+        )
+
+    def _get_ctf_nonce(self, owner: str, ctf_address: str) -> int:
+        """Get the current nonce for an owner from the CTF contract.
+
+        This requires an RPC call to the CTF contract's nonces() view function.
+        """
+        return self._get_contract_nonce(owner, ctf_address)
+
+    def _get_contract_nonce(self, owner: str, contract_address: str) -> int:
+        """Get the current nonce for an owner from a contract's nonces() function."""
+        from web3 import Web3
+
+        # Get RPC URL based on chain
+        rpc_urls = {
+            137: "https://polygon-rpc.com",
+            43114: "https://api.avax.network/ext/bc/C/rpc",
+            84532: "https://sepolia.base.org",
+        }
+        rpc_url = rpc_urls.get(self._chain_id)
+        if not rpc_url:
+            print(f"Warning: No RPC URL for chain {self._chain_id}, using nonce 0")
+            return 0
+
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc_url))
+            # nonces(address) -> uint256
+            nonce_data = w3.eth.call({
+                "to": contract_address,
+                "data": "0x7ecebe00" + owner[2:].lower().zfill(64),  # nonces(address)
+            })
+            return int(nonce_data.hex(), 16)
+        except Exception as e:
+            print(f"Warning: Failed to get nonce from {contract_address}: {e}, using 0")
+            return 0
+
+    def sign_usdc_permit(
+        self,
+        value: int,
+        settlement_address: Optional[str] = None,
+        deadline: Optional[int] = None,
+    ) -> PermitSignature:
+        """Sign an EIP-2612 permit for USDC approval.
+
+        This creates a signature that allows gasless USDC approval when
+        included with an order submission.
+
+        Args:
+            value: The amount to approve (with 6 decimals for USDC).
+            settlement_address: The spender (settlement contract). Uses chain default if not provided.
+            deadline: Permit expiration timestamp. Defaults to 1 hour from now.
+
+        Returns:
+            PermitSignature that can be included with order submission.
+        """
+        self._require_signer()
+
+        import time
+        from eth_account import Account
+
+        owner = self._signer.address
+        spender = settlement_address or self._chain_config.settlement_address
+        usdc_address = self._chain_config.usdc_address
+
+        # Get USDC nonce for the owner
+        nonce = self._get_contract_nonce(owner, usdc_address)
+
+        # Set deadline
+        if deadline is None:
+            deadline = int(time.time()) + 3600  # 1 hour from now
+
+        # USDC EIP-712 domain (Polygon mainnet uses "USD Coin" version "2")
+        # Testnet uses "Mock USDC" version "1"
+        is_testnet = self._chain_id in [84532]  # Base Sepolia
+        token_name = "Mock USDC" if is_testnet else "USD Coin"
+        token_version = "1" if is_testnet else "2"
+
+        typed_data = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "Permit": [
+                    {"name": "owner", "type": "address"},
+                    {"name": "spender", "type": "address"},
+                    {"name": "value", "type": "uint256"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "deadline", "type": "uint256"},
+                ],
+            },
+            "primaryType": "Permit",
+            "domain": {
+                "name": token_name,
+                "version": token_version,
+                "chainId": self._chain_id,
+                "verifyingContract": usdc_address,
+            },
+            "message": {
+                "owner": owner,
+                "spender": spender,
+                "value": value,
+                "nonce": nonce,
+                "deadline": deadline,
+            },
+        }
+
+        # Sign the typed data
+        signed = Account.sign_typed_data(
+            self._signer._account.key,
+            full_message=typed_data,
+        )
+
+        # Extract v, r, s
+        v = signed.v
+        r = "0x" + hex(signed.r)[2:].zfill(64)
+        s = "0x" + hex(signed.s)[2:].zfill(64)
+
+        return PermitSignature(
+            value=value,
+            deadline=deadline,
+            v=v,
+            r=r,
+            s=s,
+        )
 
     def request_ctf_redemption(
         self,

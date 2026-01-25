@@ -45,6 +45,27 @@ class OrderArgs:
 
 
 @dataclass
+class PermitSignature:
+    """EIP-2612 permit signature for gasless USDC approval."""
+
+    value: int  # Amount approved
+    deadline: int  # Expiration timestamp
+    v: int
+    r: str  # Hex string with 0x prefix
+    s: str  # Hex string with 0x prefix
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for API submission."""
+        return {
+            "value": self.value,
+            "deadline": self.deadline,
+            "v": self.v,
+            "r": self.r,
+            "s": self.s,
+        }
+
+
+@dataclass
 class SignedOrder:
     """A signed order ready for submission."""
 
@@ -59,12 +80,13 @@ class SignedOrder:
     maker_fee_recipient: str
     signature: str
     order_hash: str
+    permit_signature: Optional["PermitSignature"] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for API submission."""
         # Ensure signature has 0x prefix
         sig = self.signature if self.signature.startswith("0x") else f"0x{self.signature}"
-        return {
+        result = {
             "order": {
                 "marketId": self.market_id,
                 "trader": self.trader,
@@ -78,6 +100,9 @@ class SignedOrder:
             },
             "signature": sig,
         }
+        if self.permit_signature:
+            result["permitSignature"] = self.permit_signature.to_dict()
+        return result
 
 
 @dataclass
