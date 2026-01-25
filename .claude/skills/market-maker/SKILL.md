@@ -19,34 +19,32 @@ First, check if the user has the required setup:
 
 ## Step 2: Private Key Setup
 
-Ask the user if they already have an Ethereum wallet private key configured. If not, guide them:
+Check if .env file exists with TURBINE_PRIVATE_KEY set. If not:
 
-```
-To trade on Turbine, you need an Ethereum wallet private key.
+1. Use AskUserQuestion to ask for their Ethereum wallet private key
+2. Explain security best practices:
+   - Use a dedicated trading wallet with limited funds
+   - Never share your private key
+   - Get it from MetaMask: Settings > Security & Privacy > Export Private Key
+3. Once they provide it, CREATE the .env file directly using the Write tool
 
-IMPORTANT SECURITY NOTES:
-- NEVER share your private key with anyone
-- Use a dedicated trading wallet with limited funds
-- Store your private key securely
-
-To get your private key:
-1. If using MetaMask: Settings > Security & Privacy > Export Private Key
-2. If using a new wallet: Create one at https://metamask.io
-
-Add to your .env file:
-TURBINE_PRIVATE_KEY=0x...your_private_key_here...
-```
+Do NOT just tell them to create the file - actually create it for them!
 
 ## Step 3: API Key Auto-Registration
 
-The bot should automatically register for API credentials on first run. Show the user this pattern:
+The bot should automatically register for API credentials on first run AND save them to the .env file automatically. Use this pattern:
 
 ```python
 import os
+import re
+from pathlib import Path
 from turbine_client import TurbineClient
 
-def get_or_create_api_credentials():
-    """Get existing credentials or register new ones."""
+def get_or_create_api_credentials(env_path: Path = None):
+    """Get existing credentials or register new ones and save to .env."""
+    if env_path is None:
+        env_path = Path(__file__).parent / ".env"
+
     api_key_id = os.environ.get("TURBINE_API_KEY_ID")
     api_private_key = os.environ.get("TURBINE_API_PRIVATE_KEY")
 
@@ -68,13 +66,42 @@ def get_or_create_api_credentials():
     api_key_id = credentials["api_key_id"]
     api_private_key = credentials["api_private_key"]
 
-    print(f"API Key ID: {api_key_id}")
-    print(f"API Private Key: {api_private_key}")
-    print("\nSAVE THESE TO YOUR .env FILE:")
-    print(f"TURBINE_API_KEY_ID={api_key_id}")
-    print(f"TURBINE_API_PRIVATE_KEY={api_private_key}")
+    # Auto-save credentials to .env file
+    _save_credentials_to_env(env_path, api_key_id, api_private_key)
 
+    # Update current environment so bot can use them immediately
+    os.environ["TURBINE_API_KEY_ID"] = api_key_id
+    os.environ["TURBINE_API_PRIVATE_KEY"] = api_private_key
+
+    print(f"API credentials registered and saved to {env_path}")
     return api_key_id, api_private_key
+
+
+def _save_credentials_to_env(env_path: Path, api_key_id: str, api_private_key: str):
+    """Save API credentials to .env file."""
+    env_path = Path(env_path)
+
+    if env_path.exists():
+        content = env_path.read_text()
+        # Update or append TURBINE_API_KEY_ID
+        if "TURBINE_API_KEY_ID=" in content:
+            content = re.sub(r'^TURBINE_API_KEY_ID=.*$', f'TURBINE_API_KEY_ID={api_key_id}', content, flags=re.MULTILINE)
+        else:
+            content = content.rstrip() + f"\nTURBINE_API_KEY_ID={api_key_id}"
+        # Update or append TURBINE_API_PRIVATE_KEY
+        if "TURBINE_API_PRIVATE_KEY=" in content:
+            content = re.sub(r'^TURBINE_API_PRIVATE_KEY=.*$', f'TURBINE_API_PRIVATE_KEY={api_private_key}', content, flags=re.MULTILINE)
+        else:
+            content = content.rstrip() + f"\nTURBINE_API_PRIVATE_KEY={api_private_key}"
+        env_path.write_text(content + "\n")
+    else:
+        # Create new .env file
+        content = f"""# Turbine Trading Bot Configuration
+TURBINE_PRIVATE_KEY={os.environ.get('TURBINE_PRIVATE_KEY', '0x...')}
+TURBINE_API_KEY_ID={api_key_id}
+TURBINE_API_PRIVATE_KEY={api_private_key}
+"""
+        env_path.write_text(content)
 ```
 
 ## Step 4: Algorithm Selection
@@ -134,7 +161,9 @@ Algorithm: {ALGORITHM_DESCRIPTION}
 
 import asyncio
 import os
+import re
 import time
+from pathlib import Path
 from dotenv import load_dotenv
 
 from turbine_client import TurbineClient, TurbineWSClient, Outcome, Side
@@ -151,12 +180,16 @@ MAX_POSITION = 5_000_000  # Maximum position size (5 shares)
 QUOTE_REFRESH_SECONDS = 30  # How often to refresh quotes
 # Algorithm-specific parameters added here...
 
-def get_or_create_api_credentials():
-    """Get existing credentials or register new ones."""
+def get_or_create_api_credentials(env_path: Path = None):
+    """Get existing credentials or register new ones and save to .env."""
+    if env_path is None:
+        env_path = Path(__file__).parent / ".env"
+
     api_key_id = os.environ.get("TURBINE_API_KEY_ID")
     api_private_key = os.environ.get("TURBINE_API_PRIVATE_KEY")
 
     if api_key_id and api_private_key:
+        print("Using existing API credentials")
         return api_key_id, api_private_key
 
     private_key = os.environ.get("TURBINE_PRIVATE_KEY")
@@ -169,11 +202,37 @@ def get_or_create_api_credentials():
         private_key=private_key,
     )
 
-    print(f"\nSAVE THESE TO YOUR .env FILE:")
-    print(f"TURBINE_API_KEY_ID={credentials['api_key_id']}")
-    print(f"TURBINE_API_PRIVATE_KEY={credentials['api_private_key']}")
+    api_key_id = credentials["api_key_id"]
+    api_private_key = credentials["api_private_key"]
 
-    return credentials["api_key_id"], credentials["api_private_key"]
+    # Auto-save to .env
+    _save_credentials_to_env(env_path, api_key_id, api_private_key)
+    os.environ["TURBINE_API_KEY_ID"] = api_key_id
+    os.environ["TURBINE_API_PRIVATE_KEY"] = api_private_key
+
+    print(f"API credentials saved to {env_path}")
+    return api_key_id, api_private_key
+
+
+def _save_credentials_to_env(env_path: Path, api_key_id: str, api_private_key: str):
+    """Save API credentials to .env file."""
+    env_path = Path(env_path)
+
+    if env_path.exists():
+        content = env_path.read_text()
+        # Update or append each credential
+        if "TURBINE_API_KEY_ID=" in content:
+            content = re.sub(r'^TURBINE_API_KEY_ID=.*$', f'TURBINE_API_KEY_ID={api_key_id}', content, flags=re.MULTILINE)
+        else:
+            content = content.rstrip() + f"\nTURBINE_API_KEY_ID={api_key_id}"
+        if "TURBINE_API_PRIVATE_KEY=" in content:
+            content = re.sub(r'^TURBINE_API_PRIVATE_KEY=.*$', f'TURBINE_API_PRIVATE_KEY={api_private_key}', content, flags=re.MULTILINE)
+        else:
+            content = content.rstrip() + f"\nTURBINE_API_PRIVATE_KEY={api_private_key}"
+        env_path.write_text(content + "\n")
+    else:
+        content = f"# Turbine Bot Config\nTURBINE_PRIVATE_KEY={os.environ.get('TURBINE_PRIVATE_KEY', '')}\nTURBINE_API_KEY_ID={api_key_id}\nTURBINE_API_PRIVATE_KEY={api_private_key}\n"
+        env_path.write_text(content)
 
 
 class MarketMakerBot:
@@ -225,42 +284,39 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## Step 6: Create the .env Template
+## Step 6: Create the .env File and Install Dependencies
 
-Create a `.env.example` file showing required variables:
+IMPORTANT: Actually create the .env file for the user using the Write tool. Do NOT just tell them to copy a template.
 
+Ask the user for their Ethereum private key using AskUserQuestion, then:
+
+1. Create the `.env` file directly with their private key:
 ```
 # Turbine Trading Bot Configuration
-
-# Required: Your Ethereum wallet private key
-# Get this from MetaMask or your wallet provider
-TURBINE_PRIVATE_KEY=0x...
-
-# Auto-generated on first run - save these after registration!
+TURBINE_PRIVATE_KEY=0x...user's_actual_key...
 TURBINE_API_KEY_ID=
 TURBINE_API_PRIVATE_KEY=
+```
+
+2. Install dependencies by running:
+```bash
+pip install -e . python-dotenv
 ```
 
 ## Step 7: Explain How to Run
 
 Tell the user:
 ```
-To run your bot:
+Your bot is ready! To run it:
 
-1. Copy .env.example to .env and add your private key:
-   cp .env.example .env
+  python {bot_filename}.py
 
-2. Install dependencies:
-   pip install turbine-py-client python-dotenv
+The bot will:
+- Automatically register API credentials on first run (saved to .env)
+- Connect to the current BTC 15-minute market
+- Start trading based on your chosen algorithm
 
-3. Run the bot:
-   python your_bot_file.py
-
-4. On first run, the bot will register API credentials.
-   SAVE the credentials it prints to your .env file!
-
-5. The bot will automatically connect to the current BTC 15-minute market
-   and start trading based on your chosen algorithm.
+To stop the bot, press Ctrl+C.
 ```
 
 ## Algorithm Implementation Details

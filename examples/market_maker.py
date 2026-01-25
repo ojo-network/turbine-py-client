@@ -12,7 +12,9 @@ Real market making requires careful risk management.
 
 import asyncio
 import os
+import re
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -21,6 +23,81 @@ from turbine_client.exceptions import TurbineApiError, WebSocketError
 
 # Load environment variables
 load_dotenv()
+
+
+def get_or_create_api_credentials(env_path: Path = None) -> tuple[str, str]:
+    """Get existing API credentials or register new ones and save to .env."""
+    if env_path is None:
+        env_path = Path(__file__).parent / ".env"
+
+    api_key_id = os.environ.get("TURBINE_API_KEY_ID")
+    api_private_key = os.environ.get("TURBINE_API_PRIVATE_KEY")
+
+    if api_key_id and api_private_key:
+        print("Using existing API credentials")
+        return api_key_id, api_private_key
+
+    # Need to register new credentials
+    private_key = os.environ.get("TURBINE_PRIVATE_KEY")
+    if not private_key:
+        raise ValueError("Set TURBINE_PRIVATE_KEY in your .env file")
+
+    print("Registering new API credentials...")
+    credentials = TurbineClient.request_api_credentials(
+        host="https://api.turbinefi.com",
+        private_key=private_key,
+    )
+
+    api_key_id = credentials["api_key_id"]
+    api_private_key = credentials["api_private_key"]
+
+    # Auto-save to .env file
+    _save_credentials_to_env(env_path, api_key_id, api_private_key)
+
+    # Update current environment so we can use them immediately
+    os.environ["TURBINE_API_KEY_ID"] = api_key_id
+    os.environ["TURBINE_API_PRIVATE_KEY"] = api_private_key
+
+    print(f"API credentials saved to {env_path}")
+    return api_key_id, api_private_key
+
+
+def _save_credentials_to_env(env_path: Path, api_key_id: str, api_private_key: str):
+    """Save API credentials to .env file."""
+    env_path = Path(env_path)
+
+    if env_path.exists():
+        content = env_path.read_text()
+        # Update existing values or append if not present
+        if "TURBINE_API_KEY_ID=" in content:
+            content = re.sub(
+                r'^TURBINE_API_KEY_ID=.*$',
+                f'TURBINE_API_KEY_ID={api_key_id}',
+                content,
+                flags=re.MULTILINE
+            )
+        else:
+            content += f"\nTURBINE_API_KEY_ID={api_key_id}"
+
+        if "TURBINE_API_PRIVATE_KEY=" in content:
+            content = re.sub(
+                r'^TURBINE_API_PRIVATE_KEY=.*$',
+                f'TURBINE_API_PRIVATE_KEY={api_private_key}',
+                content,
+                flags=re.MULTILINE
+            )
+        else:
+            content += f"\nTURBINE_API_PRIVATE_KEY={api_private_key}"
+
+        env_path.write_text(content)
+    else:
+        # Create new .env file with all credentials
+        content = f"""# Turbine Trading Bot Configuration
+TURBINE_PRIVATE_KEY={os.environ.get('TURBINE_PRIVATE_KEY', '')}
+TURBINE_API_KEY_ID={api_key_id}
+TURBINE_API_PRIVATE_KEY={api_private_key}
+"""
+        env_path.write_text(content)
 
 # Configuration
 SPREAD_BPS = 200  # 2% spread (100 bps = 1%)
@@ -171,14 +248,15 @@ class SimpleMarketMaker:
 async def main():
     # Get credentials
     private_key = os.environ.get("TURBINE_PRIVATE_KEY")
-    api_key_id = os.environ.get("TURBINE_API_KEY_ID")
-    api_private_key = os.environ.get("TURBINE_API_PRIVATE_KEY")
+    if not private_key:
+        print("Error: Set TURBINE_PRIVATE_KEY in your .env file")
+        return
 
-    if not all([private_key, api_key_id, api_private_key]):
-        print("Error: Set environment variables:")
-        print("  TURBINE_PRIVATE_KEY")
-        print("  TURBINE_API_KEY_ID")
-        print("  TURBINE_API_PRIVATE_KEY")
+    # Get or create API credentials (auto-saves to .env)
+    try:
+        api_key_id, api_private_key = get_or_create_api_credentials()
+    except TurbineApiError as e:
+        print(f"Error getting API credentials: {e}")
         return
 
     # Create client
