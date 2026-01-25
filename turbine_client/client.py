@@ -896,27 +896,220 @@ class TurbineClient:
 
     def request_ctf_redemption(
         self,
-        market_id: str,
-        amount: int,
+        owner: str,
+        collateral_token: str,
+        parent_collection_id: str,
+        condition_id: str,
+        index_sets: List[str],
+        deadline: int,
+        v: int,
+        r: str,
+        s: str,
+        market_address: str = "",
     ) -> Dict[str, Any]:
         """Request gasless CTF token redemption via relayer.
 
         Args:
-            market_id: The market ID.
-            amount: The amount to redeem.
+            owner: The token owner address.
+            collateral_token: The USDC address.
+            parent_collection_id: Parent collection ID (bytes32(0) for collateral).
+            condition_id: The market's condition ID.
+            index_sets: Array of index sets to redeem (["1"] for YES, ["2"] for NO).
+            deadline: Permit deadline timestamp.
+            v: Signature v value.
+            r: Signature r value.
+            s: Signature s value.
+            market_address: Optional market contract address for PNL tracking.
 
         Returns:
-            The relayer response.
+            The relayer response with tx_hash on success.
 
         Raises:
             AuthenticationError: If no auth is configured.
         """
         self._require_auth()
         data = {
-            "marketId": market_id,
-            "amount": str(amount),
+            "chainId": self._chain_id,
+            "owner": owner,
+            "collateralToken": collateral_token,
+            "parentCollectionId": parent_collection_id,
+            "conditionId": condition_id,
+            "indexSets": index_sets,
+            "deadline": str(deadline),
+            "v": v,
+            "r": r,
+            "s": s,
         }
+        if market_address:
+            data["marketAddress"] = market_address
         return self._http.post(ENDPOINTS["ctf_redemption"], data=data, authenticated=True)
+
+    def claim_winnings(
+        self,
+        market_contract_address: str,
+    ) -> Dict[str, Any]:
+        """Claim winnings from a resolved market using gasless permit.
+
+        This queries the market contract for resolution status and condition data,
+        signs an EIP-712 permit, and submits to the relayer for gasless execution.
+
+        Args:
+            market_contract_address: The market's contract address.
+
+        Returns:
+            The relayer response with tx_hash on success.
+
+        Raises:
+            ValueError: If market is not resolved or user has no winnings.
+            AuthenticationError: If no signer is configured.
+        """
+        self._require_signer()
+        self._require_auth()
+
+        import time
+        from eth_account import Account
+        from web3 import Web3
+
+        owner = self._signer.address
+
+        # Get RPC URL
+        rpc_urls = {
+            137: "https://polygon-rpc.com",
+            43114: "https://api.avax.network/ext/bc/C/rpc",
+            84532: "https://sepolia.base.org",
+        }
+        rpc_url = rpc_urls.get(self._chain_id)
+        if not rpc_url:
+            raise ValueError(f"No RPC URL for chain {self._chain_id}")
+
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+        # Query getStaticMarketData() from market contract
+        # Returns: (ctf, collateralToken, conditionId, yesTokenId, noTokenId)
+        static_data_selector = "0x3e47d6f3"  # getStaticMarketData()
+        static_data = w3.eth.call({
+            "to": market_contract_address,
+            "data": static_data_selector,
+        })
+
+        # Decode the response (5 values: address, address, bytes32, uint256, uint256)
+        ctf_address = "0x" + static_data[12:32].hex()
+        collateral_token = "0x" + static_data[44:64].hex()
+        condition_id = "0x" + static_data[64:96].hex()
+        yes_token_id = int(static_data[96:128].hex(), 16)
+        no_token_id = int(static_data[128:160].hex(), 16)
+
+        print(f"Market data:")
+        print(f"  CTF: {ctf_address}")
+        print(f"  Collateral: {collateral_token}")
+        print(f"  Condition ID: {condition_id}")
+
+        # Query getResolutionStatus() from market contract
+        # Returns: (expired, resolved, assertionId, winningOutcome, canPropose, canSettle)
+        resolution_selector = "0x7a9262a2"  # getResolutionStatus()
+        resolution_data = w3.eth.call({
+            "to": market_contract_address,
+            "data": resolution_selector,
+        })
+
+        # Decode: bool, bool, bytes32, uint8, bool, bool
+        resolved = bool(int(resolution_data[31:32].hex(), 16))
+        winning_outcome = int(resolution_data[96:128].hex(), 16)
+
+        if not resolved:
+            raise ValueError("Market is not resolved yet")
+
+        print(f"  Resolved: {resolved}")
+        print(f"  Winning outcome: {'YES' if winning_outcome == 0 else 'NO'}")
+
+        # Check user's winning token balance
+        winning_token_id = yes_token_id if winning_outcome == 0 else no_token_id
+
+        # balanceOf(address, uint256) -> uint256
+        balance_selector = "0x00fdd58e"  # balanceOf(address,uint256)
+        balance_call = balance_selector + owner[2:].lower().zfill(64) + hex(winning_token_id)[2:].zfill(64)
+        balance_data = w3.eth.call({
+            "to": ctf_address,
+            "data": balance_call,
+        })
+        balance = int(balance_data.hex(), 16)
+
+        if balance == 0:
+            raise ValueError("No winning tokens to redeem")
+
+        print(f"  Winning token balance: {balance / 1_000_000:.2f}")
+
+        # Get nonce from CTF contract
+        nonce = self._get_contract_nonce(owner, ctf_address)
+
+        # Set deadline
+        deadline = int(time.time()) + 3600
+
+        # indexSets: [1] for YES, [2] for NO
+        index_sets = [1 if winning_outcome == 0 else 2]
+
+        # Build EIP-712 typed data for RedeemPositions
+        typed_data = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "RedeemPositions": [
+                    {"name": "owner", "type": "address"},
+                    {"name": "collateralToken", "type": "address"},
+                    {"name": "parentCollectionId", "type": "bytes32"},
+                    {"name": "conditionId", "type": "bytes32"},
+                    {"name": "indexSets", "type": "uint256[]"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "deadline", "type": "uint256"},
+                ],
+            },
+            "primaryType": "RedeemPositions",
+            "domain": {
+                "name": "ConditionalTokensWithPermit",
+                "version": "1",
+                "chainId": self._chain_id,
+                "verifyingContract": ctf_address,
+            },
+            "message": {
+                "owner": owner,
+                "collateralToken": collateral_token,
+                "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "conditionId": condition_id,
+                "indexSets": index_sets,
+                "nonce": nonce,
+                "deadline": deadline,
+            },
+        }
+
+        # Sign the typed data
+        signed = Account.sign_typed_data(
+            self._signer._account.key,
+            full_message=typed_data,
+        )
+
+        v = signed.v
+        r = "0x" + hex(signed.r)[2:].zfill(64)
+        s = "0x" + hex(signed.s)[2:].zfill(64)
+
+        print(f"Submitting redemption...")
+
+        return self.request_ctf_redemption(
+            owner=owner,
+            collateral_token=collateral_token,
+            parent_collection_id="0x0000000000000000000000000000000000000000000000000000000000000000",
+            condition_id=condition_id,
+            index_sets=[str(i) for i in index_sets],
+            deadline=deadline,
+            v=v,
+            r=r,
+            s=s,
+            market_address=market_contract_address,
+        )
+
 
     # =========================================================================
     # API Key Registration (Self-Service Credentials)
