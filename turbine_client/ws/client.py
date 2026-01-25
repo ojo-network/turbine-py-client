@@ -34,77 +34,69 @@ class WSStream:
         self._connection = connection
         self._subscriptions: Set[str] = set()
 
-    async def subscribe(
-        self,
-        market_id: Optional[str] = None,
-        channel: str = "orderbook",
-    ) -> None:
-        """Subscribe to a market channel.
+    async def subscribe(self, market_id: str) -> None:
+        """Subscribe to a market to receive orderbook and trade updates.
+
+        The Turbine WebSocket API uses market-level subscriptions. Once subscribed
+        to a market, you will receive ALL updates for that market including:
+        - Orderbook updates (type="orderbook")
+        - Trade updates (type="trade")
+        - Order cancelled updates (type="order_cancelled")
 
         Args:
-            market_id: The market ID to subscribe to.
-            channel: The channel type ("orderbook", "trades", "quick_markets").
+            market_id: The market ID to subscribe to (0x... hex string).
+
+        Example:
+            await stream.subscribe("0x1234...abcd")
         """
         message = {
             "type": "subscribe",
-            "channel": channel,
+            "marketId": market_id,
         }
-        if market_id:
-            message["marketId"] = market_id
 
         await self._connection.send(json.dumps(message))
 
         # Track subscription
-        sub_key = f"{channel}:{market_id or 'all'}"
-        self._subscriptions.add(sub_key)
+        self._subscriptions.add(market_id)
 
-    async def unsubscribe(
-        self,
-        market_id: Optional[str] = None,
-        channel: str = "orderbook",
-    ) -> None:
-        """Unsubscribe from a market channel.
+    async def unsubscribe(self, market_id: str) -> None:
+        """Unsubscribe from a market.
 
         Args:
             market_id: The market ID to unsubscribe from.
-            channel: The channel type.
         """
         message = {
             "type": "unsubscribe",
-            "channel": channel,
+            "marketId": market_id,
         }
-        if market_id:
-            message["marketId"] = market_id
 
         await self._connection.send(json.dumps(message))
 
         # Remove subscription
-        sub_key = f"{channel}:{market_id or 'all'}"
-        self._subscriptions.discard(sub_key)
+        self._subscriptions.discard(market_id)
 
+    # Convenience aliases for backwards compatibility
     async def subscribe_orderbook(self, market_id: str) -> None:
-        """Subscribe to orderbook updates for a market.
+        """Subscribe to a market (receives orderbook + trade updates).
+
+        Note: The Turbine API subscribes to markets, not channels.
+        This is an alias for subscribe() for backwards compatibility.
 
         Args:
             market_id: The market ID.
         """
-        await self.subscribe(market_id=market_id, channel="orderbook")
+        await self.subscribe(market_id)
 
     async def subscribe_trades(self, market_id: str) -> None:
-        """Subscribe to trade updates for a market.
+        """Subscribe to a market (receives orderbook + trade updates).
+
+        Note: The Turbine API subscribes to markets, not channels.
+        This is an alias for subscribe() for backwards compatibility.
 
         Args:
             market_id: The market ID.
         """
-        await self.subscribe(market_id=market_id, channel="trades")
-
-    async def subscribe_quick_markets(self, asset: Optional[str] = None) -> None:
-        """Subscribe to quick market updates.
-
-        Args:
-            asset: Optional asset to filter (e.g., "BTC", "ETH").
-        """
-        await self.subscribe(market_id=asset, channel="quick_markets")
+        await self.subscribe(market_id)
 
     def _parse_message(self, raw: str) -> WSMessage:
         """Parse a raw WebSocket message.
@@ -222,9 +214,12 @@ class TurbineWSClient:
 
         Example:
             async with client.connect() as stream:
-                await stream.subscribe(market_id="0x...")
+                await stream.subscribe("0x1234...market_id")
                 async for message in stream:
-                    print(message)
+                    if message.type == "trade":
+                        print(f"Trade: {message.trade}")
+                    elif message.type == "orderbook":
+                        print(f"Orderbook update")
         """
         try:
             self._connection = await websockets.connect(self.url)
