@@ -9,6 +9,35 @@ argument-hint: "[algorithm-type]"
 
 You are helping a programmer create a market maker bot for Turbine's Bitcoin 15-minute prediction markets.
 
+## Step 0: Environment Context Detection
+
+**CRITICAL**: Before writing ANY Python code, you MUST detect the user's environment to ensure correct syntax and compatibility.
+
+Run these commands to gather environment context:
+
+```bash
+# Get Python version
+python3 --version
+
+# Check if in virtualenv
+echo "VIRTUAL_ENV: $VIRTUAL_ENV"
+
+# Get platform info
+uname -s
+
+# Check if pyproject.toml exists for project Python requirements
+cat pyproject.toml 2>/dev/null | grep -E "(requires-python|python_version)" || echo "No pyproject.toml found"
+```
+
+**Environment Rules:**
+- If Python version is 3.9+: Use modern syntax (type hints with `list[str]` instead of `List[str]`, `dict[str, int]` instead of `Dict[str, int]`, `X | None` instead of `Optional[X]`)
+- If Python version is 3.8 or below: Use `from typing import List, Dict, Optional` and older syntax
+- Always match the project's `requires-python` if specified in pyproject.toml
+- Use `async`/`await` syntax (supported in all Python 3.9+ environments)
+- For dataclasses, use `@dataclass` decorator (available in Python 3.7+)
+
+Store the detected Python version mentally and use it for ALL generated code in this session.
+
 ## Step 1: Environment Setup Check
 
 First, check if the user has the required setup:
@@ -147,7 +176,8 @@ Based on the user's algorithm choice, generate a complete bot file. The bot shou
 4. Implement the chosen algorithm
 5. Include proper error handling
 6. Cancel orders on shutdown
-7. Handle market expiration gracefully
+7. **Automatically detect new BTC markets and switch liquidity/trades to them**
+8. Handle market expiration gracefully with seamless transitions
 
 Use this template structure for all bots:
 
@@ -236,14 +266,86 @@ def _save_credentials_to_env(env_path: Path, api_key_id: str, api_private_key: s
 
 
 class MarketMakerBot:
-    """Market maker bot implementation."""
+    """Market maker bot implementation with automatic market switching."""
 
     def __init__(self, client: TurbineClient):
         self.client = client
-        self.market_id = None
+        self.market_id: str | None = None
         self.current_position = 0
-        self.active_orders = {}
+        self.active_orders: dict[str, dict] = {}
+        self.running = True
         # Algorithm state...
+
+    async def get_active_market(self) -> tuple[str, int]:
+        """
+        Get the currently active BTC quick market.
+        Returns (market_id, end_time) tuple.
+        """
+        quick_market = self.client.get_quick_market("BTC")
+        return quick_market.market_id, quick_market.end_time
+
+    async def cancel_all_orders(self, market_id: str) -> None:
+        """Cancel all active orders on a market before switching."""
+        if not self.active_orders:
+            return
+
+        print(f"Cancelling {len(self.active_orders)} orders on market {market_id[:8]}...")
+        for order_id in list(self.active_orders.keys()):
+            try:
+                self.client.cancel_order(market_id=market_id, order_id=order_id)
+                del self.active_orders[order_id]
+            except TurbineApiError as e:
+                print(f"Failed to cancel order {order_id}: {e}")
+
+    async def switch_to_new_market(self, new_market_id: str) -> None:
+        """
+        Switch liquidity and trading to a new market.
+        Called when a new BTC 15-minute market becomes active.
+        """
+        old_market_id = self.market_id
+
+        if old_market_id:
+            print(f"\n{'='*50}")
+            print(f"MARKET TRANSITION DETECTED")
+            print(f"Old market: {old_market_id[:8]}...")
+            print(f"New market: {new_market_id[:8]}...")
+            print(f"{'='*50}\n")
+
+            # Cancel all orders on the old market
+            await self.cancel_all_orders(old_market_id)
+
+        # Update to new market
+        self.market_id = new_market_id
+        self.active_orders = {}
+
+        # Re-initialize any market-specific state
+        # (positions carry over, but orders don't)
+        print(f"Now trading on market: {new_market_id[:8]}...")
+
+    async def monitor_market_transitions(self) -> None:
+        """
+        Background task that polls for new markets and triggers transitions.
+        Runs continuously while the bot is active.
+        """
+        POLL_INTERVAL = 5  # Check every 5 seconds
+
+        while self.running:
+            try:
+                new_market_id, end_time = await self.get_active_market()
+
+                # Check if market has changed
+                if new_market_id != self.market_id:
+                    await self.switch_to_new_market(new_market_id)
+
+                # Log time remaining periodically
+                time_remaining = end_time - int(time.time())
+                if time_remaining <= 60 and time_remaining > 0:
+                    print(f"Market expires in {time_remaining}s - preparing for transition...")
+
+            except Exception as e:
+                print(f"Market monitor error: {e}")
+
+            await asyncio.sleep(POLL_INTERVAL)
 
     # ... Algorithm implementation ...
 
@@ -268,16 +370,32 @@ async def main():
 
     print(f"Bot wallet address: {client.address}")
 
-    # Get the active BTC 15-minute market
+    # Get the initial active BTC 15-minute market
     quick_market = client.get_quick_market("BTC")
-    print(f"Trading on: BTC @ ${quick_market.start_price / 1e8:,.2f}")
+    print(f"Initial market: BTC @ ${quick_market.start_price / 1e8:,.2f}")
+    print(f"Market expires at: {quick_market.end_time}")
 
-    # Run the bot
+    # Run the bot with automatic market switching
     bot = MarketMakerBot(client)
+
     try:
+        # Start the market monitor as a background task
+        monitor_task = asyncio.create_task(bot.monitor_market_transitions())
+
+        # Initialize with the current market
+        await bot.switch_to_new_market(quick_market.market_id)
+
+        # Run the main trading loop
         await bot.run("https://api.turbinefi.com")
+    except KeyboardInterrupt:
+        print("\nShutting down...")
     finally:
+        bot.running = False
+        # Cancel any remaining orders before exit
+        if bot.market_id:
+            await bot.cancel_all_orders(bot.market_id)
         client.close()
+        print("Bot stopped cleanly.")
 
 
 if __name__ == "__main__":
@@ -317,6 +435,55 @@ The bot will:
 - Start trading based on your chosen algorithm
 
 To stop the bot, press Ctrl+C.
+```
+
+## Core Bot Run Method
+
+Every generated bot must include this `run()` method that handles WebSocket streaming with automatic market switching:
+
+```python
+async def run(self, host: str) -> None:
+    """
+    Main trading loop with WebSocket streaming and automatic market switching.
+    """
+    ws = TurbineWSClient(host)
+
+    while self.running:
+        try:
+            # Ensure we have a current market
+            if not self.market_id:
+                market_id, _ = await self.get_active_market()
+                await self.switch_to_new_market(market_id)
+
+            current_market = self.market_id
+
+            async with ws.connect_with_retry() as stream:
+                # Subscribe to the current market
+                await stream.subscribe(current_market)
+                print(f"Subscribed to market {current_market[:8]}...")
+
+                # Place initial quotes
+                await self.place_quotes()
+
+                async for message in stream:
+                    # Check if market has changed (set by monitor task)
+                    if self.market_id != current_market:
+                        print("Market changed, reconnecting to new market...")
+                        break  # Exit inner loop to reconnect
+
+                    if message.type == "orderbook":
+                        await self.on_orderbook_update(message.orderbook)
+                    elif message.type == "trade":
+                        await self.on_trade(message.trade)
+                    elif message.type == "order_cancelled":
+                        self.on_order_cancelled(message.data)
+
+        except WebSocketError as e:
+            print(f"WebSocket error: {e}, reconnecting...")
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            await asyncio.sleep(5)
 ```
 
 ## Algorithm Implementation Details
@@ -410,13 +577,33 @@ def find_edge(self, best_bid, best_ask):
     return None
 ```
 
+## Automatic Market Transition
+
+**All generated bots automatically handle market transitions.** When a BTC 15-minute market expires:
+
+1. **Detection**: The bot polls every 5 seconds for new markets
+2. **Order Cleanup**: All active orders on the expiring market are cancelled
+3. **Seamless Switch**: The bot automatically connects to the new market
+4. **Continued Trading**: Trading resumes on the new market without manual intervention
+
+**How it works:**
+- A background task (`monitor_market_transitions`) runs continuously
+- It compares the current market ID with the active market from the API
+- When a new market is detected, `switch_to_new_market()` handles the transition
+- Positions carry over (they're wallet-based), but orders must be re-placed
+
+**Warning before expiration:**
+- When less than 60 seconds remain, the bot logs a warning
+- Orders are cancelled proactively to avoid stuck orders on expired markets
+
 ## Important Notes for Users
 
 - **Risk Warning**: Trading involves risk. Start with small sizes.
 - **Testnet First**: Consider testing on Base Sepolia (chain_id=84532) first.
 - **Monitor Positions**: Always monitor your bot and have stop-loss logic.
-- **Market Expiration**: BTC 15-minute markets expire quickly. Bots handle this.
+- **Market Expiration**: BTC 15-minute markets expire quickly. Bots handle this automatically!
 - **Gas/Fees**: Trading on Polygon has minimal gas costs but watch for fees.
+- **Continuous Operation**: Bots are designed to run 24/7, switching between markets automatically.
 
 ## Quick Reference
 
