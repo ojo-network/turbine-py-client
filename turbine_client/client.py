@@ -983,21 +983,49 @@ class TurbineClient:
             raise ValueError(f"No RPC URL for chain {self._chain_id}")
 
         w3 = Web3(Web3.HTTPProvider(rpc_url))
+        print(f"Connected to RPC: {rpc_url}")
 
-        # Query getStaticMarketData() from market contract
-        # Returns: (ctf, collateralToken, conditionId, yesTokenId, noTokenId)
-        static_data_selector = "0x3e47d6f3"  # getStaticMarketData()
-        static_data = w3.eth.call({
+        # Ensure address is checksummed
+        market_contract_address = Web3.to_checksum_address(market_contract_address)
+        print(f"Market address: {market_contract_address}")
+
+        # Query individual getters from market contract
+        # ctf() -> address
+        print("Querying ctf()...")
+        ctf_data = w3.eth.call({
             "to": market_contract_address,
-            "data": static_data_selector,
+            "data": "0x22a9339f",  # ctf()
         })
+        ctf_address = Web3.to_checksum_address("0x" + ctf_data[12:32].hex())
+        print(f"CTF address: {ctf_address}")
 
-        # Decode the response (5 values: address, address, bytes32, uint256, uint256)
-        ctf_address = "0x" + static_data[12:32].hex()
-        collateral_token = "0x" + static_data[44:64].hex()
-        condition_id = "0x" + static_data[64:96].hex()
-        yes_token_id = int(static_data[96:128].hex(), 16)
-        no_token_id = int(static_data[128:160].hex(), 16)
+        # collateralToken() -> address
+        collateral_data = w3.eth.call({
+            "to": market_contract_address,
+            "data": "0xb2016bd4",  # collateralToken()
+        })
+        collateral_token = Web3.to_checksum_address("0x" + collateral_data[12:32].hex())
+
+        # conditionId() -> bytes32
+        condition_data = w3.eth.call({
+            "to": market_contract_address,
+            "data": "0x2ddc7de7",  # conditionId()
+        })
+        condition_id = "0x" + condition_data.hex()
+
+        # yesTokenId() -> uint256
+        yes_data = w3.eth.call({
+            "to": market_contract_address,
+            "data": "0x76cd28a2",  # yesTokenId()
+        })
+        yes_token_id = int(yes_data.hex(), 16)
+
+        # noTokenId() -> uint256
+        no_data = w3.eth.call({
+            "to": market_contract_address,
+            "data": "0x8c2557a8",  # noTokenId()
+        })
+        no_token_id = int(no_data.hex(), 16)
 
         print(f"Market data:")
         print(f"  CTF: {ctf_address}")
@@ -1006,14 +1034,19 @@ class TurbineClient:
 
         # Query getResolutionStatus() from market contract
         # Returns: (expired, resolved, assertionId, winningOutcome, canPropose, canSettle)
-        resolution_selector = "0x7a9262a2"  # getResolutionStatus()
+        resolution_selector = "0x13b63fce"  # getResolutionStatus()
         resolution_data = w3.eth.call({
             "to": market_contract_address,
             "data": resolution_selector,
         })
 
         # Decode: bool, bool, bytes32, uint8, bool, bool
-        resolved = bool(int(resolution_data[31:32].hex(), 16))
+        # Each value is padded to 32 bytes:
+        # expired: bytes 0-32 (value at byte 31)
+        # resolved: bytes 32-64 (value at byte 63)
+        # assertionId: bytes 64-96
+        # winningOutcome: bytes 96-128 (uint8 padded)
+        resolved = bool(resolution_data[63])
         winning_outcome = int(resolution_data[96:128].hex(), 16)
 
         if not resolved:
