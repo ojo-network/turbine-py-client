@@ -27,11 +27,12 @@ This client provides a clean, typed interface for:
 5. [Authentication](#authentication)
 6. [Order Management](#order-management)
 7. [Market Data](#market-data)
-8. [WebSocket Streaming](#websocket-streaming)
-9. [Data Types](#data-types)
-10. [API Reference](#api-reference)
-11. [Examples](#examples)
-12. [Development](#development)
+8. [Claiming Winnings](#claiming-winnings)
+9. [WebSocket Streaming](#websocket-streaming)
+10. [Data Types](#data-types)
+11. [API Reference](#api-reference)
+12. [Examples](#examples)
+13. [Development](#development)
 
 ---
 
@@ -351,7 +352,62 @@ print(f"Expires: {qm.end_time}")
 
 # Price feed
 price = client.get_quick_market_price(asset="BTC")
-print(f"Current BTC: ${price.price_usd}")
+print(f"Current BTC: ${price.price}")
+```
+
+---
+
+## Claiming Winnings
+
+After a market resolves, you can claim your winnings using gasless permits (no gas required).
+
+### Single Market
+
+```python
+from turbine_client import TurbineClient
+
+client = TurbineClient(
+    host="https://api.turbinefi.com",
+    chain_id=137,
+    private_key="your_wallet_private_key",
+    api_key_id="your_api_key_id",
+    api_private_key="your_api_private_key",
+)
+
+# Claim winnings from a resolved market
+result = client.claim_winnings("0xMarketContractAddress...")
+print(f"Transaction: {result['tx_hash']}")
+```
+
+### Batch Claiming (Multiple Markets)
+
+```python
+# Claim from multiple resolved markets in a single transaction
+result = client.batch_claim_winnings([
+    "0xMarket1Address...",
+    "0xMarket2Address...",
+    "0xMarket3Address...",
+])
+print(f"Transaction: {result['txHash']}")
+```
+
+### Command Line
+
+```bash
+# Single market
+python examples/claim_winnings.py 0xMarketAddress
+
+# Multiple markets
+python examples/batch_claim_winnings.py 0xMarket1 0xMarket2 --chain 137
+```
+
+### Checking Resolution Status
+
+```python
+# Check if a market is resolved
+resolution = client.get_resolution(market_id="0x...")
+print(f"Resolved: {resolution.resolved}")
+print(f"Winning outcome: {'YES' if resolution.outcome == 0 else 'NO'}")
 ```
 
 ---
@@ -477,36 +533,56 @@ class PriceLevel:
 
 @dataclass
 class Trade:
+    id: int
     market_id: str
+    buyer: str
+    seller: str
     price: int
     size: int
     outcome: int
-    side: int
-    maker: str
-    taker: str
     timestamp: int
-    trade_hash: str
+    tx_hash: str
 
 @dataclass
 class Position:
+    id: int
     market_id: str
     user_address: str
     yes_shares: int
     no_shares: int
-    invested: int
-    last_trade_price: int
+    yes_cost: int
+    no_cost: int
+    yes_revenue: int
+    no_revenue: int
+    total_invested: int
+    total_cost: int
+    total_revenue: int
+    last_updated: int
 
 @dataclass
 class Market:
     id: str
+    chain_id: int
+    contract_address: str
+    settlement_address: str
     question: str
     description: str
     category: str
-    expiration_time: int
-    contract_address: str
-    chain_id: int
+    expiration: int
+    maker: str
     resolved: bool
     winning_outcome: int | None
+    volume: int
+    created_at: int
+    updated_at: int
+
+@dataclass
+class Resolution:
+    market_id: str
+    assertion_id: str
+    outcome: int
+    resolved: bool
+    timestamp: int
 ```
 
 ---
@@ -518,12 +594,22 @@ class Market:
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `get_markets()` | `GET /api/v1/markets` | List all markets |
+| `get_market(market_id)` | `GET /api/v1/stats/{id}` | Get market stats |
 | `get_orderbook(market_id)` | `GET /api/v1/orderbook/{id}` | Get orderbook |
 | `get_trades(market_id)` | `GET /api/v1/trades/{id}` | Get trade history |
 | `get_stats(market_id)` | `GET /api/v1/stats/{id}` | Get market stats |
 | `get_platform_stats()` | `GET /api/v1/platform/stats` | Get platform stats |
 | `get_holders(market_id)` | `GET /api/v1/holders/{id}` | Get top holders |
+| `get_resolution(market_id)` | `GET /api/v1/resolution/{id}` | Get resolution status |
 | `get_quick_market(asset)` | `GET /api/v1/quick-markets/{asset}` | Get active quick market |
+| `get_quick_market_history(asset)` | `GET /api/v1/quick-markets/{asset}/history` | Get quick market history |
+| `get_quick_market_price(asset)` | `GET /api/v1/quick-markets/{asset}/price` | Get current asset price |
+| `get_quick_market_price_history(asset)` | `GET /api/v1/quick-markets/{asset}/price-history` | Get asset price history |
+| `get_failed_trades()` | `GET /api/v1/failed-trades` | Get failed trades |
+| `get_pending_trades()` | `GET /api/v1/pending-trades` | Get pending trades |
+| `get_failed_claims()` | `GET /api/v1/failed-claims` | Get failed claims |
+| `get_pending_claims()` | `GET /api/v1/pending-claims` | Get pending claims |
+| `get_settlement_status(tx_hash)` | `GET /api/v1/settlements/{hash}` | Get settlement status |
 
 ### Authenticated Endpoints (Bearer Token)
 
@@ -531,17 +617,21 @@ class Market:
 |--------|----------|-------------|
 | `post_order(order)` | `POST /api/v1/orders` | Submit signed order |
 | `get_orders(trader)` | `GET /api/v1/orders` | Get user's open orders |
+| `get_order(hash)` | `GET /api/v1/orders/{hash}` | Get specific order |
 | `cancel_order(hash)` | `DELETE /api/v1/orders/{hash}` | Cancel order |
-| `get_positions(user)` | `GET /api/v1/positions/{market}` | Get user position |
-| `get_user_positions(addr)` | `GET /api/v1/users/{addr}/positions` | All positions |
+| `get_positions(market_id)` | `GET /api/v1/positions/{market}` | Get positions for market |
+| `get_user_positions(addr)` | `GET /api/v1/users/{addr}/positions` | All user positions |
+| `get_user_orders(addr)` | `GET /api/v1/users/{addr}/orders` | All user orders |
 | `get_user_activity(addr)` | `GET /api/v1/users/{addr}/activity` | Trading activity |
+| `get_user_stats()` | `GET /api/v1/user-stats` | Authenticated user stats |
 
 ### Relayer Endpoints (Gasless)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `ctf_approval(request)` | `POST /api/v1/relayer/ctf-approval` | Gasless CTF approval |
-| `ctf_redemption(request)` | `POST /api/v1/relayer/ctf-redemption` | Gasless redemption |
+| `approve_ctf_for_settlement()` | `POST /api/v1/relayer/ctf-approval` | Gasless CTF approval |
+| `claim_winnings(market_addr)` | `POST /api/v1/relayer/ctf-redemption` | Claim from single market |
+| `batch_claim_winnings(addrs)` | `POST /api/v1/relayer/batch-ctf-redemption` | Claim from multiple markets |
 
 ---
 
@@ -671,7 +761,9 @@ ruff format turbine_py_client/
 
 | Chain | Chain ID |
 |-------|----------|
-| Polygon | 137 |
+| Polygon Mainnet | 137 |
+| Avalanche Mainnet | 43114 |
+| Base Sepolia | 84532 |
 
 ---
 

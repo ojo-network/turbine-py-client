@@ -12,16 +12,24 @@ from turbine_client.http import HttpClient
 from turbine_client.order_builder import OrderBuilder
 from turbine_client.signer import Signer, create_signer
 from turbine_client.types import (
+    AssetPrice,
+    FailedClaim,
+    FailedTrade,
+    Holder,
     Market,
     MarketStats,
     Order,
     OrderArgs,
     OrderBookSnapshot,
     Outcome,
+    PendingClaim,
+    PendingTrade,
     PermitSignature,
     PlatformStats,
     Position,
     QuickMarket,
+    Resolution,
+    SettlementStatus,
     Side,
     SignedOrder,
     Trade,
@@ -166,18 +174,18 @@ class TurbineClient:
         markets = response.get("markets", []) if isinstance(response, dict) else response
         return [Market.from_dict(m) for m in markets]
 
-    def get_market(self, market_id: str) -> Market:
-        """Get a specific market.
+    def get_market(self, market_id: str) -> MarketStats:
+        """Get stats for a specific market.
 
         Args:
             market_id: The market ID.
 
         Returns:
-            The market.
+            The market stats.
         """
-        endpoint = ENDPOINTS["market"].format(market_id=market_id)
+        endpoint = ENDPOINTS["stats"].format(market_id=market_id)
         response = self._http.get(endpoint)
-        return Market.from_dict(response)
+        return MarketStats.from_dict(response)
 
     def get_orderbook(
         self,
@@ -239,7 +247,7 @@ class TurbineClient:
         response = self._http.get(ENDPOINTS["platform_stats"])
         return PlatformStats.from_dict(response)
 
-    def get_holders(self, market_id: str, limit: int = 100) -> List[Position]:
+    def get_holders(self, market_id: str, limit: int = 100) -> List[Holder]:
         """Get top position holders for a market.
 
         Args:
@@ -247,13 +255,13 @@ class TurbineClient:
             limit: Maximum number of holders to return.
 
         Returns:
-            List of positions.
+            List of top holders.
         """
         endpoint = ENDPOINTS["holders"].format(market_id=market_id)
         params = {"limit": limit}
         response = self._http.get(endpoint, params=params)
-        holders = response.get("holders", []) if isinstance(response, dict) else response
-        return [Position.from_dict(h) for h in holders]
+        holders = response.get("topHolders", []) if isinstance(response, dict) else response
+        return [Holder.from_dict(h) for h in holders]
 
     def get_quick_market(self, asset: str) -> QuickMarket:
         """Get the active quick market for an asset.
@@ -285,6 +293,103 @@ class TurbineClient:
         response = self._http.get(endpoint, params=params)
         markets = response.get("markets", []) if isinstance(response, dict) else response
         return [QuickMarket.from_dict(m) for m in markets]
+
+    def get_quick_market_price(self, asset: str) -> AssetPrice:
+        """Get the current price for an asset.
+
+        Args:
+            asset: The asset symbol (e.g., "BTC", "ETH").
+
+        Returns:
+            The current asset price.
+        """
+        endpoint = ENDPOINTS["quick_market_price"].format(asset=asset)
+        response = self._http.get(endpoint)
+        return AssetPrice.from_dict(response)
+
+    def get_quick_market_price_history(
+        self, asset: str, limit: int = 100
+    ) -> List[AssetPrice]:
+        """Get price history for an asset.
+
+        Args:
+            asset: The asset symbol (e.g., "BTC", "ETH").
+            limit: Maximum number of prices to return.
+
+        Returns:
+            List of historical prices.
+        """
+        endpoint = ENDPOINTS["quick_market_price_history"].format(asset=asset)
+        params = {"limit": limit}
+        response = self._http.get(endpoint, params=params)
+        prices = response if isinstance(response, list) else response.get("prices", [])
+        return [AssetPrice.from_dict(p) for p in prices]
+
+    def get_resolution(self, market_id: str) -> Resolution:
+        """Get resolution status for a market.
+
+        Args:
+            market_id: The market ID.
+
+        Returns:
+            The resolution status.
+        """
+        endpoint = ENDPOINTS["resolution"].format(market_id=market_id)
+        response = self._http.get(endpoint)
+        return Resolution.from_dict(response)
+
+    def get_failed_trades(self) -> List[FailedTrade]:
+        """Get all failed trades.
+
+        Returns:
+            List of failed trades.
+        """
+        response = self._http.get(ENDPOINTS["failed_trades"])
+        trades = response.get("failedTrades", []) if isinstance(response, dict) else response
+        return [FailedTrade.from_dict(t) for t in trades]
+
+    def get_pending_trades(self) -> List[PendingTrade]:
+        """Get all pending trades.
+
+        Returns:
+            List of pending trades.
+        """
+        response = self._http.get(ENDPOINTS["pending_trades"])
+        trades = response.get("pendingTrades", []) if isinstance(response, dict) else response
+        return [PendingTrade.from_dict(t) for t in trades]
+
+    def get_failed_claims(self) -> List[FailedClaim]:
+        """Get all failed claims.
+
+        Returns:
+            List of failed claims.
+        """
+        response = self._http.get(ENDPOINTS["failed_claims"])
+        claims = response if isinstance(response, list) else response.get("failedClaims", [])
+        return [FailedClaim.from_dict(c) for c in claims]
+
+    def get_pending_claims(self) -> List[PendingClaim]:
+        """Get all pending claims.
+
+        Returns:
+            List of pending claims.
+        """
+        response = self._http.get(ENDPOINTS["pending_claims"])
+        claims = response if isinstance(response, list) else response.get("pendingClaims", [])
+        return [PendingClaim.from_dict(c) for c in claims]
+
+    def get_settlement_status(self, tx_hash: str) -> SettlementStatus:
+        """Get settlement status for a transaction.
+
+        Args:
+            tx_hash: The transaction hash.
+
+        Returns:
+            The settlement status.
+        """
+        endpoint = ENDPOINTS["settlement_status"].format(tx_hash=tx_hash)
+        response = self._http.get(endpoint)
+        return SettlementStatus.from_dict(response)
 
     # =========================================================================
     # Order Management (Requires Signing)
@@ -620,6 +725,19 @@ class TurbineClient:
         endpoint = ENDPOINTS["user_activity"].format(address=address)
         response = self._http.get(endpoint, authenticated=True)
         return UserActivity.from_dict(response)
+
+    def get_user_stats(self) -> Dict[str, Any]:
+        """Get statistics for the authenticated user.
+
+        Returns:
+            User statistics.
+
+        Raises:
+            AuthenticationError: If no auth is configured.
+        """
+        self._require_auth()
+        response = self._http.get(ENDPOINTS["user_stats"], authenticated=True)
+        return response
 
     # =========================================================================
     # Relayer Endpoints (Gasless Operations)
@@ -1143,6 +1261,210 @@ class TurbineClient:
             market_address=market_contract_address,
         )
 
+    def request_batch_ctf_redemption(
+        self,
+        redemptions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Request batch gasless CTF token redemption via relayer.
+
+        Args:
+            redemptions: List of redemption requests, each containing:
+                - owner: The token owner address
+                - collateralToken: The USDC address
+                - parentCollectionId: Parent collection ID (bytes32(0) for collateral)
+                - conditionId: The market's condition ID
+                - indexSets: Array of index sets to redeem
+                - deadline: Permit deadline timestamp
+                - v: Signature v value
+                - r: Signature r value
+                - s: Signature s value
+                - marketAddress: Optional market contract address
+
+        Returns:
+            The relayer response with txHash on success.
+
+        Raises:
+            AuthenticationError: If no auth is configured.
+        """
+        self._require_auth()
+        data = {
+            "chainId": self._chain_id,
+            "redemptions": redemptions,
+        }
+        return self._http.post(
+            ENDPOINTS["batch_ctf_redemption"], data=data, authenticated=True
+        )
+
+    def batch_claim_winnings(
+        self,
+        market_contract_addresses: List[str],
+    ) -> Dict[str, Any]:
+        """Claim winnings from multiple resolved markets using gasless permits.
+
+        This queries each market contract for resolution status and condition data,
+        signs EIP-712 permits for each, and submits a batch to the relayer.
+
+        Args:
+            market_contract_addresses: List of market contract addresses to claim from.
+
+        Returns:
+            The relayer response with txHash on success.
+
+        Raises:
+            ValueError: If any market is not resolved or user has no winnings.
+            AuthenticationError: If no signer is configured.
+        """
+        self._require_signer()
+        self._require_auth()
+
+        import time
+        from eth_account import Account
+        from web3 import Web3
+
+        owner = self._signer.address
+
+        # Get RPC URL
+        rpc_urls = {
+            137: "https://polygon-rpc.com",
+            43114: "https://api.avax.network/ext/bc/C/rpc",
+            84532: "https://sepolia.base.org",
+        }
+        rpc_url = rpc_urls.get(self._chain_id)
+        if not rpc_url:
+            raise ValueError(f"No RPC URL for chain {self._chain_id}")
+
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+        redemptions = []
+
+        for market_address in market_contract_addresses:
+            market_address = Web3.to_checksum_address(market_address)
+
+            # Query market contract data
+            ctf_data = w3.eth.call({
+                "to": market_address,
+                "data": "0x22a9339f",  # ctf()
+            })
+            ctf_address = Web3.to_checksum_address("0x" + ctf_data[12:32].hex())
+
+            collateral_data = w3.eth.call({
+                "to": market_address,
+                "data": "0xb2016bd4",  # collateralToken()
+            })
+            collateral_token = Web3.to_checksum_address("0x" + collateral_data[12:32].hex())
+
+            condition_data = w3.eth.call({
+                "to": market_address,
+                "data": "0x2ddc7de7",  # conditionId()
+            })
+            condition_id = "0x" + condition_data.hex()
+
+            yes_data = w3.eth.call({
+                "to": market_address,
+                "data": "0x76cd28a2",  # yesTokenId()
+            })
+            yes_token_id = int(yes_data.hex(), 16)
+
+            no_data = w3.eth.call({
+                "to": market_address,
+                "data": "0x8c2557a8",  # noTokenId()
+            })
+            no_token_id = int(no_data.hex(), 16)
+
+            # Check resolution status
+            resolution_data = w3.eth.call({
+                "to": market_address,
+                "data": "0x13b63fce",  # getResolutionStatus()
+            })
+            resolved = bool(resolution_data[63])
+            winning_outcome = int(resolution_data[96:128].hex(), 16)
+
+            if not resolved:
+                print(f"Skipping {market_address}: not resolved")
+                continue
+
+            # Check balance
+            winning_token_id = yes_token_id if winning_outcome == 0 else no_token_id
+            balance_call = "0x00fdd58e" + owner[2:].lower().zfill(64) + hex(winning_token_id)[2:].zfill(64)
+            balance_data = w3.eth.call({
+                "to": ctf_address,
+                "data": balance_call,
+            })
+            balance = int(balance_data.hex(), 16)
+
+            if balance == 0:
+                print(f"Skipping {market_address}: no winning tokens")
+                continue
+
+            # Get nonce and sign
+            nonce = self._get_contract_nonce(owner, ctf_address)
+            deadline = int(time.time()) + 3600
+            index_sets = [1 if winning_outcome == 0 else 2]
+
+            typed_data = {
+                "types": {
+                    "EIP712Domain": [
+                        {"name": "name", "type": "string"},
+                        {"name": "version", "type": "string"},
+                        {"name": "chainId", "type": "uint256"},
+                        {"name": "verifyingContract", "type": "address"},
+                    ],
+                    "RedeemPositions": [
+                        {"name": "owner", "type": "address"},
+                        {"name": "collateralToken", "type": "address"},
+                        {"name": "parentCollectionId", "type": "bytes32"},
+                        {"name": "conditionId", "type": "bytes32"},
+                        {"name": "indexSets", "type": "uint256[]"},
+                        {"name": "nonce", "type": "uint256"},
+                        {"name": "deadline", "type": "uint256"},
+                    ],
+                },
+                "primaryType": "RedeemPositions",
+                "domain": {
+                    "name": "ConditionalTokensWithPermit",
+                    "version": "1",
+                    "chainId": self._chain_id,
+                    "verifyingContract": ctf_address,
+                },
+                "message": {
+                    "owner": owner,
+                    "collateralToken": collateral_token,
+                    "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "conditionId": condition_id,
+                    "indexSets": index_sets,
+                    "nonce": nonce,
+                    "deadline": deadline,
+                },
+            }
+
+            signed = Account.sign_typed_data(
+                self._signer._account.key,
+                full_message=typed_data,
+            )
+
+            v = signed.v
+            r = "0x" + hex(signed.r)[2:].zfill(64)
+            s = "0x" + hex(signed.s)[2:].zfill(64)
+
+            redemptions.append({
+                "owner": owner,
+                "collateralToken": collateral_token,
+                "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "conditionId": condition_id,
+                "indexSets": [str(i) for i in index_sets],
+                "deadline": str(deadline),
+                "v": v,
+                "r": r,
+                "s": s,
+                "marketAddress": market_address,
+            })
+
+            print(f"Added {market_address} to batch (balance: {balance / 1_000_000:.2f})")
+
+        if not redemptions:
+            raise ValueError("No markets with winning tokens to redeem")
+
+        print(f"Submitting batch redemption for {len(redemptions)} markets...")
+        return self.request_batch_ctf_redemption(redemptions)
 
     # =========================================================================
     # API Key Registration (Self-Service Credentials)

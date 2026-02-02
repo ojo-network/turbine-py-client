@@ -145,29 +145,29 @@ class OrderBookSnapshot:
 class Trade:
     """A trade execution."""
 
+    id: int
     market_id: str
+    buyer: str
+    seller: str
     price: int
     size: int
     outcome: int
-    side: int
-    maker: str
-    taker: str
     timestamp: int
-    trade_hash: str
+    tx_hash: str
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Trade":
         """Create from API response dictionary."""
         return cls(
+            id=int(data.get("id", 0)),
             market_id=data.get("marketId", ""),
+            buyer=data.get("buyer", ""),
+            seller=data.get("seller", ""),
             price=int(data.get("price", 0)),
             size=int(data.get("size", 0)),
             outcome=int(data.get("outcome", 0)),
-            side=int(data.get("side", 0)),
-            maker=data.get("maker", ""),
-            taker=data.get("taker", ""),
             timestamp=int(data.get("timestamp", 0)),
-            trade_hash=data.get("tradeHash", ""),
+            tx_hash=data.get("txHash", ""),
         )
 
 
@@ -175,23 +175,57 @@ class Trade:
 class Position:
     """A user's position in a market."""
 
+    id: int
     market_id: str
     user_address: str
     yes_shares: int
     no_shares: int
-    invested: int
-    last_trade_price: int
+    yes_cost: int
+    no_cost: int
+    yes_revenue: int
+    no_revenue: int
+    total_invested: int
+    total_cost: int
+    total_revenue: int
+    last_updated: int
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Position":
         """Create from API response dictionary."""
         return cls(
+            id=int(data.get("id", 0)),
             market_id=data.get("marketId", ""),
             user_address=data.get("userAddress", ""),
             yes_shares=int(data.get("yesShares", 0)),
             no_shares=int(data.get("noShares", 0)),
-            invested=int(data.get("invested", 0)),
-            last_trade_price=int(data.get("lastTradePrice", 0)),
+            yes_cost=int(data.get("yesCost", 0)),
+            no_cost=int(data.get("noCost", 0)),
+            yes_revenue=int(data.get("yesRevenue", 0)),
+            no_revenue=int(data.get("noRevenue", 0)),
+            total_invested=int(data.get("totalInvested", 0)),
+            total_cost=int(data.get("totalCost", 0)),
+            total_revenue=int(data.get("totalRevenue", 0)),
+            last_updated=int(data.get("lastUpdated", 0)),
+        )
+
+
+@dataclass
+class Holder:
+    """A top holder in a market."""
+
+    user_address: str
+    yes_shares: int
+    no_shares: int
+    total_invested: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Holder":
+        """Create from API response dictionary."""
+        return cls(
+            user_address=data.get("userAddress", ""),
+            yes_shares=int(data.get("yesShares", 0)),
+            no_shares=int(data.get("noShares", 0)),
+            total_invested=int(data.get("totalInvested", 0)),
         )
 
 
@@ -200,30 +234,38 @@ class Market:
     """A prediction market."""
 
     id: str
+    chain_id: int
+    contract_address: str
+    settlement_address: str
     question: str
     description: str
     category: str
-    expiration_time: int
-    contract_address: str
-    chain_id: int
+    expiration: int
+    maker: str
     resolved: bool
-    settlement_address: str = ""
-    winning_outcome: Optional[int] = None
+    winning_outcome: Optional[int]
+    volume: int
+    created_at: int
+    updated_at: int
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Market":
         """Create from API response dictionary."""
         return cls(
             id=data.get("id", ""),
+            chain_id=int(data.get("chainId", 0)),
+            contract_address=data.get("contractAddress", ""),
+            settlement_address=data.get("settlementAddress", ""),
             question=data.get("question", ""),
             description=data.get("description", ""),
             category=data.get("category", ""),
-            expiration_time=int(data.get("expirationTime", data.get("expiration", 0))),
-            contract_address=data.get("contractAddress", ""),
-            chain_id=int(data.get("chainId", 0)),
+            expiration=int(data.get("expiration", 0)),
+            maker=data.get("maker", ""),
             resolved=data.get("resolved", False),
-            settlement_address=data.get("settlementAddress", ""),
             winning_outcome=data.get("winningOutcome"),
+            volume=int(data.get("volume", 0)),
+            created_at=int(data.get("createdAt", 0)),
+            updated_at=int(data.get("updatedAt", 0)),
         )
 
 
@@ -232,22 +274,40 @@ class MarketStats:
     """Statistics for a market."""
 
     market_id: str
-    volume_24h: int
-    volume_total: int
+    contract_address: str
     last_price: int
-    price_change_24h: int
-    open_interest: int
+    total_volume: int
+    volume_24h: int
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MarketStats":
         """Create from API response dictionary."""
         return cls(
             market_id=data.get("marketId", ""),
-            volume_24h=int(data.get("volume24h", 0)),
-            volume_total=int(data.get("volumeTotal", 0)),
+            contract_address=data.get("contractAddress", ""),
             last_price=int(data.get("lastPrice", 0)),
-            price_change_24h=int(data.get("priceChange24h", 0)),
-            open_interest=int(data.get("openInterest", 0)),
+            total_volume=int(data.get("totalVolume", 0)),
+            volume_24h=int(data.get("volume24h", 0)),
+        )
+
+
+@dataclass
+class ChainStats:
+    """Statistics for a single chain."""
+
+    chain_id: int
+    total_volume: int
+    total_trades: int
+    updated_at: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ChainStats":
+        """Create from API response dictionary."""
+        return cls(
+            chain_id=int(data.get("chain_id", 0)),
+            total_volume=int(data.get("total_volume", 0)),
+            total_trades=int(data.get("total_trades", 0)),
+            updated_at=int(data.get("updated_at", 0)),
         )
 
 
@@ -255,17 +315,17 @@ class MarketStats:
 class PlatformStats:
     """Platform-wide statistics."""
 
-    market_count: int
+    chains: List["ChainStats"]
     total_volume: int
-    total_traders: int
+    total_trades: int
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PlatformStats":
         """Create from API response dictionary."""
         return cls(
-            market_count=int(data.get("marketCount", 0)),
-            total_volume=int(data.get("totalVolume", 0)),
-            total_traders=int(data.get("totalTraders", 0)),
+            chains=[ChainStats.from_dict(c) for c in data.get("chains", [])],
+            total_volume=int(data.get("total_volume", 0)),
+            total_trades=int(data.get("total_trades", 0)),
         )
 
 
@@ -273,23 +333,223 @@ class PlatformStats:
 class QuickMarket:
     """A quick market (15-minute BTC/ETH markets)."""
 
+    id: int
     market_id: str
     asset: str
-    start_price: int  # Price in 8 decimals
+    interval_minutes: int
+    start_price: int
+    end_price: Optional[int]
+    start_time: int
     end_time: int
     resolved: bool
-    winning_outcome: Optional[int] = None
+    outcome: Optional[int]
+    price_source: str
+    created_at: int
+    contract_address: str
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QuickMarket":
         """Create from API response dictionary."""
         return cls(
+            id=int(data.get("id", 0)),
             market_id=data.get("marketId", ""),
             asset=data.get("asset", ""),
+            interval_minutes=int(data.get("intervalMinutes", 0)),
             start_price=int(data.get("startPrice", 0)),
+            end_price=data.get("endPrice"),
+            start_time=int(data.get("startTime", 0)),
             end_time=int(data.get("endTime", 0)),
             resolved=data.get("resolved", False),
-            winning_outcome=data.get("winningOutcome"),
+            outcome=data.get("outcome"),
+            price_source=data.get("priceSource", ""),
+            created_at=int(data.get("createdAt", 0)),
+            contract_address=data.get("contractAddress", ""),
+        )
+
+
+@dataclass
+class Resolution:
+    """Market resolution status."""
+
+    market_id: str
+    assertion_id: str
+    outcome: int
+    resolved: bool
+    timestamp: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Resolution":
+        """Create from API response dictionary."""
+        return cls(
+            market_id=data.get("marketId", ""),
+            assertion_id=data.get("assertionId", ""),
+            outcome=int(data.get("outcome", 0)),
+            resolved=data.get("resolved", False),
+            timestamp=int(data.get("timestamp", 0)),
+        )
+
+
+@dataclass
+class FailedTrade:
+    """A failed trade."""
+
+    market_id: str
+    tx_hash: str
+    buyer_address: str
+    seller_address: str
+    fill_size: int
+    fill_price: int
+    reason: str
+    timestamp: str
+    batch_index: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FailedTrade":
+        """Create from API response dictionary."""
+        return cls(
+            market_id=data.get("marketId", ""),
+            tx_hash=data.get("txHash", ""),
+            buyer_address=data.get("buyerAddress", ""),
+            seller_address=data.get("sellerAddress", ""),
+            fill_size=int(data.get("fillSize", 0)),
+            fill_price=int(data.get("fillPrice", 0)),
+            reason=data.get("reason", ""),
+            timestamp=data.get("timestamp", ""),
+            batch_index=int(data.get("batchIndex", 0)),
+        )
+
+
+@dataclass
+class PendingTrade:
+    """A pending trade."""
+
+    market_id: str
+    tx_hash: str
+    buyer_address: str
+    seller_address: str
+    fill_size: int
+    fill_price: int
+    timestamp: str
+    is_batch: bool
+    batch_index: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PendingTrade":
+        """Create from API response dictionary."""
+        return cls(
+            market_id=data.get("marketId", ""),
+            tx_hash=data.get("txHash", ""),
+            buyer_address=data.get("buyerAddress", ""),
+            seller_address=data.get("sellerAddress", ""),
+            fill_size=int(data.get("fillSize", 0)),
+            fill_price=int(data.get("fillPrice", 0)),
+            timestamp=data.get("timestamp", ""),
+            is_batch=data.get("isBatch", False),
+            batch_index=int(data.get("batchIndex", 0)),
+        )
+
+
+@dataclass
+class FailedClaim:
+    """A failed claim."""
+
+    tx_hash: str
+    user_address: str
+    market_address: str
+    market_id: str
+    payout: int
+    winning_outcome: int
+    submitted_at: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FailedClaim":
+        """Create from API response dictionary."""
+        return cls(
+            tx_hash=data.get("txHash", ""),
+            user_address=data.get("userAddress", ""),
+            market_address=data.get("marketAddress", ""),
+            market_id=data.get("marketId", ""),
+            payout=int(data.get("payout", 0)),
+            winning_outcome=int(data.get("winningOutcome", 0)),
+            submitted_at=int(data.get("submittedAt", 0)),
+        )
+
+
+@dataclass
+class PendingClaim:
+    """A pending claim."""
+
+    tx_hash: str
+    user_address: str
+    market_address: str
+    market_id: str
+    payout: int
+    winning_outcome: int
+    submitted_at: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PendingClaim":
+        """Create from API response dictionary."""
+        return cls(
+            tx_hash=data.get("txHash", ""),
+            user_address=data.get("userAddress", ""),
+            market_address=data.get("marketAddress", ""),
+            market_id=data.get("marketId", ""),
+            payout=int(data.get("payout", 0)),
+            winning_outcome=int(data.get("winningOutcome", 0)),
+            submitted_at=int(data.get("submittedAt", 0)),
+        )
+
+
+@dataclass
+class SettlementStatus:
+    """Settlement status for a transaction."""
+
+    found: bool
+    tx_hash: str
+    status: str
+    error: str
+    market_id: str
+    buyer_address: str
+    seller_address: str
+    fill_size: int
+    fill_price: int
+    timestamp: str
+    is_batch: bool
+    batch_index: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SettlementStatus":
+        """Create from API response dictionary."""
+        return cls(
+            found=data.get("found", False),
+            tx_hash=data.get("txHash", ""),
+            status=data.get("status", ""),
+            error=data.get("error", ""),
+            market_id=data.get("marketId", ""),
+            buyer_address=data.get("buyerAddress", ""),
+            seller_address=data.get("sellerAddress", ""),
+            fill_size=int(data.get("fillSize", 0)),
+            fill_price=int(data.get("fillPrice", 0)),
+            timestamp=data.get("timestamp", ""),
+            is_batch=data.get("isBatch", False),
+            batch_index=int(data.get("batchIndex", 0)),
+        )
+
+
+@dataclass
+class AssetPrice:
+    """Current price for an asset."""
+
+    price: float
+    timestamp: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AssetPrice":
+        """Create from API response dictionary."""
+        return cls(
+            price=float(data.get("price", 0)),
+            timestamp=int(data.get("timestamp", 0)),
         )
 
 

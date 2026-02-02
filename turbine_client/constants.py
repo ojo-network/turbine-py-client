@@ -20,27 +20,44 @@ SIZE_DECIMALS = 6
 
 # API endpoints
 ENDPOINTS = {
-    # Public endpoints (no auth)
+    # Health
     "health": "/health",
+
+    # Public endpoints (no auth required for GET)
     "markets": "/api/v1/markets",
-    "market": "/api/v1/markets/{market_id}",
     "orderbook": "/api/v1/orderbook/{market_id}",
     "trades": "/api/v1/trades/{market_id}",
     "stats": "/api/v1/stats/{market_id}",
     "platform_stats": "/api/v1/platform/stats",
     "holders": "/api/v1/holders/{market_id}",
+    "resolution": "/api/v1/resolution/{market_id}",
+
+    # Failed/Pending tracking
+    "failed_trades": "/api/v1/failed-trades",
+    "pending_trades": "/api/v1/pending-trades",
+    "failed_claims": "/api/v1/failed-claims",
+    "pending_claims": "/api/v1/pending-claims",
+    "settlement_status": "/api/v1/settlements/{tx_hash}",
+
+    # Quick markets
     "quick_market": "/api/v1/quick-markets/{asset}",
     "quick_market_history": "/api/v1/quick-markets/{asset}/history",
+    "quick_market_price": "/api/v1/quick-markets/{asset}/price",
+    "quick_market_price_history": "/api/v1/quick-markets/{asset}/price-history",
+
     # Authenticated endpoints (bearer token)
     "orders": "/api/v1/orders",
     "order": "/api/v1/orders/{order_hash}",
-    "positions": "/api/v1/positions/{market_id}",
+    "positions": "/api/v1/positions/{market_address}",
     "user_positions": "/api/v1/users/{address}/positions",
     "user_orders": "/api/v1/users/{address}/orders",
     "user_activity": "/api/v1/users/{address}/activity",
+    "user_stats": "/api/v1/user-stats",
+
     # Relayer endpoints
     "ctf_approval": "/api/v1/relayer/ctf-approval",
     "ctf_redemption": "/api/v1/relayer/ctf-redemption",
+    "batch_ctf_redemption": "/api/v1/relayer/batch-ctf-redemption",
 }
 
 # WebSocket endpoint
