@@ -192,24 +192,25 @@ class TestTrade:
     def test_from_dict(self, market_id, test_address):
         """Test creating Trade from dict."""
         data = {
+            "id": 1,
             "marketId": market_id,
+            "buyer": test_address,
+            "seller": "0x" + "11" * 20,
             "price": 500000,
             "size": 1000000,
             "outcome": 0,
-            "side": 0,
-            "maker": test_address,
-            "taker": "0x" + "11" * 20,
             "timestamp": 1735689600,
-            "tradeHash": "0x" + "ab" * 32,
+            "txHash": "0x" + "ab" * 32,
         }
         trade = Trade.from_dict(data)
 
+        assert trade.id == 1
         assert trade.market_id == market_id
         assert trade.price == 500000
         assert trade.size == 1000000
         assert trade.outcome == 0
-        assert trade.side == 0
-        assert trade.maker == test_address
+        assert trade.buyer == test_address
+        assert trade.tx_hash == "0x" + "ab" * 32
         assert trade.timestamp == 1735689600
 
 
@@ -219,20 +220,29 @@ class TestPosition:
     def test_from_dict(self, market_id, test_address):
         """Test creating Position from dict."""
         data = {
+            "id": 1,
             "marketId": market_id,
             "userAddress": test_address,
             "yesShares": 5000000,
             "noShares": 0,
-            "invested": 2500000,
-            "lastTradePrice": 500000,
+            "yesCost": 2500000,
+            "noCost": 0,
+            "yesRevenue": 0,
+            "noRevenue": 0,
+            "totalInvested": 2500000,
+            "totalCost": 2500000,
+            "totalRevenue": 0,
+            "lastUpdated": 1735689600,
         }
         position = Position.from_dict(data)
 
+        assert position.id == 1
         assert position.market_id == market_id
         assert position.user_address == test_address
         assert position.yes_shares == 5000000
         assert position.no_shares == 0
-        assert position.invested == 2500000
+        assert position.total_invested == 2500000
+        assert position.last_updated == 1735689600
 
 
 class TestMarket:
