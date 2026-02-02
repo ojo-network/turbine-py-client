@@ -111,25 +111,23 @@ class TestPublicEndpoints:
 
     @respx.mock
     def test_get_market(self, client, host, market_id):
-        """Test getting a specific market."""
-        respx.get(f"{host}/api/v1/markets/{market_id}").mock(
+        """Test getting market stats."""
+        respx.get(f"{host}/api/v1/stats/{market_id}").mock(
             return_value=Response(
                 200,
                 json={
-                    "id": market_id,
-                    "question": "Test market?",
-                    "description": "",
-                    "category": "test",
-                    "expirationTime": 1735689600,
+                    "marketId": market_id,
                     "contractAddress": "0x" + "aa" * 20,
-                    "chainId": 137,
-                    "resolved": False,
+                    "lastPrice": 500000,
+                    "totalVolume": 10000000,
+                    "volume24h": 1000000,
                 },
             )
         )
 
-        market = client.get_market(market_id)
-        assert market.id == market_id
+        stats = client.get_market(market_id)
+        assert stats.market_id == market_id
+        assert stats.last_price == 500000
 
     @respx.mock
     def test_get_orderbook(self, client, host, market_id):
@@ -160,15 +158,15 @@ class TestPublicEndpoints:
                 json={
                     "trades": [
                         {
+                            "id": 1,
                             "marketId": market_id,
+                            "buyer": test_address,
+                            "seller": "0x" + "bb" * 20,
                             "price": 500000,
                             "size": 1000000,
                             "outcome": 0,
-                            "side": 0,
-                            "maker": test_address,
-                            "taker": "0x" + "bb" * 20,
                             "timestamp": 1735689600,
-                            "tradeHash": "0x" + "cc" * 32,
+                            "txHash": "0x" + "cc" * 32,
                         }
                     ]
                 },
@@ -182,7 +180,7 @@ class TestPublicEndpoints:
     @respx.mock
     def test_api_error_handling(self, client, host, market_id):
         """Test API error handling."""
-        respx.get(f"{host}/api/v1/markets/{market_id}").mock(
+        respx.get(f"{host}/api/v1/stats/{market_id}").mock(
             return_value=Response(404, json={"error": "Market not found"})
         )
 
