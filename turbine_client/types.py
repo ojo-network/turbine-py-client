@@ -383,7 +383,7 @@ class Resolution:
         return cls(
             market_id=data.get("marketId", ""),
             assertion_id=data.get("assertionId", ""),
-            outcome=int(data.get("outcome", 0)),
+            outcome=int(data.get("winningOutcome", data.get("outcome", 0))),
             resolved=data.get("resolved", False),
             timestamp=int(data.get("timestamp", 0)),
         )
@@ -610,6 +610,30 @@ class UserActivity:
             total_volume=int(data.get("totalVolume", 0)),
             pnl=int(data.get("pnl", 0)),
             markets_traded=int(data.get("marketsTraded", 0)),
+        )
+
+
+@dataclass
+class UserStats:
+    """User statistics."""
+
+    user_address: str
+    total_cost: int  # Total USDC spent on positions (6 decimals)
+    total_invested: int  # Total USDC invested in positions (6 decimals)
+    position_value: int  # Current value of all positions (6 decimals)
+    pnl: int  # Profit/Loss (6 decimals)
+    pnl_percentage: float  # PNL as percentage
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UserStats":
+        """Create from API response dictionary."""
+        return cls(
+            user_address=data.get("user_address", ""),
+            total_cost=int(data.get("total_cost", 0)),
+            total_invested=int(data.get("total_invested", 0)),
+            position_value=int(data.get("position_value", 0)),
+            pnl=int(data.get("pnl", 0)),
+            pnl_percentage=float(data.get("pnl_percentage", 0.0)),
         )
 
 

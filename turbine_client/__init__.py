@@ -28,6 +28,7 @@ from turbine_client.types import (
     Side,
     SignedOrder,
     Trade,
+    UserStats,
 )
 from turbine_client.ws.client import TurbineWSClient
 from turbine_client.exceptions import (
@@ -67,6 +68,7 @@ __all__ = [
     "Side",
     "SignedOrder",
     "Trade",
+    "UserStats",
     # Exceptions
     "TurbineError",
     "TurbineApiError",

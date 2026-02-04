@@ -34,6 +34,7 @@ from turbine_client.types import (
     SignedOrder,
     Trade,
     UserActivity,
+    UserStats,
 )
 
 
@@ -726,18 +727,18 @@ class TurbineClient:
         response = self._http.get(endpoint, authenticated=True)
         return UserActivity.from_dict(response)
 
-    def get_user_stats(self) -> Dict[str, Any]:
+    def get_user_stats(self) -> UserStats:
         """Get statistics for the authenticated user.
 
         Returns:
-            User statistics.
+            User statistics including total cost, invested, position value, and PNL.
 
         Raises:
             AuthenticationError: If no auth is configured.
         """
         self._require_auth()
         response = self._http.get(ENDPOINTS["user_stats"], authenticated=True)
-        return response
+        return UserStats.from_dict(response)
 
     # =========================================================================
     # Relayer Endpoints (Gasless Operations)
@@ -1092,9 +1093,9 @@ class TurbineClient:
 
         # Get RPC URL
         rpc_urls = {
-            137: "https://polygon-rpc.com",
-            43114: "https://api.avax.network/ext/bc/C/rpc",
-            84532: "https://sepolia.base.org",
+            1137: "https://polygon-bor-rpc.publicnode.com",
+            43114: "https://avalanche-c-chain-rpc.publicnode.com",
+            84532: "https://base-sepolia-rpc.publicnode.com",
         }
         rpc_url = rpc_urls.get(self._chain_id)
         if not rpc_url:
@@ -1325,9 +1326,9 @@ class TurbineClient:
 
         # Get RPC URL
         rpc_urls = {
-            137: "https://polygon-rpc.com",
-            43114: "https://api.avax.network/ext/bc/C/rpc",
-            84532: "https://sepolia.base.org",
+            137: "https://polygon-bor-rpc.publicnode.com",
+            43114: "https://avalanche-c-chain-rpc.publicnode.com",
+            84532: "https://base-sepolia-rpc.publicnode.com",
         }
         rpc_url = rpc_urls.get(self._chain_id)
         if not rpc_url:
