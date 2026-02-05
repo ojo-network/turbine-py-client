@@ -1093,7 +1093,7 @@ class TurbineClient:
 
         # Get RPC URL
         rpc_urls = {
-            1137: "https://polygon-bor-rpc.publicnode.com",
+            137: "https://polygon-bor-rpc.publicnode.com",
             43114: "https://avalanche-c-chain-rpc.publicnode.com",
             84532: "https://base-sepolia-rpc.publicnode.com",
         }

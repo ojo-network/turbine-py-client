@@ -62,7 +62,16 @@ Store the result as `BOT_FILE` for the remaining steps.
 
 ## Step 2: Generate Deployment Configuration
 
-Create `railway.toml` using the Write tool:
+Create these files using the Write tool:
+
+**`nixpacks.toml`** — tells Railway's builder how to start the app:
+
+```toml
+[start]
+cmd = "python {BOT_FILE}"
+```
+
+**`railway.toml`** — configures restart policy:
 
 ```toml
 [deploy]
@@ -71,15 +80,9 @@ restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 ```
 
-Also create a `Procfile` as a fallback:
-
-```
-worker: python {BOT_FILE}
-```
-
 Tell the user what you created and why:
-- `railway.toml` tells Railway how to run the bot and to restart on crashes
-- `Procfile` is a fallback that Railway also recognizes
+- `nixpacks.toml` tells Railway's build system which file to run
+- `railway.toml` configures restart-on-crash behavior
 - Railway auto-detects Python from `pyproject.toml` and installs dependencies
 
 ## Step 3: Railway Login and Project Setup
@@ -87,10 +90,10 @@ Tell the user what you created and why:
 Run these commands sequentially:
 
 ```bash
-railway login
+railway login --browserless
 ```
 
-This opens a browser for authentication. Wait for it to complete.
+This prints a URL and pairing code. Tell the user to open the URL in their browser and enter the code. Wait for confirmation before proceeding.
 
 Then create a project:
 

@@ -154,7 +154,14 @@ detect_bot_file() {
 generate_railway_config() {
     echo -e "${GREEN}Generating deployment config...${NC}"
 
-    # Create railway.toml
+    # Create nixpacks.toml — tells Railway's builder how to start the app
+    cat > nixpacks.toml << EOF
+[start]
+cmd = "python ${BOT_FILE}"
+EOF
+    echo "  Created nixpacks.toml"
+
+    # Create railway.toml — configures restart policy
     cat > railway.toml << EOF
 [deploy]
 startCommand = "python ${BOT_FILE}"
@@ -162,19 +169,24 @@ restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 EOF
     echo "  Created railway.toml"
-
-    # Create Procfile as fallback
-    echo "worker: python ${BOT_FILE}" > Procfile
-    echo "  Created Procfile"
 }
 
 # Login to Railway
 railway_login() {
     echo ""
     echo -e "${GREEN}Logging into Railway...${NC}"
-    echo "(This will open your browser for authentication)"
     echo ""
-    railway login
+
+    # Use --browserless if not in an interactive terminal (e.g., running from Claude)
+    if [ -t 0 ]; then
+        echo "(This will open your browser for authentication)"
+        echo ""
+        railway login
+    else
+        echo "(Copy the URL below and open it in your browser)"
+        echo ""
+        railway login --browserless
+    fi
 }
 
 # Create a Railway project
