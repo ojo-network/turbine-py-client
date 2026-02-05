@@ -154,17 +154,20 @@ detect_bot_file() {
 generate_railway_config() {
     echo -e "${GREEN}Generating deployment config...${NC}"
 
-    # Create nixpacks.toml — tells Railway's builder how to start the app
-    cat > nixpacks.toml << EOF
-[start]
-cmd = "python ${BOT_FILE}"
+    # Create main.py entry point — Railpack auto-detects this
+    if [ "$BOT_FILE" = "main.py" ]; then
+        echo "  Bot is already main.py — Railpack will find it automatically"
+    else
+        cat > main.py << EOF
+import runpy
+runpy.run_path("${BOT_FILE}", run_name="__main__")
 EOF
-    echo "  Created nixpacks.toml"
+        echo "  Created main.py (entry point for ${BOT_FILE})"
+    fi
 
     # Create railway.toml — configures restart policy
     cat > railway.toml << EOF
 [deploy]
-startCommand = "python ${BOT_FILE}"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 EOF

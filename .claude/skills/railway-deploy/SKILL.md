@@ -64,24 +64,23 @@ Store the result as `BOT_FILE` for the remaining steps.
 
 Create these files using the Write tool:
 
-**`nixpacks.toml`** — tells Railway's builder how to start the app:
+**`main.py`** — Railway's Railpack builder looks for this file as the entry point. If `BOT_FILE` is already `main.py`, skip this step. Otherwise create it:
 
-```toml
-[start]
-cmd = "python {BOT_FILE}"
+```python
+import runpy
+runpy.run_path("{BOT_FILE}", run_name="__main__")
 ```
 
 **`railway.toml`** — configures restart policy:
 
 ```toml
 [deploy]
-startCommand = "python {BOT_FILE}"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 ```
 
 Tell the user what you created and why:
-- `nixpacks.toml` tells Railway's build system which file to run
+- `main.py` is the entry point Railpack auto-detects — it just runs `{BOT_FILE}`
 - `railway.toml` configures restart-on-crash behavior
 - Railway auto-detects Python from `pyproject.toml` and installs dependencies
 
