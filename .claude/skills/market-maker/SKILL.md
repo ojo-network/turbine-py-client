@@ -492,11 +492,11 @@ pip install -e . python-dotenv httpx
 
 Note: `httpx` is used by the Price Action Trader to fetch real-time BTC prices from Pyth Network.
 
-## Step 7: Explain How to Run
+## Step 7: Explain How to Run and Deploy
 
 Tell the user:
 ```
-Your bot is ready! To run it:
+Your bot is ready! To run it locally:
 
   python {bot_filename}.py
 
@@ -509,6 +509,11 @@ The bot will:
 - Track traded markets and claim winnings when they resolve
 
 To stop the bot, press Ctrl+C.
+
+
+Want to run your bot 24/7 in the cloud? Deploy to Railway (free $5 credit for 30 days):
+
+  claude "/railway-deploy"
 ```
 
 ## Core Bot Run Method

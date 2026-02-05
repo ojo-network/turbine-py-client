@@ -180,3 +180,7 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 CLAUDE.md
+
+# Railway deployment config (generated per-user)
+railway.toml
+Procfile
