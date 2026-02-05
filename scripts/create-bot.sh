@@ -185,6 +185,26 @@ main() {
     setup_env
 
     run_claude
+
+    offer_railway_deploy
+}
+
+# Suggest Railway deployment after bot creation
+offer_railway_deploy() {
+    echo ""
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${GREEN}Want to run your bot 24/7 in the cloud?${NC}"
+    echo ""
+    echo "  Deploy to Railway (free \$5 credit for 30 days):"
+    echo ""
+    echo "    claude \"/railway-deploy\""
+    echo ""
+    echo "  Or use the deployment script:"
+    echo "    bash scripts/deploy-railway.sh"
+    echo ""
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
 }
 
 main

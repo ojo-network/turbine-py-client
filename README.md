@@ -10,6 +10,26 @@ We have a Claude skill published that can help you write a trading bot. Run this
 curl -sSL turbinefi.com/claude | bash
 ```
 
+## Deploy to Railway
+
+Run your trading bot 24/7 in the cloud with Railway (free $5 credit for 30 days):
+
+```bash
+# After creating your bot, deploy it:
+claude "/railway-deploy"
+```
+
+Or use the deployment script directly:
+
+```bash
+bash scripts/deploy-railway.sh
+```
+
+**Prerequisites:**
+- A Railway account ([railway.com](https://railway.com)) — free $5 credit for 30 days
+- A generated bot (run the Claude skill above first)
+- Railway CLI is installed automatically if not found
+
 ## Overview
 
 This client provides a clean, typed interface for:

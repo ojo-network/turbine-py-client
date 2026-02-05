@@ -1,0 +1,2 @@
+[start]
+cmd = "python price_action_bot.py"
