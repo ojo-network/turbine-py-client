@@ -64,7 +64,13 @@ Store the result as `BOT_FILE` for the remaining steps.
 
 Create these files using the Write tool:
 
-**`main.py`** — Railway's Railpack builder looks for this file as the entry point. If `BOT_FILE` is already `main.py`, skip this step. Otherwise create it:
+**`requirements.txt`** — Railpack looks for this to install dependencies. A single `.` tells pip to install the package and all its deps from `pyproject.toml`:
+
+```
+.
+```
+
+**`main.py`** — Railpack looks for this file as the entry point. If `BOT_FILE` is already `main.py`, skip this step. Otherwise create it:
 
 ```python
 import runpy
@@ -80,9 +86,9 @@ restartPolicyMaxRetries = 10
 ```
 
 Tell the user what you created and why:
+- `requirements.txt` tells Railpack to install the project's dependencies from `pyproject.toml`
 - `main.py` is the entry point Railpack auto-detects — it just runs `{BOT_FILE}`
 - `railway.toml` configures restart-on-crash behavior
-- Railway auto-detects Python from `pyproject.toml` and installs dependencies
 
 ## Step 3: Railway Login and Project Setup
 

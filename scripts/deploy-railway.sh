@@ -154,6 +154,10 @@ detect_bot_file() {
 generate_railway_config() {
     echo -e "${GREEN}Generating deployment config...${NC}"
 
+    # Create requirements.txt — tells Railpack to install deps from pyproject.toml
+    echo "." > requirements.txt
+    echo "  Created requirements.txt"
+
     # Create main.py entry point — Railpack auto-detects this
     if [ "$BOT_FILE" = "main.py" ]; then
         echo "  Bot is already main.py — Railpack will find it automatically"
