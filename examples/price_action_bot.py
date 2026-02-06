@@ -1,14 +1,32 @@
 """
-Turbine Market Maker Bot - Price Action Trader
-Generated for Turbine
+Turbine Price Action Bot
+
+Trades BTC 15-minute prediction markets using real-time price data from Pyth
+Network. USDC is approved gaslessly via a one-time max permit per settlement
+contract — no native gas required, no per-order permit overhead.
 
 Algorithm: Fetches real-time BTC price from Pyth Network (same oracle Turbine uses)
            and compares it to the market's strike price to make trading decisions.
            - If BTC is above strike → buy YES (bet it stays above)
            - If BTC is below strike → buy NO (bet it stays below)
            - Confidence scales with distance from strike price
+
+Features:
+- Order size and max position configured in USDC terms
+- Auto-approves USDC gaslessly when entering a new market
+- Automatic market transition when 15-minute markets rotate
+- Automatic claiming of winnings from resolved markets
+
+Usage:
+    TURBINE_PRIVATE_KEY=0x... python examples/price_action_bot.py
+
+    # Custom USDC amounts
+    TURBINE_PRIVATE_KEY=0x... python examples/price_action_bot.py \\
+        --order-size 5 \\
+        --max-position 50
 """
 
+import argparse
 import asyncio
 import os
 import re
@@ -28,12 +46,14 @@ load_dotenv()
 # ============================================================
 # Claim-only mode: Set CLAIM_ONLY_MODE=true in .env to disable trading
 CLAIM_ONLY_MODE = os.environ.get("CLAIM_ONLY_MODE", "false").lower() == "true"
-# Chain ID: Set CHAIN_ID in .env (default: 137 for Polygon mainnet)
-CHAIN_ID = int(os.environ.get("CHAIN_ID", "137"))
-# API Host: Set TURBINE_HOST in .env (default: production API)
-TURBINE_HOST = os.environ.get("TURBINE_HOST", "https://api.turbinefi.com")
-ORDER_SIZE = 1_000_000  # 1 share (6 decimals)
-MAX_POSITION = 5_000_000  # Maximum position size (5 shares)
+# Chain ID: Set CHAIN_ID in .env (default: 84532 for Base Sepolia)
+CHAIN_ID = int(os.environ.get("CHAIN_ID", "84532"))
+# API Host: Set TURBINE_HOST in .env (default: localhost for testing)
+TURBINE_HOST = os.environ.get("TURBINE_HOST", "http://localhost:8080")
+
+# Default trading parameters (in USDC terms)
+DEFAULT_ORDER_SIZE_USDC = 1.0  # $1 USDC per order
+DEFAULT_MAX_POSITION_USDC = 10.0  # $10 max position per market
 PRICE_POLL_SECONDS = 10  # How often to check BTC price
 
 # Price Action parameters
@@ -102,27 +122,140 @@ def _save_credentials_to_env(env_path: Path, api_key_id: str, api_private_key: s
 
 
 class PriceActionBot:
-    """Price action trader that follows BTC price vs strike price."""
+    """Price action trader for BTC 15-minute prediction markets.
 
-    def __init__(self, client: TurbineClient):
+    Tracks positions in USDC terms. USDC is approved gaslessly for new
+    markets via one-time max EIP-2612 permit submitted through the relayer.
+    """
+
+    def __init__(
+        self,
+        client: TurbineClient,
+        order_size_usdc: float = DEFAULT_ORDER_SIZE_USDC,
+        max_position_usdc: float = DEFAULT_MAX_POSITION_USDC,
+    ):
         self.client = client
+        self.order_size_usdc = order_size_usdc
+        self.max_position_usdc = max_position_usdc
+
+        # Market state
         self.market_id: str | None = None
         self.settlement_address: str | None = None
         self.contract_address: str | None = None
         self.strike_price: int = 0  # BTC price when market created (6 decimals)
-        self.current_position = 0
+
+        # Position tracking in USDC
+        self.position_usdc: dict[str, float] = {}  # market_id -> usdc spent
         self.active_orders: dict[str, str] = {}  # order_hash -> side
         self.running = True
+
+        # Track approved settlement contracts
+        self.approved_settlements: dict[str, int] = {}  # settlement_address -> approved_amount
+
         # Track markets we've traded in for claiming winnings
         self.traded_markets: dict[str, str] = {}  # market_id -> contract_address
+
         # Track processed trades to avoid double-counting
         self.processed_trade_ids: set[int] = set()
+
         # Track pending order TXs to prevent placing new orders while orders are settling
         self.pending_order_txs: set[str] = set()
+
         # Async HTTP client for non-blocking price fetches
         self._http_client: httpx.AsyncClient | None = None
+
         # Stop trading when market is about to expire
         self.market_expiring = False
+
+    def calculate_shares_from_usdc(self, usdc_amount: float, price: int) -> int:
+        """Calculate shares from USDC amount at given price.
+
+        Args:
+            usdc_amount: Amount of USDC to spend (e.g., 10.0 for $10)
+            price: Price per share in 6 decimals (e.g., 500000 = 50%)
+
+        Returns:
+            Number of shares in 6 decimals
+        """
+        if price <= 0:
+            return 0
+        # shares = usdc / (price / 1_000_000) = usdc * 1_000_000 / price
+        # Result in 6 decimals
+        return int((usdc_amount * 1_000_000 * 1_000_000) / price)
+
+    def get_position_usdc(self, market_id: str) -> float:
+        """Get current position in USDC for a market."""
+        return self.position_usdc.get(market_id, 0.0)
+
+    def can_trade(self, market_id: str, usdc_amount: float) -> bool:
+        """Check if trade would exceed max position."""
+        current = self.get_position_usdc(market_id)
+        return (current + usdc_amount) <= self.max_position_usdc
+
+    # Half of max uint256 — threshold for "already has max approval"
+    MAX_APPROVAL_THRESHOLD = (2**256 - 1) // 2
+
+    def ensure_settlement_approved(self, settlement_address: str) -> None:
+        """Ensure USDC is approved for the settlement contract.
+
+        Uses a gasless max permit via the relayer. No native gas required.
+        """
+        # Check if already approved in this session
+        if settlement_address in self.approved_settlements:
+            return
+
+        # Check on-chain allowance
+        current_allowance = self.client.get_usdc_allowance(spender=settlement_address)
+
+        if current_allowance >= self.MAX_APPROVAL_THRESHOLD:
+            print(f"  Existing USDC max approval found")
+            self.approved_settlements[settlement_address] = current_allowance
+            return
+
+        # Need to approve via gasless max permit
+        print(f"\n{'='*50}")
+        print(f"GASLESS USDC APPROVAL (one-time max permit)")
+        print(f"{'='*50}")
+        print(f"Settlement: {settlement_address}")
+
+        try:
+            result = self.client.approve_usdc_for_settlement(settlement_address)
+            tx_hash = result.get("tx_hash", "unknown")
+            print(f"Relayer TX: {tx_hash}")
+            print("Waiting for confirmation...")
+
+            # Wait for confirmation
+            from web3 import Web3
+            rpc_urls = {
+                137: "https://polygon-rpc.com",
+                43114: "https://api.avax.network/ext/bc/C/rpc",
+                84532: "https://sepolia.base.org",
+            }
+            rpc_url = rpc_urls.get(self.client.chain_id)
+            w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+            for _ in range(30):
+                try:
+                    receipt = w3.eth.get_transaction_receipt(tx_hash)
+                    if receipt:
+                        if receipt["status"] == 1:
+                            print(f"✓ Max USDC approval confirmed (gasless)")
+                            self.approved_settlements[settlement_address] = 2**256 - 1
+                        else:
+                            print(f"✗ Transaction failed!")
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            else:
+                print(f"⚠ Transaction pending (may still confirm)")
+                self.approved_settlements[settlement_address] = 2**256 - 1
+
+        except Exception as e:
+            print(f"✗ Gasless approval failed: {e}")
+            raise
+
+        print(f"{'='*50}\n")
 
     async def _get_http_client(self) -> httpx.AsyncClient:
         """Get or create the async HTTP client."""
@@ -151,20 +284,18 @@ class PriceActionBot:
 
                 # Check if they filled by looking at recent trades
                 trades = self.client.get_trades(market_id=self.market_id, limit=20)
-                # No time filter needed - processed_trade_ids prevents double-counting
                 my_recent_trades = [t for t in trades
                                    if t.buyer.lower() == self.client.address.lower()
                                    and t.id not in self.processed_trade_ids]
 
                 for trade in my_recent_trades:
                     self.processed_trade_ids.add(trade.id)
-                    # Track position from filled trades (outcome: 0=YES, 1=NO)
-                    if trade.outcome == 0:
-                        self.current_position += trade.size
-                        print(f"  Filled: {trade.size / 1_000_000:.2f} YES shares")
-                    else:
-                        self.current_position -= trade.size
-                        print(f"  Filled: {trade.size / 1_000_000:.2f} NO shares")
+                    # Calculate USDC spent for this trade
+                    usdc_spent = (trade.size * trade.price) / (1_000_000 * 1_000_000)
+                    self.position_usdc[self.market_id] = self.get_position_usdc(self.market_id) + usdc_spent
+
+                    outcome_str = "YES" if trade.outcome == 0 else "NO"
+                    print(f"  Filled: ${usdc_spent:.2f} USDC → {trade.size / 1_000_000:.2f} {outcome_str} shares")
 
         except Exception as e:
             print(f"  Warning: Could not cleanup pending orders: {e}")
@@ -175,68 +306,34 @@ class PriceActionBot:
             return
 
         try:
-            # Get all user positions
             positions = self.client.get_user_positions(
                 address=self.client.address,
                 chain_id=self.client.chain_id
             )
 
-            # Find position for this market
             for position in positions:
                 if position.market_id == self.market_id:
-                    # Net position (positive = long YES, negative = long NO)
-                    self.current_position = position.yes_shares - position.no_shares
+                    # Estimate USDC value from shares (rough estimate at 50% price)
+                    total_shares = position.yes_shares + position.no_shares
+                    estimated_usdc = (total_shares * 0.5) / 1_000_000
 
-                    if self.current_position != 0:
-                        shares = abs(self.current_position) / 1_000_000
-                        side = "YES" if self.current_position > 0 else "NO"
-                        print(f"Position synced: {shares:.1f} {side} shares")
+                    if total_shares > 0:
+                        print(f"Position synced: ~${estimated_usdc:.2f} USDC in shares")
+                        self.position_usdc[self.market_id] = estimated_usdc
                     else:
                         print("Position synced: No existing positions")
+                        self.position_usdc[self.market_id] = 0.0
                     return
 
-            # No position found for this market
-            self.current_position = 0
+            self.position_usdc[self.market_id] = 0.0
             print("Position synced: No existing positions")
 
         except Exception as e:
             print(f"Failed to sync position: {e}")
-            # Default to 0 on error
-            self.current_position = 0
-
-    async def verify_position(self) -> None:
-        """Verify position from API and correct if internal tracking is wrong."""
-        if not self.market_id:
-            return
-
-        try:
-            positions = self.client.get_user_positions(
-                address=self.client.address,
-                chain_id=self.client.chain_id
-            )
-
-            for position in positions:
-                if position.market_id == self.market_id:
-                    actual_position = position.yes_shares - position.no_shares
-
-                    # Check if internal tracking is off
-                    if actual_position != self.current_position:
-                        old_shares = abs(self.current_position) / 1_000_000
-                        new_shares = abs(actual_position) / 1_000_000
-                        print(f"  ⚠ Position corrected: {old_shares:.1f} → {new_shares:.1f} shares (verified from API)")
-                        self.current_position = actual_position
-                    return
-
-            # No position found
-            if self.current_position != 0:
-                print(f"  ⚠ Position corrected: {abs(self.current_position) / 1_000_000:.1f} → 0 shares")
-                self.current_position = 0
-
-        except Exception as e:
-            print(f"  Warning: Could not verify position: {e}")
+            self.position_usdc[self.market_id] = 0.0
 
     async def get_current_btc_price(self) -> float:
-        """Fetch current BTC price from Pyth Network (same source as Turbine)."""
+        """Fetch current BTC price from Pyth Network."""
         try:
             http_client = await self._get_http_client()
             response = await http_client.get(
@@ -252,9 +349,8 @@ class PriceActionBot:
 
             price_data = data["parsed"][0]["price"]
             price_int = int(price_data["price"])
-            expo = price_data["expo"]  # Usually -8 for BTC
+            expo = price_data["expo"]
 
-            # Convert Pyth price to USD: price * 10^expo
             return price_int * (10 ** expo)
 
         except Exception as e:
@@ -262,70 +358,49 @@ class PriceActionBot:
             return 0.0
 
     async def calculate_signal(self) -> tuple[str, float]:
-        """
-        Calculate trading signal based on current price vs strike price.
-
-        Returns:
-            (action, confidence) where action is "BUY_YES", "BUY_NO", or "HOLD"
-        """
+        """Calculate trading signal based on current price vs strike price."""
         current_price = await self.get_current_btc_price()
         if current_price <= 0:
             return "HOLD", 0.0
 
-        # Convert strike price from 6 decimals to USD
         strike_usd = self.strike_price / 1e6
-
-        # Calculate percentage difference
         price_diff_pct = ((current_price - strike_usd) / strike_usd) * 100
-
-        # Threshold check (0.5% = 50 bps)
         threshold_pct = PRICE_THRESHOLD_BPS / 100
 
         if abs(price_diff_pct) < threshold_pct:
-            # Price too close to strike, hold
             return "HOLD", 0.0
 
-        # Calculate confidence based on distance from strike
-        # Further from strike = higher confidence (capped)
         raw_confidence = min(abs(price_diff_pct) / 2, MAX_CONFIDENCE)
         confidence = max(raw_confidence, MIN_CONFIDENCE) if abs(price_diff_pct) >= threshold_pct else 0.0
 
         if price_diff_pct > 0:
-            # BTC is above strike → bet YES (will end above)
             print(f"BTC ${current_price:,.2f} is {price_diff_pct:+.2f}% above strike ${strike_usd:,.2f}")
             return "BUY_YES", confidence
         else:
-            # BTC is below strike → bet NO (will end below)
             print(f"BTC ${current_price:,.2f} is {price_diff_pct:+.2f}% below strike ${strike_usd:,.2f}")
             return "BUY_NO", confidence
 
     async def execute_signal(self, action: str, confidence: float) -> None:
-        """Execute the trading signal."""
+        """Execute the trading signal using gasless max permit (no per-order permits)."""
         if action == "HOLD" or confidence < MIN_CONFIDENCE:
             return
 
-        # Check if we have any pending orders being tracked
         if self.pending_order_txs:
             print(f"⏳ Waiting for {len(self.pending_order_txs)} pending order(s) to settle...")
             return
 
-        # Don't place new orders when market is about to expire
         if self.market_expiring:
             print("⏰ Market expiring soon - not placing new orders")
             return
 
-        # Check position limits
-        if abs(self.current_position) >= MAX_POSITION:
-            print("Position limit reached")
+        # Check position limits (in USDC)
+        if not self.can_trade(self.market_id, self.order_size_usdc):
+            current = self.get_position_usdc(self.market_id)
+            print(f"Position limit reached: ${current:.2f} / ${self.max_position_usdc:.2f}")
             return
 
-        # Determine outcome and get the correct orderbook
-        if action == "BUY_YES":
-            outcome = Outcome.YES
-        else:
-            outcome = Outcome.NO
+        outcome = Outcome.YES if action == "BUY_YES" else Outcome.NO
 
-        # Get orderbook for the specific outcome
         try:
             orderbook = self.client.get_orderbook(self.market_id, outcome=outcome)
         except Exception as e:
@@ -339,53 +414,47 @@ class PriceActionBot:
         # Pay slightly above best ask to ensure fill
         price = min(orderbook.asks[0].price + 5000, 999000)
 
+        # Calculate shares from USDC amount
+        shares = self.calculate_shares_from_usdc(self.order_size_usdc, price)
+        if shares <= 0:
+            print(f"Order too small: ${self.order_size_usdc:.2f} at {price/10000:.1f}%")
+            return
+
         try:
+            # Create order without per-trade permit (using max permit allowance)
             order = self.client.create_limit_buy(
                 market_id=self.market_id,
                 outcome=outcome,
                 price=price,
-                size=ORDER_SIZE,
+                size=shares,
                 expiration=int(time.time()) + 300,
                 settlement_address=self.settlement_address,
             )
 
-            # Sign USDC permit for gasless execution
-            buyer_cost = (ORDER_SIZE * price) // 1_000_000
-            total_fee = ORDER_SIZE // 100  # 1% fee
-            permit_amount = ((buyer_cost + total_fee) * 120) // 100  # 20% margin
-            permit = self.client.sign_usdc_permit(
-                value=permit_amount,
-                settlement_address=self.settlement_address,
-            )
-            order.permit_signature = permit
+            # No per-trade permit - relying on one-time max permit allowance
 
             result = self.client.post_order(order)
             outcome_str = "YES" if outcome == Outcome.YES else "NO"
 
-            # Check if order was accepted
             if result and isinstance(result, dict):
                 status = result.get("status", "unknown")
                 order_hash = result.get("orderHash", order.order_hash)
 
-                print(f"→ Order submitted: {outcome_str} @ {price / 10000:.1f}% (initial status: {status})")
+                print(f"→ Order submitted: {outcome_str} @ {price / 10000:.1f}% | ${self.order_size_usdc:.2f} = {shares/1_000_000:.4f} shares (status: {status})")
 
-                # Wait briefly for order to be processed
                 await asyncio.sleep(2)
 
-                # Check for failed trades (match by market + buyer + size)
+                # Check for failed trades
                 try:
                     failed_trades = self.client.get_failed_trades()
                     my_failed = [t for t in failed_trades
                                  if t.market_id == self.market_id
                                  and t.buyer_address.lower() == self.client.address.lower()
-                                 and t.fill_size == ORDER_SIZE]
+                                 and t.fill_size == shares]
 
                     if my_failed:
-                        # Take most recent
                         failed = my_failed[0]
-                        print(f"✗ Order FAILED")
-                        print(f"  Reason: {failed.reason}")
-                        print(f"  TX: {failed.tx_hash[:16]}...")
+                        print(f"✗ Order FAILED: {failed.reason}")
                         return
                 except Exception as e:
                     print(f"  Warning: Could not check failed trades: {e}")
@@ -396,23 +465,19 @@ class PriceActionBot:
                     my_pending = [t for t in pending_trades
                                   if t.market_id == self.market_id
                                   and t.buyer_address.lower() == self.client.address.lower()
-                                  and t.fill_size == ORDER_SIZE]
+                                  and t.fill_size == shares]
 
                     if my_pending:
                         pending = my_pending[0]
-                        print(f"⏳ Order still PENDING on-chain")
-                        print(f"  TX: {pending.tx_hash[:16]}...")
-                        print(f"  Not tracking position until settled")
-                        # Track this TX so we don't place more orders
+                        print(f"⏳ Order PENDING on-chain (TX: {pending.tx_hash[:16]}...)")
                         self.pending_order_txs.add(pending.tx_hash)
                         return
                 except Exception as e:
                     print(f"  Warning: Could not check pending trades: {e}")
 
-                # Check if order was immediately filled (look at recent trades)
+                # Check if immediately filled
                 try:
                     trades = self.client.get_trades(market_id=self.market_id, limit=20)
-                    # Look for trades from the last 10 seconds that we haven't processed yet
                     recent_threshold = time.time() - 10
                     my_trades = [t for t in trades
                                  if t.buyer.lower() == self.client.address.lower()
@@ -421,20 +486,18 @@ class PriceActionBot:
 
                     if my_trades:
                         trade = my_trades[0]
-                        print(f"✓ Order FILLED (immediate match)")
-                        print(f"  Size: {trade.size / 1_000_000:.2f} shares")
-                        print(f"  Price: {trade.price / 10000:.1f}%")
-
-                        # Mark trade as processed
                         self.processed_trade_ids.add(trade.id)
 
-                        # Track position
-                        self.current_position += ORDER_SIZE if outcome == Outcome.YES else -ORDER_SIZE
+                        # Track position in USDC
+                        usdc_spent = (trade.size * trade.price) / (1_000_000 * 1_000_000)
+                        self.position_usdc[self.market_id] = self.get_position_usdc(self.market_id) + usdc_spent
+
+                        print(f"✓ FILLED: ${usdc_spent:.2f} USDC → {trade.size / 1_000_000:.4f} shares")
                         return
                 except Exception as e:
                     print(f"  Warning: Could not check trades: {e}")
 
-                # Check if order is still open on orderbook
+                # Check if still open on orderbook
                 try:
                     my_orders = self.client.get_orders(
                         trader=self.client.address,
@@ -444,17 +507,11 @@ class PriceActionBot:
 
                     if matching:
                         print(f"✓ Order OPEN on orderbook")
-                        print(f"  Order hash: {order_hash[:16]}...")
-                        # Track as active order (position updated when filled, not here)
                         self.active_orders[order_hash] = action
                     else:
-                        # Not in failed, not in pending, not in trades, not open - likely rejected
-                        print(f"⚠ Order not found anywhere - may have been rejected")
+                        print(f"⚠ Order not found - may have been rejected")
                 except Exception as e:
                     print(f"  Warning: Could not check open orders: {e}")
-
-                # Verify actual position from API after order attempt
-                await self.verify_position()
 
             else:
                 print(f"⚠ Unexpected order response: {result}")
@@ -462,20 +519,18 @@ class PriceActionBot:
         except TurbineApiError as e:
             print(f"✗ Order failed: {e}")
         except Exception as e:
-            print(f"✗ Unexpected error placing order: {e}")
+            print(f"✗ Unexpected error: {e}")
 
     async def price_action_loop(self) -> None:
         """Main loop that monitors price and executes trades."""
         if CLAIM_ONLY_MODE:
-            print("CLAIM ONLY MODE - Trading disabled, only claiming winnings")
-            # Don't trade, just keep the task alive
+            print("CLAIM ONLY MODE - Trading disabled")
             while self.running:
                 await asyncio.sleep(60)
             return
 
         while self.running and self.market_id:
             try:
-                # Check for settled pending orders first
                 if self.pending_order_txs:
                     await self.cleanup_pending_orders()
 
@@ -483,12 +538,12 @@ class PriceActionBot:
                 if action != "HOLD":
                     await self.execute_signal(action, confidence)
                 else:
-                    # Still log current price vs strike
                     current_price = await self.get_current_btc_price()
                     strike_usd = self.strike_price / 1e6
                     if current_price > 0:
                         diff_pct = ((current_price - strike_usd) / strike_usd) * 100
-                        print(f"BTC ${current_price:,.2f} ({diff_pct:+.2f}% from strike ${strike_usd:,.2f}) - HOLDING")
+                        pos = self.get_position_usdc(self.market_id)
+                        print(f"BTC ${current_price:,.2f} ({diff_pct:+.2f}% from ${strike_usd:,.2f}) | Pos: ${pos:.2f}/${self.max_position_usdc:.2f} - HOLD")
 
                 await asyncio.sleep(PRICE_POLL_SECONDS)
             except Exception as e:
@@ -496,10 +551,7 @@ class PriceActionBot:
                 await asyncio.sleep(PRICE_POLL_SECONDS)
 
     async def get_active_market(self) -> tuple[str, int, int] | None:
-        """
-        Get the currently active BTC quick market.
-        Returns (market_id, end_time, start_price) tuple, or None if no active market.
-        """
+        """Get the currently active BTC quick market."""
         response = self.client._http.get("/api/v1/quick-markets/BTC")
         quick_market_data = response.get("quickMarket")
         if not quick_market_data:
@@ -512,102 +564,82 @@ class PriceActionBot:
         if not self.active_orders or not self.market_id:
             return
 
-        print(f"Cancelling {len(self.active_orders)} orders on market {self.market_id[:8]}...")
+        print(f"Cancelling {len(self.active_orders)} orders...")
         for order_hash in list(self.active_orders.keys()):
             try:
                 self.client.cancel_order(order_hash, market_id=self.market_id)
                 del self.active_orders[order_hash]
             except TurbineApiError as e:
-                print(f"Failed to cancel order {order_hash[:8]}...: {e}")
+                print(f"Failed to cancel order: {e}")
 
     async def switch_to_new_market(self, new_market_id: str, start_price: int = 0) -> None:
-        """
-        Switch liquidity and trading to a new market.
-        Called when a new BTC 15-minute market becomes active.
-
-        Args:
-            new_market_id: The new market ID to switch to.
-            start_price: The BTC price when market was created (6 decimals).
-        """
+        """Switch to a new market and ensure gasless USDC approval."""
         old_market_id = self.market_id
 
-        # Track old market for claiming winnings later
+        # Track old market for claiming winnings
         if old_market_id and self.contract_address:
             self.traded_markets[old_market_id] = self.contract_address
-            print(f"✓ Tracking market {old_market_id[:16]}... for winnings claim")
 
         if old_market_id:
             print(f"\n{'='*50}")
-            print(f"MARKET TRANSITION DETECTED")
-            print(f"Old market: {old_market_id[:8]}...")
-            print(f"New market: {new_market_id[:8]}...")
+            print(f"MARKET TRANSITION")
+            print(f"Old: {old_market_id[:8]}... | New: {new_market_id[:8]}...")
             print(f"{'='*50}\n")
-
-            # Cancel all orders on the old market
             await self.cancel_all_orders()
 
-        # Update to new market
+        # Update market state
         self.market_id = new_market_id
         self.strike_price = start_price
         self.active_orders = {}
-        self.processed_trade_ids.clear()  # Clear trade history for new market
-        self.pending_order_txs.clear()  # Clear pending orders for new market
-        self.market_expiring = False  # Reset expiring flag for new market
+        self.processed_trade_ids.clear()
+        self.pending_order_txs.clear()
+        self.market_expiring = False
 
         # Fetch settlement and contract addresses
         try:
-            # get_markets returns list of Market objects with settlement_address
             markets = self.client.get_markets()
             for market in markets:
                 if market.id == new_market_id:
                     self.settlement_address = market.settlement_address
-                    # Get contract address from market stats
                     try:
                         stats = self.client.get_market(new_market_id)
                         self.contract_address = stats.contract_address
-                        print(f"Settlement: {self.settlement_address[:16]}...")
-                        print(f"Contract: {self.contract_address[:16]}...")
-                    except Exception as e:
-                        print(f"Warning: Could not fetch contract address: {e}")
+                    except Exception:
+                        pass
                     break
         except Exception as e:
             print(f"Warning: Could not fetch market addresses: {e}")
 
-        strike_usd = start_price / 1e6 if start_price else 0
-        print(f"Now trading on market: {new_market_id[:8]}...")
-        if strike_usd > 0:
-            print(f"Strike price: ${strike_usd:,.2f}")
+        # Ensure gasless USDC approval for this settlement contract
+        if self.settlement_address:
+            self.ensure_settlement_approved(self.settlement_address)
 
-        # Sync position from on-chain data
+        strike_usd = start_price / 1e6 if start_price else 0
+        print(f"Trading market: {new_market_id[:8]}... | Strike: ${strike_usd:,.2f}")
+
         await self.sync_position()
 
     async def monitor_market_transitions(self) -> None:
-        """
-        Background task that polls for new markets and triggers transitions.
-        Runs continuously while the bot is active.
-        """
-        POLL_INTERVAL = 5  # Check every 5 seconds
+        """Background task that polls for new markets."""
+        POLL_INTERVAL = 5
 
         while self.running:
             try:
                 market_info = await self.get_active_market()
 
-                # If no market available, wait for next poll
                 if not market_info:
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
                 new_market_id, end_time, start_price = market_info
 
-                # Check if market has changed
                 if new_market_id != self.market_id:
                     await self.switch_to_new_market(new_market_id, start_price)
 
-                # Log time remaining and stop trading when market is about to expire
                 time_remaining = end_time - int(time.time())
                 if time_remaining <= 60 and time_remaining > 0:
                     if not self.market_expiring:
-                        print(f"⏰ Market expires in {time_remaining}s - stopping new trades")
+                        print(f"⏰ Market expires in {time_remaining}s - stopping trades")
                         self.market_expiring = True
                 elif time_remaining > 60:
                     self.market_expiring = False
@@ -617,69 +649,9 @@ class PriceActionBot:
 
             await asyncio.sleep(POLL_INTERVAL)
 
-    async def discover_unclaimed_markets(self) -> None:
-        """Discover markets with unclaimed winnings from previous sessions."""
-        try:
-            print("Scanning for unclaimed winnings from past markets...")
-
-            # Get all user positions across all markets
-            all_positions = self.client.get_user_positions(
-                address=self.client.address,
-                chain_id=self.client.chain_id
-            )
-
-            # Group positions by market and check if they have winning shares
-            markets_with_positions = {}
-            for position in all_positions:
-                # Check if has any shares (YES or NO)
-                if position.yes_shares > 0 or position.no_shares > 0:
-                    market_id = position.market_id
-
-                    if market_id not in markets_with_positions:
-                        # Try to get market details and resolution
-                        try:
-                            # Get resolution to see which side won
-                            resolution = self.client.get_resolution(market_id)
-
-                            # Check if user has winning shares
-                            has_winning_shares = False
-                            if resolution and resolution.resolved:
-                                if resolution.outcome == 0 and position.yes_shares > 0:  # YES won
-                                    has_winning_shares = True
-                                elif resolution.outcome == 1 and position.no_shares > 0:  # NO won
-                                    has_winning_shares = True
-
-                            if has_winning_shares:
-                                # Get contract address
-                                market = self.client.get_market(market_id)
-                                if market.contract_address:
-                                    markets_with_positions[market_id] = market.contract_address
-
-                        except Exception as e:
-                            # Market API failed - skip this market
-                            pass
-
-            # Add discovered markets to tracking
-            for market_id, contract_address in markets_with_positions.items():
-                if market_id not in self.traded_markets:
-                    self.traded_markets[market_id] = contract_address
-                    print(f"Added market {market_id[:16]}... to claim tracking")
-
-            if markets_with_positions:
-                print(f"Found {len(markets_with_positions)} market(s) with positions to check for winnings")
-            else:
-                print("No positions found with shares to claim")
-
-        except Exception as e:
-            print(f"Failed to discover unclaimed markets: {e}")
-
     async def claim_resolved_markets(self) -> None:
-        """Background task to claim winnings from resolved markets using batch claiming."""
-        # First run: discover markets from previous sessions
-        await self.discover_unclaimed_markets()
-
-        # Track retry delay for rate limiting
-        retry_delay = 120  # Check every 2 minutes
+        """Background task to claim winnings from resolved markets."""
+        retry_delay = 120
 
         while self.running:
             try:
@@ -687,63 +659,30 @@ class PriceActionBot:
                     await asyncio.sleep(retry_delay)
                     continue
 
-                # Filter to only resolved markets using API (no RPC!)
                 market_items = list(self.traded_markets.items())
                 resolved_markets = []
-
-                print(f"\n💰 Checking {len(market_items)} market(s) for resolution status...")
 
                 for market_id, contract_address in market_items:
                     try:
                         resolution = self.client.get_resolution(market_id)
                         if resolution and resolution.resolved:
                             resolved_markets.append((market_id, contract_address))
-                            outcome_name = "YES" if resolution.outcome == 0 else "NO"
-                            print(f"   ✓ {market_id[:8]}... is resolved (outcome: {outcome_name})")
-                        else:
-                            print(f"   ⏳ {market_id[:8]}... not resolved yet")
-                    except Exception as e:
-                        # Market might not have resolution endpoint yet
-                        print(f"   ? {market_id[:8]}... resolution check failed: {e}")
+                    except Exception:
+                        pass
 
-                # Claim from resolved markets ONE AT A TIME to avoid rate limits
-                if resolved_markets:
-                    print(f"\n💰 Claiming from {len(resolved_markets)} resolved market(s) (one at a time)...")
-
-                    for i, (market_id, contract_address) in enumerate(resolved_markets, 1):
-                        print(f"   [{i}/{len(resolved_markets)}] Claiming from {market_id[:8]}...")
-
-                        try:
-                            result = self.client.claim_winnings(contract_address)
-                            tx_hash = result.get("txHash", result.get("tx_hash", "unknown"))
-                            print(f"   ✓ Claim successful! TX: {tx_hash}")
-
-                            # Remove this market from tracking
+                for market_id, contract_address in resolved_markets:
+                    try:
+                        result = self.client.claim_winnings(contract_address)
+                        tx_hash = result.get("txHash", result.get("tx_hash", "unknown"))
+                        print(f"💰 Claimed winnings from {market_id[:8]}... TX: {tx_hash}")
+                        del self.traded_markets[market_id]
+                    except ValueError as e:
+                        if "no winning tokens" in str(e).lower():
                             del self.traded_markets[market_id]
+                    except Exception as e:
+                        print(f"Claim error: {e}")
 
-                        except ValueError as e:
-                            error_msg = str(e).lower()
-                            if "no markets with winning tokens" in error_msg or "no winning tokens" in error_msg:
-                                print(f"   No winning tokens (already claimed)")
-                                # Remove from tracking since there's nothing to claim
-                                del self.traded_markets[market_id]
-                            else:
-                                print(f"   Claim error: {e}")
-                        except Exception as e:
-                            error_str = str(e)
-                            if "rate limit" in error_str.lower() or "too many requests" in error_str.lower():
-                                print(f"   ⏳ Rate limited - will retry this market next cycle")
-                                break  # Stop processing more markets
-                            else:
-                                print(f"   Error: {e}")
-
-                        # Delay between markets to avoid rate limits (only if more to process)
-                        if i < len(resolved_markets):
-                            print(f"   Waiting 15s before next claim...")
-                            await asyncio.sleep(15)
-
-                else:
-                    print("No resolved markets ready to claim yet")
+                    await asyncio.sleep(15)
 
             except Exception as e:
                 print(f"Claim monitor error: {e}")
@@ -751,25 +690,20 @@ class PriceActionBot:
             await asyncio.sleep(retry_delay)
 
     async def run(self) -> None:
-        """
-        Main trading loop with automatic market switching and winnings claiming.
-        """
-        # Start background tasks
+        """Main trading loop."""
         monitor_task = asyncio.create_task(self.monitor_market_transitions())
         claim_task = asyncio.create_task(self.claim_resolved_markets())
         price_task = asyncio.create_task(self.price_action_loop())
 
         try:
-            # Ensure we have a current market
             if not self.market_id:
                 market_info = await self.get_active_market()
                 if market_info:
                     market_id, _, start_price = market_info
                     await self.switch_to_new_market(market_id, start_price)
                 else:
-                    print("Waiting for a BTC market to become active...")
+                    print("Waiting for BTC market...")
 
-            # Keep running while tasks execute
             while self.running:
                 await asyncio.sleep(1)
 
@@ -780,16 +714,29 @@ class PriceActionBot:
             monitor_task.cancel()
             claim_task.cancel()
             price_task.cancel()
-
-            # Wait for tasks to cancel
             await asyncio.gather(monitor_task, claim_task, price_task, return_exceptions=True)
-
             await self.cancel_all_orders()
-            await self.close()  # Close async HTTP client
+            await self.close()
 
 
 async def main():
-    # Get credentials
+    parser = argparse.ArgumentParser(
+        description="Turbine price action bot for BTC 15-minute prediction markets"
+    )
+    parser.add_argument(
+        "-s", "--order-size",
+        type=float,
+        default=DEFAULT_ORDER_SIZE_USDC,
+        help=f"Order size in USDC (default: ${DEFAULT_ORDER_SIZE_USDC})"
+    )
+    parser.add_argument(
+        "-m", "--max-position",
+        type=float,
+        default=DEFAULT_MAX_POSITION_USDC,
+        help=f"Max position per market in USDC (default: ${DEFAULT_MAX_POSITION_USDC})"
+    )
+    args = parser.parse_args()
+
     private_key = os.environ.get("TURBINE_PRIVATE_KEY")
     if not private_key:
         print("Error: Set TURBINE_PRIVATE_KEY in your .env file")
@@ -797,7 +744,6 @@ async def main():
 
     api_key_id, api_private_key = get_or_create_api_credentials()
 
-    # Create client
     client = TurbineClient(
         host=TURBINE_HOST,
         chain_id=CHAIN_ID,
@@ -806,56 +752,23 @@ async def main():
         api_private_key=api_private_key,
     )
 
-    print(f"Bot wallet address: {client.address}")
-    print()
+    print(f"\n{'='*60}")
+    print(f"TURBINE PRICE ACTION BOT")
+    print(f"{'='*60}")
+    print(f"Wallet: {client.address}")
+    print(f"Chain: {CHAIN_ID}")
+    print(f"Order size: ${args.order_size:.2f} USDC")
+    print(f"Max position: ${args.max_position:.2f} USDC per market")
+    print(f"USDC approval: gasless (one-time max permit per settlement)")
+    print(f"{'='*60}\n")
 
-    # Get the initial active BTC 15-minute market
-    print("Checking for active BTC market...")
-    response = client._http.get("/api/v1/quick-markets/BTC")
-    quick_market_data = response.get("quickMarket")
-
-    if not quick_market_data:
-        print("⚠️  No active BTC market right now.")
-        print("The bot will wait for a new market to start and then begin trading.")
-        print("Monitor task will check for new markets every 5 seconds.")
-        print()
-
-        # Create bot with no initial market
-        bot = PriceActionBot(client)
-
-        # Run background tasks (monitor will detect when market starts)
-        try:
-            await bot.run()
-        except KeyboardInterrupt:
-            print("\n🛑 Shutting down...")
-        finally:
-            client.close()
-        return
-
-    quick_market = QuickMarket.from_dict(quick_market_data)
-    print(f"Initial market: BTC @ ${quick_market.start_price / 1e6:,.2f}")
-    print(f"Market expires at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(quick_market.end_time))}")
-    print()
-
-    # Note gasless features
-    if CLAIM_ONLY_MODE:
-        print("🔒 CLAIM ONLY MODE ENABLED - Trading disabled")
-        print("✓ Automatic winnings claim enabled for resolved markets")
-        print("✓ Monitoring markets for transitions")
-    else:
-        print("✓ Orders will include USDC permit signatures for gasless trading")
-        print("✓ Automatic winnings claim enabled for resolved markets")
-        print("✓ Automatic market switching when new BTC markets start")
-    print()
-
-    # Run the bot
-    bot = PriceActionBot(client)
+    bot = PriceActionBot(
+        client,
+        order_size_usdc=args.order_size,
+        max_position_usdc=args.max_position,
+    )
 
     try:
-        # Initialize with the current market
-        await bot.switch_to_new_market(quick_market.market_id, quick_market.start_price)
-
-        # Run the main trading loop (starts background tasks internally)
         await bot.run()
     except KeyboardInterrupt:
         pass
@@ -864,7 +777,7 @@ async def main():
         bot.running = False
         await bot.cancel_all_orders()
         client.close()
-        print("Bot stopped cleanly.")
+        print("Bot stopped.")
 
 
 if __name__ == "__main__":
