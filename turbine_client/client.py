@@ -85,6 +85,10 @@ class TurbineClient:
         # Initialize HTTP client
         self._http = HttpClient(host, auth=self._auth, timeout=timeout)
 
+        # Local permit nonce tracking for high-throughput scenarios
+        # Key: (owner_address, contract_address), Value: next nonce to use
+        self._permit_nonces: Dict[Tuple[str, str], int] = {}
+
     def close(self) -> None:
         """Close the client and release resources."""
         self._http.close()
@@ -921,6 +925,170 @@ class TurbineClient:
             print(f"Warning: Failed to get nonce from {contract_address}: {e}, using 0")
             return 0
 
+    def _get_and_increment_permit_nonce(self, owner: str, contract_address: str) -> int:
+        """Get the next permit nonce with local tracking for high-throughput scenarios.
+
+        On first call for an owner/contract pair, fetches from blockchain.
+        Subsequent calls use local tracking and increment automatically.
+
+        This prevents permit nonce conflicts when signing multiple permits
+        for the same account before any are settled on-chain.
+
+        Args:
+            owner: The permit owner address.
+            contract_address: The token contract address.
+
+        Returns:
+            The next nonce to use for the permit.
+        """
+        key = (owner.lower(), contract_address.lower())
+
+        if key not in self._permit_nonces:
+            # First call - fetch from blockchain
+            self._permit_nonces[key] = self._get_contract_nonce(owner, contract_address)
+
+        nonce = self._permit_nonces[key]
+        self._permit_nonces[key] += 1
+        return nonce
+
+    def sync_permit_nonce(self, contract_address: Optional[str] = None) -> int:
+        """Sync the local permit nonce with the blockchain.
+
+        Use this after transactions have settled to ensure local tracking
+        matches on-chain state, or after a permit failure to resync.
+
+        Args:
+            contract_address: The token contract. Defaults to USDC.
+
+        Returns:
+            The current on-chain nonce.
+        """
+        self._require_signer()
+
+        owner = self._signer.address
+        contract = contract_address or self._chain_config.usdc_address
+        key = (owner.lower(), contract.lower())
+
+        on_chain_nonce = self._get_contract_nonce(owner, contract)
+        self._permit_nonces[key] = on_chain_nonce
+        return on_chain_nonce
+
+    def approve_usdc(
+        self,
+        amount: int,
+        spender: Optional[str] = None,
+    ) -> str:
+        """Approve USDC spending for the settlement contract (on-chain transaction).
+
+        This is an alternative to permit-based approval. Use this for high-frequency
+        trading scenarios where permit nonce management becomes a bottleneck.
+
+        Args:
+            amount: The amount to approve (with 6 decimals for USDC).
+            spender: The spender address. Defaults to settlement contract.
+
+        Returns:
+            The transaction hash.
+
+        Raises:
+            AuthenticationError: If no signer is configured.
+        """
+        self._require_signer()
+
+        from web3 import Web3
+
+        spender = spender or self._chain_config.settlement_address
+        usdc_address = self._chain_config.usdc_address
+
+        # Get RPC URL
+        rpc_urls = {
+            137: "https://polygon-rpc.com",
+            43114: "https://api.avax.network/ext/bc/C/rpc",
+            84532: "https://sepolia.base.org",
+        }
+        rpc_url = rpc_urls.get(self._chain_id)
+        if not rpc_url:
+            raise ValueError(f"No RPC URL for chain {self._chain_id}")
+
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+        # ERC20 approve function signature: approve(address,uint256)
+        approve_selector = "0x095ea7b3"
+        approve_data = (
+            approve_selector
+            + spender[2:].lower().zfill(64)
+            + hex(amount)[2:].zfill(64)
+        )
+
+        # Build transaction
+        nonce = w3.eth.get_transaction_count(self._signer.address)
+        gas_price = w3.eth.gas_price
+
+        tx = {
+            "to": usdc_address,
+            "data": approve_data,
+            "gas": 100000,
+            "gasPrice": gas_price,
+            "nonce": nonce,
+            "chainId": self._chain_id,
+        }
+
+        # Sign and send
+        signed_tx = w3.eth.account.sign_transaction(tx, self._signer._account.key)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+        return tx_hash.hex()
+
+    def get_usdc_allowance(
+        self,
+        owner: Optional[str] = None,
+        spender: Optional[str] = None,
+    ) -> int:
+        """Get the current USDC allowance for a spender.
+
+        Args:
+            owner: The token owner. Defaults to signer address.
+            spender: The spender address. Defaults to settlement contract.
+
+        Returns:
+            The current allowance (with 6 decimals).
+        """
+        from web3 import Web3
+
+        owner = owner or (self._signer.address if self._signer else None)
+        if not owner:
+            raise ValueError("Owner address required (no signer configured)")
+
+        spender = spender or self._chain_config.settlement_address
+        usdc_address = self._chain_config.usdc_address
+
+        # Get RPC URL
+        rpc_urls = {
+            137: "https://polygon-rpc.com",
+            43114: "https://api.avax.network/ext/bc/C/rpc",
+            84532: "https://sepolia.base.org",
+        }
+        rpc_url = rpc_urls.get(self._chain_id)
+        if not rpc_url:
+            raise ValueError(f"No RPC URL for chain {self._chain_id}")
+
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+        # allowance(address,address) -> uint256
+        allowance_selector = "0xdd62ed3e"
+        allowance_data = (
+            allowance_selector
+            + owner[2:].lower().zfill(64)
+            + spender[2:].lower().zfill(64)
+        )
+
+        result = w3.eth.call({
+            "to": usdc_address,
+            "data": allowance_data,
+        })
+
+        return int(result.hex(), 16)
+
     def sign_usdc_permit(
         self,
         value: int,
@@ -949,8 +1117,8 @@ class TurbineClient:
         spender = settlement_address or self._chain_config.settlement_address
         usdc_address = self._chain_config.usdc_address
 
-        # Get USDC nonce for the owner
-        nonce = self._get_contract_nonce(owner, usdc_address)
+        # Get USDC nonce with local tracking (auto-increment for batch scenarios)
+        nonce = self._get_and_increment_permit_nonce(owner, usdc_address)
 
         # Set deadline
         if deadline is None:

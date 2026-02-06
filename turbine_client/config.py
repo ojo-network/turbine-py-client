@@ -25,9 +25,9 @@ CHAIN_CONFIGS: Dict[int, ChainConfig] = {
     BASE_SEPOLIA: ChainConfig(
         chain_id=BASE_SEPOLIA,
         name="Base Sepolia",
-        settlement_address="0x0000000000000000000000000000000000000000",  # TBD
-        ctf_address="0x0000000000000000000000000000000000000000",  # TBD
-        usdc_address="0x0000000000000000000000000000000000000000",  # TBD
+        settlement_address="0xF37B881F236033E55bF1cdAB628c7Cd88aAd89D4",
+        ctf_address="0xc5Eb8d9dE7c56CC600B9ed4E71318307C740f5ED",
+        usdc_address="0xf9065CCFF7025649F16D547DC341DAffF0C7F7f6",
         default_host="https://api.turbinefi.com",
     ),
     POLYGON_MAINNET: ChainConfig(
