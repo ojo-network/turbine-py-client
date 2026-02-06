@@ -7,14 +7,10 @@ Places N trades at a time against the current BTC quick market.
 Uses aiohttp for TRUE parallel HTTP requests - all orders hit the API
 within milliseconds of each other, properly testing batch settlement.
 
-Supports multiple accounts to avoid permit nonce race conditions.
-Each account handles its own trades with its own nonce sequence.
+Supports multiple accounts for distributed load testing.
 
-Pre-Approval Mode:
-    When --preapprove is enabled, the bot pre-approves USDC to the settlement
-    contract at startup. This eliminates the need for per-order permit signing
-    and removes the batch delay requirement for permit nonce propagation.
-    Use this for high-frequency trading simulations.
+USDC is approved gaslessly at startup via one-time max permit per settlement
+contract. Orders are submitted without per-order permits.
 
 Usage:
     # Single account
@@ -25,9 +21,6 @@ Usage:
 
     # Multiple batches
     TURBINE_PRIVATE_KEY=0x... python examples/stress_test_bot.py -n 20 --batches 5
-
-    # Pre-approval mode (faster, no permit delays needed)
-    TURBINE_PRIVATE_KEY=0x... python examples/stress_test_bot.py -n 30 --preapprove -d 2
 """
 
 import argparse
@@ -99,14 +92,10 @@ class StressTestBot:
     Uses aiohttp for TRUE parallel HTTP requests, ensuring all orders
     hit the API within milliseconds of each other.
 
-    Supports multiple accounts to distribute trades and avoid permit nonce
-    race conditions. Each account handles its own permit nonce sequence.
+    Supports multiple accounts to distribute trades across wallets.
 
-    Pre-Approval Mode:
-        When preapprove=True, the bot uses pre-approved USDC allowances instead
-        of per-order permit signatures. This eliminates permit nonce constraints
-        and allows much faster batch submission (no need to wait for permit
-        nonce propagation between batches).
+    USDC is approved gaslessly at startup via one-time max permit per
+    settlement contract. Orders are submitted without per-order permits.
     """
 
     def __init__(
@@ -116,7 +105,6 @@ class StressTestBot:
         order_size: int = DEFAULT_ORDER_SIZE,
         batch_delay: float = DEFAULT_BATCH_DELAY,
         num_batches: int = DEFAULT_NUM_BATCHES,
-        preapprove: bool = False,
     ):
         if not clients:
             raise ValueError("At least one client is required")
@@ -125,7 +113,6 @@ class StressTestBot:
         self.order_size = order_size
         self.batch_delay = batch_delay
         self.num_batches = num_batches
-        self.preapprove = preapprove
         self.market_id: str | None = None
         self.settlement_address: str | None = None
         self.strike_price: int = 0
@@ -177,9 +164,7 @@ class StressTestBot:
 
         Creates and signs the order using the sync client, then returns
         the payload and headers needed for async HTTP submission.
-
-        When preapprove mode is enabled, skips permit signing (relies on
-        pre-approved USDC allowance instead).
+        No per-order permit — relies on one-time max permit allowance.
 
         Returns:
             Tuple of (order_payload, headers) for async submission.
@@ -194,17 +179,7 @@ class StressTestBot:
             settlement_address=self.settlement_address,
         )
 
-        # Sign USDC permit (only if not using preapprove mode)
-        if not self.preapprove:
-            buyer_cost = (self.order_size * price) // 1_000_000
-            total_fee = self.order_size // 100  # 1% fee
-            permit_amount = ((buyer_cost + total_fee) * 120) // 100  # 20% margin
-
-            permit = client.sign_usdc_permit(
-                value=permit_amount,
-                settlement_address=self.settlement_address,
-            )
-            order.permit_signature = permit
+        # No per-order permit — using one-time max permit allowance
 
         # Get the payload and auth headers
         payload = order.to_dict()
@@ -262,49 +237,34 @@ class StressTestBot:
 
         return result
 
-    def sync_all_permit_nonces(self) -> None:
-        """Sync permit nonces for all clients from the blockchain.
+    # Half of max uint256 — threshold for "already has max approval"
+    MAX_APPROVAL_THRESHOLD = (2**256 - 1) // 2
 
-        Call this before each batch to ensure local tracking matches
-        on-chain state after previous batches have settled.
-        """
-        for client in self.clients:
-            try:
-                nonce = client.sync_permit_nonce()
-                print(f"  {client.address[:10]}: nonce={nonce}")
-            except Exception as e:
-                print(f"Warning: Failed to sync nonce for {client.address[:10]}: {e}")
+    def ensure_all_approved(self) -> None:
+        """Ensure all clients have gasless max USDC approval for the settlement contract.
 
-    def setup_preapproval(self, approval_amount: int) -> None:
-        """Pre-approve USDC for all clients to the settlement contract.
-
-        This is an on-chain transaction that approves USDC spending.
-        Once approved, orders can be submitted without per-order permits.
-
-        Args:
-            approval_amount: Amount of USDC to approve (with 6 decimals).
+        Signs a one-time max permit per client via the relayer. No native gas required.
         """
         print(f"\n{'='*60}")
-        print("SETTING UP USDC PRE-APPROVALS")
+        print("ENSURING GASLESS USDC APPROVALS")
         print(f"{'='*60}")
-        print(f"Approval amount: {approval_amount / 1_000_000:,.2f} USDC per account")
 
         for i, client in enumerate(self.clients):
             print(f"\n[{i+1}/{len(self.clients)}] {client.address}")
 
             # Check current allowance
-            current_allowance = client.get_usdc_allowance()
-            print(f"  Current allowance: {current_allowance / 1_000_000:,.2f} USDC")
+            current_allowance = client.get_usdc_allowance(spender=self.settlement_address)
 
-            if current_allowance >= approval_amount:
-                print(f"  ✓ Already approved sufficient amount")
+            if current_allowance >= self.MAX_APPROVAL_THRESHOLD:
+                print(f"  ✓ Already has max approval")
                 continue
 
-            # Submit approval transaction
-            print(f"  Submitting approval transaction...")
+            # Submit gasless max permit via relayer
+            print(f"  Submitting gasless max permit...")
             try:
-                tx_hash = client.approve_usdc(approval_amount)
-                print(f"  TX: {tx_hash}")
+                result = client.approve_usdc_for_settlement(self.settlement_address)
+                tx_hash = result.get("tx_hash", "unknown")
+                print(f"  Relayer TX: {tx_hash}")
                 print(f"  Waiting for confirmation...")
 
                 # Wait for transaction confirmation
@@ -317,13 +277,12 @@ class StressTestBot:
                 rpc_url = rpc_urls.get(client.chain_id)
                 w3 = Web3(Web3.HTTPProvider(rpc_url))
 
-                # Poll for receipt
-                for _ in range(30):  # Wait up to 30 seconds
+                for _ in range(30):
                     try:
                         receipt = w3.eth.get_transaction_receipt(tx_hash)
                         if receipt:
                             if receipt["status"] == 1:
-                                print(f"  ✓ Approved successfully")
+                                print(f"  ✓ Max approval confirmed (gasless)")
                             else:
                                 print(f"  ✗ Transaction failed")
                             break
@@ -334,10 +293,10 @@ class StressTestBot:
                     print(f"  ⚠ Transaction pending (may still confirm)")
 
             except Exception as e:
-                print(f"  ✗ Approval failed: {e}")
+                print(f"  ✗ Gasless approval failed: {e}")
 
         print(f"\n{'='*60}")
-        print("PRE-APPROVAL SETUP COMPLETE")
+        print("APPROVAL SETUP COMPLETE")
         print(f"{'='*60}")
 
     async def place_batch_orders(self, batch_num: int) -> list[dict]:
@@ -346,13 +305,7 @@ class StressTestBot:
         print(f"BATCH {batch_num}: Placing {self.trades_per_batch} orders across {len(self.clients)} accounts")
         print(f"{'='*60}")
 
-        # Sync permit nonces from blockchain before preparing orders
-        # Skip this in preapprove mode (no permits needed)
-        if not self.preapprove:
-            print("Syncing permit nonces from blockchain...")
-            self.sync_all_permit_nonces()
-        else:
-            print("(Preapprove mode - skipping permit nonce sync)")
+        # No permit nonce sync needed — using one-time max permit allowance
 
         # Get current orderbook to determine prices
         try:
@@ -509,8 +462,11 @@ class StressTestBot:
         print(f"Order size: {self.order_size / 1_000_000:.2f} shares")
         print(f"Batches: {self.num_batches if self.num_batches > 0 else 'Infinite'}")
         print(f"Delay between batches: {self.batch_delay}s ({int(self.batch_delay * 1000)}ms)")
-        print(f"Approval mode: {'PRE-APPROVED (no permits)' if self.preapprove else 'PER-ORDER PERMITS'}")
+        print(f"Approval mode: GASLESS (one-time max permit)")
         print(f"HTTP mode: ASYNC (true parallel requests)")
+
+        # Ensure all clients have gasless max USDC approval
+        self.ensure_all_approved()
 
         # Run batches
         batch_num = 0
@@ -576,17 +532,6 @@ async def main():
         default=DEFAULT_BATCH_DELAY,
         help=f"Delay in seconds between batches, supports decimals like 0.1 (default: {DEFAULT_BATCH_DELAY})"
     )
-    parser.add_argument(
-        "--preapprove",
-        action="store_true",
-        help="Pre-approve USDC instead of per-order permits (faster, no permit delays)"
-    )
-    parser.add_argument(
-        "--approval-amount",
-        type=int,
-        default=10_000_000_000,  # 10,000 USDC
-        help="USDC approval amount in 6 decimals (default: 10000000000 = 10,000 USDC)"
-    )
     args = parser.parse_args()
 
     # Get private keys (supports multiple)
@@ -612,8 +557,7 @@ async def main():
     print(f"\nAll {len(clients)} accounts ready")
     print(f"Chain ID: {CHAIN_ID}")
     print(f"API Host: {TURBINE_HOST}")
-    if args.preapprove:
-        print(f"Mode: PRE-APPROVAL (no permit delays)")
+    print(f"Mode: GASLESS (one-time max permit)")
 
     # Run stress test with CLI args
     bot = StressTestBot(
@@ -622,12 +566,7 @@ async def main():
         order_size=args.size,
         batch_delay=args.delay,
         num_batches=args.batches,
-        preapprove=args.preapprove,
     )
-
-    # Setup pre-approvals if enabled
-    if args.preapprove:
-        bot.setup_preapproval(args.approval_amount)
 
     try:
         await bot.run()

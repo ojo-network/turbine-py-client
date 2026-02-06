@@ -56,6 +56,7 @@ ENDPOINTS = {
 
     # Relayer endpoints
     "ctf_approval": "/api/v1/relayer/ctf-approval",
+    "usdc_permit": "/api/v1/relayer/usdc-permit",
     "ctf_redemption": "/api/v1/relayer/ctf-redemption",
     "batch_ctf_redemption": "/api/v1/relayer/batch-ctf-redemption",
 }

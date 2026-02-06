@@ -891,6 +891,142 @@ class TurbineClient:
             s=s,
         )
 
+    def request_usdc_permit(
+        self,
+        owner: str,
+        spender: str,
+        value: int,
+        deadline: int,
+        v: int,
+        r: str,
+        s: str,
+    ) -> Dict[str, Any]:
+        """Submit a USDC permit to the relayer for gasless approval.
+
+        Args:
+            owner: The token owner address.
+            spender: The spender (settlement contract) address.
+            value: The approved amount.
+            deadline: The permit deadline timestamp.
+            v: Signature v value.
+            r: Signature r value (hex string with 0x prefix).
+            s: Signature s value (hex string with 0x prefix).
+
+        Returns:
+            The relayer response with tx_hash on success.
+
+        Raises:
+            AuthenticationError: If no auth is configured.
+        """
+        self._require_auth()
+        data = {
+            "chainId": self._chain_id,
+            "owner": owner,
+            "spender": spender,
+            "value": str(value),
+            "deadline": str(deadline),
+            "v": v,
+            "r": r,
+            "s": s,
+        }
+        return self._http.post(ENDPOINTS["usdc_permit"], data=data, authenticated=True)
+
+    def approve_usdc_for_settlement(
+        self,
+        settlement_address: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Approve USDC spending for a settlement contract using gasless permit.
+
+        Signs an EIP-2612 max permit (max value, max deadline) and submits it
+        to the relayer for gasless execution. No native gas is required.
+
+        Args:
+            settlement_address: The settlement contract to approve. If not provided,
+                               uses the default for the chain.
+
+        Returns:
+            The relayer response with tx_hash on success.
+
+        Raises:
+            AuthenticationError: If no signer is configured.
+        """
+        self._require_signer()
+        self._require_auth()
+
+        from eth_account import Account
+
+        MAX_UINT256 = 2**256 - 1
+
+        owner = self._signer.address
+        spender = settlement_address or self._chain_config.settlement_address
+        usdc_address = self._chain_config.usdc_address
+
+        # Get nonce from USDC contract
+        nonce = self._get_contract_nonce(owner, usdc_address)
+
+        # USDC EIP-712 domain varies by network
+        is_testnet = self._chain_id in [84532]  # Base Sepolia
+        token_name = "Mock USDC" if is_testnet else "USD Coin"
+        token_version = "1" if is_testnet else "2"
+
+        typed_data = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "Permit": [
+                    {"name": "owner", "type": "address"},
+                    {"name": "spender", "type": "address"},
+                    {"name": "value", "type": "uint256"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "deadline", "type": "uint256"},
+                ],
+            },
+            "primaryType": "Permit",
+            "domain": {
+                "name": token_name,
+                "version": token_version,
+                "chainId": self._chain_id,
+                "verifyingContract": usdc_address,
+            },
+            "message": {
+                "owner": owner,
+                "spender": spender,
+                "value": MAX_UINT256,
+                "nonce": nonce,
+                "deadline": MAX_UINT256,
+            },
+        }
+
+        # Sign the typed data
+        signed = Account.sign_typed_data(
+            self._signer._account.key,
+            full_message=typed_data,
+        )
+
+        # Extract v, r, s
+        v = signed.v
+        r = "0x" + hex(signed.r)[2:].zfill(64)
+        s = "0x" + hex(signed.s)[2:].zfill(64)
+
+        print(f"Submitting USDC max permit...")
+        print(f"  Owner: {owner}")
+        print(f"  Spender: {spender}")
+
+        # Submit to relayer
+        return self.request_usdc_permit(
+            owner=owner,
+            spender=spender,
+            value=MAX_UINT256,
+            deadline=MAX_UINT256,
+            v=v,
+            r=r,
+            s=s,
+        )
+
     def _get_ctf_nonce(self, owner: str, ctf_address: str) -> int:
         """Get the current nonce for an owner from the CTF contract.
 
