@@ -48,6 +48,7 @@ class OrderArgs:
 class PermitSignature:
     """EIP-2612 permit signature for gasless USDC approval."""
 
+    nonce: int  # The nonce used when signing (must match on-chain)
     value: int  # Amount approved
     deadline: int  # Expiration timestamp
     v: int
@@ -57,6 +58,7 @@ class PermitSignature:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for API submission."""
         return {
+            "nonce": self.nonce,
             "value": self.value,
             "deadline": self.deadline,
             "v": self.v,

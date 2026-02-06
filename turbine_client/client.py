@@ -1174,6 +1174,7 @@ class TurbineClient:
         s = "0x" + hex(signed.s)[2:].zfill(64)
 
         return PermitSignature(
+            nonce=nonce,
             value=value,
             deadline=deadline,
             v=v,
