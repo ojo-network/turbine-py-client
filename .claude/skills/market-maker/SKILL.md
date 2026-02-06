@@ -175,14 +175,51 @@ Present the user with these trading algorithm options for prediction markets:
 - Best for: Markets with overconfident pricing
 - Risk: Medium - based on market efficiency assumptions
 
+## Step 4.5: Approval Mode Selection
+
+After selecting an algorithm, ask the user which USDC approval mode they prefer:
+
+**Option A: Permit-Based (Recommended for beginners)**
+- **No native gas token required** - Orders are fully gasless
+- Uses EIP-2612 permit signatures attached to each order
+- **Trade-off**: Requires time between orders (~5-10s) for permit nonce to increment after settlement
+- Best for: Casual trading, low-frequency strategies, users without native gas
+- Reference: `examples/price_action_bot.py`
+
+**Option B: Pre-Approval (Recommended for high-frequency)**
+- **Requires native gas token** (ETH on Base, MATIC on Polygon) for one-time USDC approval transaction
+- Orders submitted without permit signatures (faster)
+- **Trade-off**: Must send an on-chain approval transaction at startup
+- Best for: High-frequency trading, stress testing, rapid order placement
+- Reference: `examples/price_action_bot_preapproved.py`
+
+**Key differences:**
+
+| Feature | Permit-Based | Pre-Approval |
+|---------|--------------|--------------|
+| Native gas needed | No | Yes (for approval TX) |
+| Order frequency | ~5-10s between orders | No permit delays (API rate limits apply) |
+| Complexity | Per-order permit signing | One-time approval |
+| Nonce management | Must track permit nonces | None |
+| Best for | Beginners, gasless | High-frequency, bots |
+
 ## Reference Implementation
 
-For **Option 1: Price Action Trader**, a complete, production-ready implementation exists at:
+Two complete, production-ready implementations exist for the **Price Action Trader**:
 
-**`examples/price_action_bot.py`**
+**Permit-Based: `examples/price_action_bot.py`**
+- Uses EIP-2612 permits for gasless trading
+- Includes permit nonce tracking and management
+- Best for users who don't want to hold native gas tokens
 
-This is the canonical reference. When generating a Price Action Trader bot:
-1. **Read `examples/price_action_bot.py`** to understand the complete implementation
+**Pre-Approval: `examples/price_action_bot_preapproved.py`**
+- Uses pre-approved USDC allowance
+- Auto-approves USDC at startup when entering new markets
+- Order sizing in USDC terms with position tracking
+- Best for high-frequency trading scenarios
+
+When generating a bot:
+1. **Read the appropriate reference file** based on approval mode chosen
 2. Copy the structure exactly, customizing only configuration parameters as needed
 3. **DO NOT** use the simplified code snippets in this skill - they are incomplete
 
@@ -191,7 +228,7 @@ For **other algorithm options**, use the same bot structure but replace the algo
 - `execute_signal()` - Adapt order placement to match the algorithm
 - `price_action_loop()` - Rename and adapt the main loop for the algorithm
 
-The reference implementation includes critical patterns that **MUST** be preserved in all bots:
+The reference implementations include critical patterns that **MUST** be preserved in all bots:
 - Position syncing from API (`sync_position()`, `verify_position()`)
 - Pending order TX tracking (`pending_order_txs` set)
 - Trade verification (check failed_trades, pending_trades, recent trades)
@@ -200,9 +237,15 @@ The reference implementation includes critical patterns that **MUST** be preserv
 - Rate-limited claiming (15s delay between claims)
 - Async HTTP client for non-blocking external API calls
 
+**Additional patterns for Pre-Approval mode:**
+- Auto-approval when entering new markets (`ensure_settlement_approved()`)
+- USDC-based order sizing (`calculate_shares_from_usdc()`)
+- Position tracking in USDC terms (`position_usdc` dict)
+- Allowance checking via `client.get_usdc_allowance()`
+
 ## Step 5: Generate the Bot Code
 
-Based on the user's algorithm choice, generate a complete bot file. The bot should:
+Based on the user's algorithm and approval mode choices, generate a complete bot file. The bot should:
 
 1. Load credentials from environment variables
 2. Auto-register API keys if needed
@@ -212,8 +255,13 @@ Based on the user's algorithm choice, generate a complete bot file. The bot shou
 6. Cancel orders on shutdown
 7. **Automatically detect new BTC markets and switch liquidity/trades to them**
 8. Handle market expiration gracefully with seamless transitions
-9. **Sign USDC permits for gasless order execution** (no separate approval transaction needed)
+9. **Handle USDC authorization based on chosen mode:**
+   - **Permit mode**: Sign USDC permits for each order (gasless)
+   - **Pre-approval mode**: Auto-approve USDC at startup/market switch (high-frequency)
 10. **Track traded markets and automatically claim winnings when they resolve**
+
+**For Permit mode**: Use `examples/price_action_bot.py` as reference
+**For Pre-approval mode**: Use `examples/price_action_bot_preapproved.py` as reference
 
 Use this template structure for all bots:
 
@@ -494,7 +542,9 @@ Note: `httpx` is used by the Price Action Trader to fetch real-time BTC prices f
 
 ## Step 7: Explain How to Run and Deploy
 
-Tell the user:
+Tell the user based on their chosen approval mode:
+
+**For Permit-Based bots:**
 ```
 Your bot is ready! To run it locally:
 
@@ -507,6 +557,27 @@ The bot will:
 - Sign USDC permits for gasless order execution (no approval TX needed)
 - Automatically switch to new markets when they start
 - Track traded markets and claim winnings when they resolve
+
+Note: Orders require ~5-10 seconds between submissions for permit nonce propagation.
+
+To stop the bot, press Ctrl+C.
+```
+
+**For Pre-Approval bots:**
+```
+Your bot is ready! To run it:
+
+  python {bot_filename}.py
+
+The bot will:
+- Automatically register API credentials on first run (saved to .env)
+- Connect to the current BTC 15-minute market
+- Auto-approve USDC spending (requires native gas token: ETH on Base, MATIC on Polygon)
+- Start trading based on your chosen algorithm (no permit nonce delays)
+- Automatically switch to new markets when they start (re-approves for new settlements)
+- Track traded markets and claim winnings when they resolve
+
+Note: Ensure your wallet has native gas tokens for the initial USDC approval transaction.
 
 To stop the bot, press Ctrl+C.
 
@@ -717,11 +788,53 @@ def find_edge(self, best_bid, best_ask):
 - When less than 60 seconds remain, the bot logs a warning
 - Orders are cancelled proactively to avoid stuck orders on expired markets
 
-## USDC Permit Signatures (Gasless Trading)
+## USDC Approval Modes
 
-**Every order must include a USDC permit signature** for gasless execution. Without this, orders will fail with "ERC20: transfer amount exceeds allowance".
+There are two ways to authorize USDC spending for order execution:
+
+### Mode A: Permit Signatures (Gasless)
+
+**Every order includes a USDC permit signature** for gasless execution. No on-chain approval needed.
 
 The `TurbineClient` provides `sign_usdc_permit()` to create EIP-2612 permit signatures:
+
+**Pros:** No native gas token needed
+**Cons:** Must wait ~5-10s between orders for permit nonce to propagate after settlement
+
+### Mode B: Pre-Approval (High-Frequency)
+
+**Approve USDC once at startup**, then submit orders without permit signatures.
+
+```python
+# At startup or when entering a new market:
+APPROVAL_AMOUNT = 1_000_000_000_000  # 1 million USDC (adjust as needed)
+
+def ensure_settlement_approved(self, settlement_address: str) -> None:
+    """Ensure USDC is approved for this settlement contract."""
+    if settlement_address in self.approved_settlements:
+        return
+
+    # Check current allowance
+    current = self.client.get_usdc_allowance(spender=settlement_address)
+    if current >= APPROVAL_AMOUNT // 2:
+        print(f"Existing allowance sufficient: ${current / 1e6:,.2f}")
+        self.approved_settlements[settlement_address] = current
+        return
+
+    # Send approval transaction (requires native gas)
+    print(f"Approving USDC for settlement {settlement_address[:16]}...")
+    tx_hash = self.client.approve_usdc(APPROVAL_AMOUNT, spender=settlement_address)
+    print(f"Approval TX: {tx_hash}")
+
+    # Wait for confirmation
+    time.sleep(5)
+    self.approved_settlements[settlement_address] = APPROVAL_AMOUNT
+```
+
+**Pros:** No permit nonce delays (API rate limits still apply), no permit nonce tracking
+**Cons:** Requires native gas token for approval transaction
+
+### Permit-Based Order Placement (Mode A)
 
 ```python
 async def place_quotes(self) -> None:
@@ -780,6 +893,67 @@ async def place_quotes(self) -> None:
 - SELL orders need permit for: `size` (for JIT token splitting)
 - Always add a 10% safety margin to permit amounts
 - Permits are signed per-order with the settlement address as spender
+
+### Pre-Approval Order Placement (Mode B)
+
+When using pre-approval mode, orders are submitted **without** permit signatures:
+
+```python
+# Bot initialization includes approval tracking
+class PreapprovedBot:
+    def __init__(self, client: TurbineClient):
+        self.client = client
+        self.approved_settlements: dict[str, int] = {}  # settlement -> approved amount
+        self.order_size_usdc = 1.0  # Order size in USDC terms
+        self.position_usdc: dict[str, float] = {}  # market_id -> USDC position
+        # ... other fields
+
+    def calculate_shares_from_usdc(self, usdc_amount: float, price: int) -> int:
+        """Convert USDC amount to shares based on price.
+
+        Args:
+            usdc_amount: Amount in USDC (e.g., 1.0 = $1)
+            price: Price in 6 decimals (e.g., 500000 = 50%)
+
+        Returns:
+            Number of shares in 6 decimals
+        """
+        # shares = (usdc * 1e6 * 1e6) / price
+        return int((usdc_amount * 1_000_000 * 1_000_000) / price)
+
+    async def place_order(self, outcome: Outcome, price: int) -> None:
+        """Place order without permit signature (pre-approved)."""
+        # Ensure approved for this market's settlement
+        self.ensure_settlement_approved(self.settlement_address)
+
+        # Calculate shares from USDC amount
+        shares = self.calculate_shares_from_usdc(self.order_size_usdc, price)
+
+        order = self.client.create_limit_buy(
+            market_id=self.market_id,
+            outcome=outcome,
+            price=price,
+            size=shares,
+            expiration=int(time.time()) + 300,
+            settlement_address=self.settlement_address,
+        )
+
+        # NO permit_signature attached - uses pre-approved allowance
+        result = self.client.post_order(order)
+        print(f"Order submitted: {result.order_hash[:16]}...")
+```
+
+**Key points:**
+- Call `ensure_settlement_approved()` when entering each new market
+- Orders submitted without `permit_signature` field
+- Settlement contract uses existing USDC allowance
+- Order size specified in USDC terms, converted to shares based on price
+- Track position in USDC terms per market for risk management
+
+**When to auto-approve:**
+- At bot startup
+- When switching to a new market (new settlement address)
+- When allowance drops below threshold
 
 ## Automatic Winnings Claiming
 
@@ -968,6 +1142,9 @@ After posting an order:
 - **Market Expiration**: BTC 15-minute markets expire quickly. Bots handle this automatically!
 - **Gas/Fees**: Trading on Polygon has minimal gas costs but watch for fees.
 - **Continuous Operation**: Bots are designed to run 24/7, switching between markets automatically.
+- **Approval Mode Choice**:
+  - **Permit mode**: Fully gasless, but ~5-10s delay between orders for nonce propagation
+  - **Pre-approval mode**: Needs native gas for approval TX, but no permit nonce delays
 
 ## Quick Reference
 
