@@ -1,264 +1,789 @@
-# Turbine Python SDK
+# Turbine Python Client
 
-Trade on [Turbine](https://beta.turbinefi.com) prediction markets from Python. Binary BTC/ETH markets with 15-minute resolution, CLOB orderbook, gasless execution on Polygon & Avalanche.
+A Python client for market makers to interact with the Turbine CLOB (Central Limit Order Book) prediction markets API.
+
+## Claude Skill
+
+We have a Claude skill published that can help you write a trading bot. Run this command to get started:
+
+```bash
+curl -sSL turbinefi.com/claude | bash
+```
+
+## Deploy to Railway
+
+Run your trading bot 24/7 in the cloud with Railway (free $5 credit for 30 days):
+
+```bash
+# After creating your bot, deploy it:
+claude "/railway-deploy"
+```
+
+Or use the deployment script directly:
+
+```bash
+bash scripts/deploy-railway.sh
+```
+
+**Prerequisites:**
+- A Railway account ([railway.com](https://railway.com)) — free $5 credit for 30 days
+- A generated bot (run the Claude skill above first)
+- Railway CLI is installed automatically if not found
+
+## Overview
+
+This client provides a clean, typed interface for:
+- Creating and signing EIP-712 orders
+- Submitting orders to the Turbine orderbook
+- Managing positions and tracking fills
+- Subscribing to real-time orderbook updates via WebSocket
+
+## Table of Contents
+
+1. [Installation](#installation)
+2. [Getting API Credentials](#getting-api-credentials)
+3. [Quick Start](#quick-start)
+4. [Architecture](#architecture)
+5. [Authentication](#authentication)
+6. [Order Management](#order-management)
+7. [Market Data](#market-data)
+8. [Claiming Winnings](#claiming-winnings)
+9. [WebSocket Streaming](#websocket-streaming)
+10. [Data Types](#data-types)
+11. [API Reference](#api-reference)
+12. [Examples](#examples)
+13. [Development](#development)
+
+---
+
+## Installation
 
 ```bash
 pip install turbine-py-client
 ```
 
-> **Import name:** `from turbine_client import TurbineClient` (underscore, not hyphen)
+Or install from source:
 
-## 30-Second Quickstart
+```bash
+git clone https://github.com/ojo-network/turbine-py-client.git
+cd turbine-py-client
+pip install -e .
+```
 
-### Read market data (no credentials)
+---
+
+## Getting API Credentials
+
+To trade on Turbine, you need:
+
+1. **Wallet Private Key** - Your Ethereum wallet's private key for signing orders
+2. **API Key ID** - Identifier for your API key
+3. **API Private Key** - Ed25519 private key for authenticating API requests
+
+### Self-Service Registration
+
+You can register for API credentials directly using your wallet:
 
 ```python
 from turbine_client import TurbineClient
 
-client = TurbineClient()  # defaults to Polygon mainnet
-qm = client.get_quick_market("BTC")
-print(f"BTC strike: ${qm.start_price / 1e6:,.2f}")
-
-book = client.get_orderbook(qm.market_id)
-print(f"Best bid: {book.bids[0].price / 1e4:.1f}%")
-```
-
-### Place a trade (3 lines)
-
-```python
-from turbine_client import TurbineClient
-
-client = TurbineClient.from_env()  # reads TURBINE_PRIVATE_KEY from .env
-qm = client.get_quick_market("BTC")
-
-result = client.buy(qm.market_id, "yes", price=0.55, size=1.0)
-# Buys 1 YES share at 55¢ ($0.55 USDC risk, $1.00 payout if correct)
-```
-
-**Setup:** Create a `.env` file with your wallet private key:
-
-```env
-TURBINE_PRIVATE_KEY=0xYOUR_PRIVATE_KEY_HERE
-```
-
-`from_env()` auto-registers API credentials on first run and prints them. Save them to `.env` for next time:
-
-```env
-TURBINE_PRIVATE_KEY=0x...
-TURBINE_API_KEY_ID=abc123
-TURBINE_API_PRIVATE_KEY=base64...
-```
-
-See [`.env.example`](.env.example) for the template.
-
----
-
-## How Turbine Markets Work
-
-- **Binary markets:** "Will BTC be above $X in 15 minutes?" → YES or NO
-- **Price = probability:** 60¢ for YES means the market thinks 60% chance of YES
-- **Payout:** Winning shares pay $1.00 USDC. Losing shares pay $0.
-- **CLOB orderbook:** Limit orders matched on-chain, gasless via relayer
-- **Chains:** Polygon (137), Avalanche (43114), Base Sepolia testnet (84532)
-
-### Price & Size Conventions
-
-| Human value | SDK value | Notes |
-|---|---|---|
-| 55% / $0.55 | `price=0.55` or `price=550000` | Floats 0–1 auto-scale |
-| 1 share | `size=1.0` or `size=1_000_000` | Floats auto-scale (6 decimals) |
-| $10 USDC | `10_000_000` (raw) | 6 decimal places |
-
-The `buy()` and `sell()` convenience methods accept **floats** (0.55, 1.0) or **raw ints** (550000, 1000000).
-
----
-
-## Client Setup
-
-```python
-# Option 1: From environment (recommended)
-client = TurbineClient.from_env()
-
-# Option 2: Explicit credentials
-client = TurbineClient(
-    private_key="0x...",
-    api_key_id="...",
-    api_private_key="...",
-)
-
-# Option 3: Read-only (public endpoints only)
-client = TurbineClient()
-
-# Option 4: Different chain
-client = TurbineClient.from_env(chain_id=43114)  # Avalanche
-```
-
-### Getting API Credentials
-
-```python
-# One-time registration (or use from_env() which does this automatically)
-creds = TurbineClient.request_api_credentials(
+# Request API credentials (only need to do this once!)
+credentials = TurbineClient.request_api_credentials(
     host="https://api.turbinefi.com",
-    private_key="0x...",
+    private_key="your_wallet_private_key",
 )
-print(creds["api_key_id"])       # save this
-print(creds["api_private_key"])  # save this — shown only once!
+
+print(f"API Key ID: {credentials['api_key_id']}")
+print(f"API Private Key: {credentials['api_private_key']}")
+# SAVE THESE! The private key cannot be retrieved later.
+```
+
+This will:
+1. Sign a message with your wallet to prove ownership
+2. Generate new Ed25519 API credentials linked to your wallet
+3. Return the credentials (save the private key - it's only shown once!)
+
+---
+
+## Quick Start
+
+### Full Trading Example
+
+```python
+from turbine_client import TurbineClient
+from turbine_client.types import Outcome, Side
+
+# Initialize with all credentials
+client = TurbineClient(
+    host="https://api.turbinefi.com",
+    chain_id=137,  # Polygon mainnet
+    private_key="your_wallet_private_key",
+    api_key_id="your_api_key_id",
+    api_private_key="your_api_private_key",
+)
+
+# Get the latest BTC quick market
+market = client.get_quick_market("BTC")
+print(f"Market: {market.question}")
+
+# Place a limit buy order
+order = client.create_limit_buy(
+    market_id=market.market_id,
+    outcome=Outcome.YES,
+    price=500000,      # 50% (price scaled by 1e6)
+    size=1_000_000,    # 1 share (6 decimals)
+)
+
+result = client.post_order(order)
+print(f"Order submitted: {result['orderHash']}")
+
+# Check orderbook
+orderbook = client.get_orderbook(market.market_id)
+print(f"Best bid: {orderbook.bids[0].price / 10000:.2f}%")
+print(f"Best ask: {orderbook.asks[0].price / 10000:.2f}%")
+
+# Cancel the order
+client.cancel_order(
+    order_hash=result['orderHash'],
+    market_id=market.market_id,
+    side=Side.BUY,
+)
+
+client.close()
+```
+
+### Read-Only Access (No Authentication)
+
+```python
+from turbine_client import TurbineClient
+
+# Public endpoints - no auth required
+client = TurbineClient(
+    host="https://api.turbinefi.com",
+    chain_id=137,
+)
+
+# Get all markets
+markets = client.get_markets()
+
+# Get orderbook for a market
+orderbook = client.get_orderbook(market_id="0x...")
+
+# Get recent trades
+trades = client.get_trades(market_id="0x...")
 ```
 
 ---
 
-## Trading
+## Architecture
 
-### Convenience Methods (Recommended)
+### Project Structure
 
-```python
-# Buy YES shares — creates, signs, and submits in one call
-result = client.buy(qm.market_id, "yes", price=0.60, size=5.0)
-
-# Sell YES shares
-result = client.sell(qm.market_id, "yes", price=0.70, size=5.0)
-
-# Works with enums too
-from turbine_client import Outcome
-result = client.buy(qm.market_id, Outcome.NO, price=0.40, size=2.0)
+```
+turbine_py_client/
+├── __init__.py                 # Main exports
+├── client.py                   # TurbineClient class
+├── signer.py                   # EIP-712 order signing
+├── auth.py                     # Bearer token generation (Ed25519)
+├── config.py                   # Chain configurations
+├── constants.py                # Constants (endpoints, chain IDs)
+├── exceptions.py               # Custom exceptions
+├── types.py                    # Data types and models
+├── order_builder/
+│   ├── __init__.py
+│   ├── builder.py              # OrderBuilder class
+│   └── helpers.py              # Price/size utilities
+├── http/
+│   ├── __init__.py
+│   └── client.py               # HTTP request handling
+├── ws/
+│   ├── __init__.py
+│   └── client.py               # WebSocket client
+└── utils.py                    # Utility functions
 ```
 
-### Low-Level Order Creation
+### Design Patterns
+
+1. **Modular Authentication** - Separate concerns for EIP-712 signing vs Bearer tokens
+2. **Builder Pattern** - OrderBuilder encapsulates order creation and signing
+3. **Dataclass Types** - Clean, serializable data structures with type hints
+4. **Async WebSocket** - Non-blocking real-time updates
+
+---
+
+## Authentication
+
+Turbine uses two authentication mechanisms:
+
+### 1. EIP-712 Order Signing (Required for Trading)
+
+All orders must be signed using EIP-712 structured data. The client handles this automatically.
+
+**Domain Separator:**
+```python
+{
+    "name": "Turbine",
+    "version": "1",
+    "chainId": 84532,  # Chain-specific
+    "verifyingContract": "0x..."  # Settlement contract
+}
+```
+
+**Order Type:**
+```python
+Order(
+    bytes32 marketId,
+    address trader,
+    uint8 side,        # 0=BUY, 1=SELL
+    uint8 outcome,     # 0=YES, 1=NO
+    uint256 price,
+    uint256 size,
+    uint256 nonce,
+    uint256 expiration,
+    address makerFeeRecipient
+)
+```
+
+### 2. Bearer Token Authentication (For Private Endpoints)
+
+Some endpoints require Ed25519 bearer tokens:
 
 ```python
-from turbine_client import Outcome
+# Token format: base64url(payload).base64url(signature)
+# Payload: {"kid": keyId, "ts": timestamp, "n": nonce}
+```
 
-# Step 1: Create and sign
-order = client.create_limit_buy(
-    market_id=qm.market_id,
+---
+
+## Order Management
+
+### Creating Orders
+
+```python
+from turbine_client import OrderArgs, Side, Outcome
+
+# Basic limit order
+order = OrderArgs(
+    market_id="0x1234...",
+    side=Side.BUY,
     outcome=Outcome.YES,
-    price=550000,       # 55% (raw int)
-    size=5_000_000,     # 5 shares (raw int)
-    expiration=int(time.time()) + 300,  # 5 min
+    price=500000,       # 50%
+    size=10000000,      # 10 shares
+    expiration=int(time.time()) + 86400,  # 24 hours
 )
 
-# Step 2: Submit
-result = client.post_order(order)
-print(result["orderHash"])
+signed = client.create_order(order)
+result = client.post_order(signed)
+```
 
-# Cancel
-client.cancel_order(result["orderHash"], market_id=qm.market_id)
+### Price Representation
 
-# Cancel all orders in a market
-client.cancel_market_orders(qm.market_id)
+Prices are scaled by 1,000,000 (1e6):
+- `500000` = 50% (even odds)
+- `250000` = 25%
+- `750000` = 75%
+- Range: 1 to 999,999
+
+### Order Lifecycle
+
+1. **Create** - Build order parameters
+2. **Sign** - EIP-712 signature via eth_account
+3. **Submit** - POST to `/api/v1/orders`
+4. **Match** - Engine matches against orderbook
+5. **Settle** - On-chain settlement
+6. **Confirm** - Position updated
+
+### Canceling Orders
+
+```python
+# Cancel single order
+client.cancel_order(
+    order_hash="0x...",
+    market_id="0x...",
+    side=Side.BUY
+)
+
+# Cancel all orders for a market
+client.cancel_market_orders(market_id="0x...")
 ```
 
 ---
 
 ## Market Data
 
+### Get Markets
+
 ```python
-# Quick markets (15-min BTC/ETH)
-qm = client.get_quick_market("BTC")
-price = client.get_quick_market_price("BTC")
-history = client.get_quick_market_history("BTC", limit=10)
-
-# Orderbook
-book = client.get_orderbook(qm.market_id)
-for bid in book.bids[:3]:
-    print(f"BID {bid.price / 1e4:.1f}% × {bid.size / 1e6:.2f}")
-
-# Trades
-trades = client.get_trades(qm.market_id, limit=20)
-
 # All markets
 markets = client.get_markets()
 
-# Platform stats
-stats = client.get_platform_stats()
+# Filter by chain
+markets = client.get_markets(chain_id=137)
+
+# Single market
+market = client.get_market(market_id="0x...")
 ```
 
----
-
-## Positions & Account
+### Get Orderbook
 
 ```python
-# Your positions
-positions = client.get_user_positions(client.address, chain_id=137)
-for pos in positions:
-    print(f"YES: {pos.yes_shares / 1e6:.2f}  NO: {pos.no_shares / 1e6:.2f}")
+# Full orderbook
+orderbook = client.get_orderbook(market_id="0x...")
 
-# Your open orders
-orders = client.get_orders(trader=client.address)
+# Filter by outcome
+yes_book = client.get_orderbook(market_id="0x...", outcome=Outcome.YES)
 
-# Your P&L
-stats = client.get_user_stats()
-print(f"PNL: ${stats.pnl / 1e6:.2f} ({stats.pnl_percentage:.1f}%)")
+# Access bids/asks
+for bid in orderbook.bids:
+    print(f"Bid: {bid.price} x {bid.size}")
+```
+
+### Get Trades
+
+```python
+# Recent trades (last 100)
+trades = client.get_trades(market_id="0x...")
+
+# Trade details
+for trade in trades:
+    print(f"{trade.timestamp}: {trade.price} x {trade.size}")
+```
+
+### Get Statistics
+
+```python
+# Market stats
+stats = client.get_stats(market_id="0x...")
+print(f"24h Volume: {stats.volume_24h}")
+print(f"Last Price: {stats.last_price}")
+
+# Platform stats
+platform = client.get_platform_stats()
+print(f"Total Markets: {platform.market_count}")
+```
+
+### Quick Markets (15-minute BTC/ETH)
+
+```python
+# Get active quick market
+qm = client.get_quick_market(asset="BTC")
+print(f"Strike: ${qm.start_price / 1e8}")
+print(f"Expires: {qm.end_time}")
+
+# Price feed
+price = client.get_quick_market_price(asset="BTC")
+print(f"Current BTC: ${price.price}")
 ```
 
 ---
 
 ## Claiming Winnings
 
-After a market resolves, claim your USDC — gasless, no native token needed:
+After a market resolves, you can claim your winnings using gasless permits (no gas required).
+
+### Single Market
 
 ```python
-# Single market
-result = client.claim_winnings("0xMarketContractAddress")
+from turbine_client import TurbineClient
 
-# Batch claim multiple markets
+client = TurbineClient(
+    host="https://api.turbinefi.com",
+    chain_id=137,
+    private_key="your_wallet_private_key",
+    api_key_id="your_api_key_id",
+    api_private_key="your_api_private_key",
+)
+
+# Claim winnings from a resolved market
+result = client.claim_winnings("0xMarketContractAddress...")
+print(f"Transaction: {result['tx_hash']}")
+```
+
+### Batch Claiming (Multiple Markets)
+
+```python
+# Claim from multiple resolved markets in a single transaction
 result = client.batch_claim_winnings([
-    "0xMarket1Address",
-    "0xMarket2Address",
+    "0xMarket1Address...",
+    "0xMarket2Address...",
+    "0xMarket3Address...",
 ])
+print(f"Transaction: {result['txHash']}")
+```
+
+### Command Line
+
+```bash
+# Single market
+python examples/claim_winnings.py 0xMarketAddress
+
+# Multiple markets
+python examples/batch_claim_winnings.py 0xMarket1 0xMarket2 --chain 137
+```
+
+### Checking Resolution Status
+
+```python
+# Check if a market is resolved
+resolution = client.get_resolution(market_id="0x...")
+print(f"Resolved: {resolution.resolved}")
+print(f"Winning outcome: {'YES' if resolution.outcome == 0 else 'NO'}")
 ```
 
 ---
 
 ## WebSocket Streaming
 
+### Basic Subscription
+
 ```python
 import asyncio
 from turbine_client import TurbineWSClient
 
 async def main():
-    ws = TurbineWSClient(host="https://api.turbinefi.com")
+    ws = TurbineWSClient(host="wss://api.turbinefi.com")
+
     async with ws.connect() as stream:
+        # Subscribe to market
         await stream.subscribe(market_id="0x...")
-        async for msg in stream:
-            if msg.type == "orderbook":
-                print(f"Book update: {len(msg.data['bids'])} bids")
-            elif msg.type == "trade":
-                print(f"Trade: {msg.data}")
+
+        async for message in stream:
+            if message.type == "orderbook":
+                print(f"Orderbook update: {len(message.data.bids)} bids")
+            elif message.type == "trade":
+                print(f"Trade: {message.data.price} x {message.data.size}")
 
 asyncio.run(main())
 ```
 
----
-
-## USDC Approval (Gasless)
-
-Before your first trade on a new settlement contract, USDC must be approved. This happens gaslessly via EIP-2612 permits:
+### Message Types
 
 ```python
-# One-time max approval (recommended) — no gas needed
-client.approve_usdc_for_settlement()
+# Orderbook update
+{
+    "type": "orderbook",
+    "marketId": "0x...",
+    "data": {
+        "bids": [{"price": 500000, "size": 10000}],
+        "asks": [{"price": 510000, "size": 5000}],
+        "lastUpdate": 1705000000
+    }
+}
 
-# Also approve CTF tokens for claiming winnings
-client.approve_ctf_for_settlement()
+# Trade execution
+{
+    "type": "trade",
+    "marketId": "0x...",
+    "data": {
+        "price": 505000,
+        "size": 5000,
+        "outcome": 0,
+        "side": 0,
+        "maker": "0x...",
+        "taker": "0x..."
+    }
+}
 
-# Check current allowance
-allowance = client.get_usdc_allowance()
+# Quick market update
+{
+    "type": "quick_market",
+    "data": {
+        "asset": "BTC",
+        "marketId": "0x...",
+        "startPrice": 95000000000,
+        "resolved": false
+    }
+}
 ```
+
+---
+
+## Data Types
+
+### Core Types
+
+```python
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+
+class Side(IntEnum):
+    BUY = 0
+    SELL = 1
+
+class Outcome(IntEnum):
+    YES = 0
+    NO = 1
+
+@dataclass
+class OrderArgs:
+    market_id: str
+    side: Side
+    outcome: Outcome
+    price: int          # 0 to 1,000,000
+    size: int           # 6 decimals
+    expiration: int     # Unix timestamp
+    nonce: int = 0      # Auto-generated if 0
+    maker_fee_recipient: str = "0x0000000000000000000000000000000000000000"
+
+@dataclass
+class SignedOrder:
+    market_id: str
+    trader: str
+    side: int
+    outcome: int
+    price: int
+    size: int
+    nonce: int
+    expiration: int
+    maker_fee_recipient: str
+    signature: str
+    order_hash: str
+
+@dataclass
+class OrderBookSnapshot:
+    market_id: str
+    bids: list[PriceLevel]
+    asks: list[PriceLevel]
+    last_update: int
+
+@dataclass
+class PriceLevel:
+    price: int
+    size: int
+
+@dataclass
+class Trade:
+    id: int
+    market_id: str
+    buyer: str
+    seller: str
+    price: int
+    size: int
+    outcome: int
+    timestamp: int
+    tx_hash: str
+
+@dataclass
+class Position:
+    id: int
+    market_id: str
+    user_address: str
+    yes_shares: int
+    no_shares: int
+    yes_cost: int
+    no_cost: int
+    yes_revenue: int
+    no_revenue: int
+    total_invested: int
+    total_cost: int
+    total_revenue: int
+    last_updated: int
+
+@dataclass
+class Market:
+    id: str
+    chain_id: int
+    contract_address: str
+    settlement_address: str
+    question: str
+    description: str
+    category: str
+    expiration: int
+    maker: str
+    resolved: bool
+    winning_outcome: int | None
+    volume: int
+    created_at: int
+    updated_at: int
+
+@dataclass
+class Resolution:
+    market_id: str
+    assertion_id: str
+    outcome: int
+    resolved: bool
+    timestamp: int
+```
+
+---
+
+## API Reference
+
+### Public Endpoints (No Auth)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `get_markets()` | `GET /api/v1/markets` | List all markets |
+| `get_market(market_id)` | `GET /api/v1/stats/{id}` | Get market stats |
+| `get_orderbook(market_id)` | `GET /api/v1/orderbook/{id}` | Get orderbook |
+| `get_trades(market_id)` | `GET /api/v1/trades/{id}` | Get trade history |
+| `get_stats(market_id)` | `GET /api/v1/stats/{id}` | Get market stats |
+| `get_platform_stats()` | `GET /api/v1/platform/stats` | Get platform stats |
+| `get_holders(market_id)` | `GET /api/v1/holders/{id}` | Get top holders |
+| `get_resolution(market_id)` | `GET /api/v1/resolution/{id}` | Get resolution status |
+| `get_quick_market(asset)` | `GET /api/v1/quick-markets/{asset}` | Get active quick market |
+| `get_quick_market_history(asset)` | `GET /api/v1/quick-markets/{asset}/history` | Get quick market history |
+| `get_quick_market_price(asset)` | `GET /api/v1/quick-markets/{asset}/price` | Get current asset price |
+| `get_quick_market_price_history(asset)` | `GET /api/v1/quick-markets/{asset}/price-history` | Get asset price history |
+| `get_failed_trades()` | `GET /api/v1/failed-trades` | Get failed trades |
+| `get_pending_trades()` | `GET /api/v1/pending-trades` | Get pending trades |
+| `get_failed_claims()` | `GET /api/v1/failed-claims` | Get failed claims |
+| `get_pending_claims()` | `GET /api/v1/pending-claims` | Get pending claims |
+| `get_settlement_status(tx_hash)` | `GET /api/v1/settlements/{hash}` | Get settlement status |
+
+### Authenticated Endpoints (Bearer Token)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `post_order(order)` | `POST /api/v1/orders` | Submit signed order |
+| `get_orders(trader)` | `GET /api/v1/orders` | Get user's open orders |
+| `get_order(hash)` | `GET /api/v1/orders/{hash}` | Get specific order |
+| `cancel_order(hash)` | `DELETE /api/v1/orders/{hash}` | Cancel order |
+| `get_positions(market_id)` | `GET /api/v1/positions/{market}` | Get positions for market |
+| `get_user_positions(addr)` | `GET /api/v1/users/{addr}/positions` | All user positions |
+| `get_user_orders(addr)` | `GET /api/v1/users/{addr}/orders` | All user orders |
+| `get_user_activity(addr)` | `GET /api/v1/users/{addr}/activity` | Trading activity |
+| `get_user_stats()` | `GET /api/v1/user-stats` | Authenticated user stats |
+
+### Relayer Endpoints (Gasless)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `approve_ctf_for_settlement()` | `POST /api/v1/relayer/ctf-approval` | Gasless CTF approval |
+| `claim_winnings(market_addr)` | `POST /api/v1/relayer/ctf-redemption` | Claim from single market |
+| `batch_claim_winnings(addrs)` | `POST /api/v1/relayer/batch-ctf-redemption` | Claim from multiple markets |
 
 ---
 
 ## Examples
 
-| File | Description |
-|---|---|
-| [`fetch_market_data.py`](examples/fetch_market_data.py) | Read orderbooks, prices, trades — no auth needed |
-| [`simple_trading_loop.py`](examples/simple_trading_loop.py) | Buy YES/NO based on price vs strike |
-| [`momentum_bot.py`](examples/momentum_bot.py) | Trade on short-term BTC momentum |
-| [`price_action_bot.py`](examples/price_action_bot.py) | Full production bot with Pyth oracle, auto-claiming |
-| [`market_maker.py`](examples/market_maker.py) | Two-sided quoting around mid price |
-| [`websocket_stream.py`](examples/websocket_stream.py) | Real-time orderbook & trade streaming |
-| [`basic_usage.py`](examples/basic_usage.py) | Walkthrough of public API endpoints |
+### Market Making Bot
+
+```python
+import asyncio
+from turbine_client import TurbineClient, TurbineWSClient, OrderArgs, Side, Outcome
+
+class SimpleMarketMaker:
+    def __init__(self, client: TurbineClient, market_id: str):
+        self.client = client
+        self.market_id = market_id
+        self.spread = 20000  # 2% spread
+
+    async def run(self):
+        ws = TurbineWSClient(host=self.client.host)
+
+        async with ws.connect() as stream:
+            await stream.subscribe(market_id=self.market_id)
+
+            async for msg in stream:
+                if msg.type == "orderbook":
+                    await self.update_quotes(msg.data)
+
+    async def update_quotes(self, orderbook):
+        # Cancel existing orders
+        self.client.cancel_market_orders(self.market_id)
+
+        # Calculate mid price
+        best_bid = orderbook.bids[0].price if orderbook.bids else 400000
+        best_ask = orderbook.asks[0].price if orderbook.asks else 600000
+        mid = (best_bid + best_ask) // 2
+
+        # Place new quotes
+        buy_order = self.client.create_order(OrderArgs(
+            market_id=self.market_id,
+            side=Side.BUY,
+            outcome=Outcome.YES,
+            price=mid - self.spread // 2,
+            size=1000000,
+            expiration=int(time.time()) + 300,
+        ))
+
+        sell_order = self.client.create_order(OrderArgs(
+            market_id=self.market_id,
+            side=Side.SELL,
+            outcome=Outcome.YES,
+            price=mid + self.spread // 2,
+            size=1000000,
+            expiration=int(time.time()) + 300,
+        ))
+
+        self.client.post_order(buy_order)
+        self.client.post_order(sell_order)
+```
+
+### Position Monitoring
+
+```python
+from turbine_client import TurbineClient
+
+client = TurbineClient(
+    host="https://api.turbinefi.com",
+    chain_id=137,
+    api_key_id="...",
+    api_private_key="..."
+)
+
+# Get all positions
+positions = client.get_user_positions(
+    address="0x...",
+    chain_id=137
+)
+
+for pos in positions:
+    market = client.get_market(pos.market_id)
+    print(f"\n{market.question}")
+    print(f"  YES: {pos.yes_shares / 1e6:.2f} shares")
+    print(f"  NO:  {pos.no_shares / 1e6:.2f} shares")
+    print(f"  Cost Basis: ${pos.invested / 1e6:.2f}")
+```
+
+---
+
+## Development
+
+### Setup
+
+```bash
+# Clone repo
+git clone https://github.com/ojo-network/turbine-py-client.git
+cd turbine-py-client
+
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate
+
+# Install dev dependencies
+pip install -e ".[dev]"
+```
+
+### Running Tests
+
+```bash
+pytest tests/
+```
+
+### Type Checking
+
+```bash
+mypy turbine_py_client/
+```
+
+### Linting
+
+```bash
+ruff check turbine_py_client/
+ruff format turbine_py_client/
+```
+
+---
+
+## Chain Configuration
+
+| Chain | Chain ID |
+|-------|----------|
+| Polygon Mainnet | 137 |
+| Avalanche Mainnet | 43114 |
+| Base Sepolia | 84532 |
 
 ---
 
@@ -268,127 +793,39 @@ allowance = client.get_usdc_allowance()
 from turbine_client.exceptions import (
     TurbineApiError,
     OrderValidationError,
+    SignatureError,
     AuthenticationError,
 )
 
 try:
-    client.buy(market_id, "yes", price=0.50, size=1.0)
+    client.post_order(signed_order)
 except OrderValidationError as e:
-    print(f"Bad order: {e}")
+    print(f"Invalid order: {e}")
 except AuthenticationError as e:
-    print(f"Auth issue: {e}")
+    print(f"Auth failed: {e}")
 except TurbineApiError as e:
     print(f"API error ({e.status_code}): {e.message}")
 ```
 
 ---
 
-## Architecture
+## Contributing
 
-```
-turbine_client/
-├── client.py              # TurbineClient — main entry point
-├── types.py               # Dataclasses: OrderArgs, Market, Position, etc.
-├── signer.py              # EIP-712 order signing
-├── auth.py                # Ed25519 bearer token generation
-├── config.py              # Chain configs (Polygon, Avalanche, Base Sepolia)
-├── constants.py           # Endpoints, chain IDs, scaling factors
-├── exceptions.py          # TurbineApiError, AuthenticationError, etc.
-├── order_builder/         # OrderBuilder + price/size helpers
-├── http/                  # HTTP client with auth
-└── ws/                    # WebSocket client for streaming
-```
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run tests and linting
+5. Submit a pull request
 
 ---
 
-## API Reference
+## License
 
-### Public Endpoints (no auth)
-
-| Method | Description |
-|---|---|
-| `get_markets()` | List all markets |
-| `get_market(id)` | Market stats |
-| `get_orderbook(id)` | Orderbook snapshot |
-| `get_trades(id)` | Trade history |
-| `get_quick_market(asset)` | Active 15-min market |
-| `get_quick_market_price(asset)` | Current oracle price |
-| `get_quick_market_history(asset)` | Historical quick markets |
-| `get_quick_market_price_history(asset)` | Historical prices |
-| `get_platform_stats()` | Platform-wide stats |
-| `get_holders(id)` | Top position holders |
-| `get_resolution(id)` | Market resolution status |
-| `get_failed_trades()` | Failed trades |
-| `get_pending_trades()` | Pending trades |
-| `get_settlement_status(tx)` | Settlement TX status |
-
-### Authenticated Endpoints
-
-| Method | Description |
-|---|---|
-| `buy(market_id, outcome, price, size)` | Create + sign + submit buy |
-| `sell(market_id, outcome, price, size)` | Create + sign + submit sell |
-| `create_limit_buy(...)` | Create signed buy order |
-| `create_limit_sell(...)` | Create signed sell order |
-| `post_order(signed_order)` | Submit signed order |
-| `get_orders(...)` | Query open orders |
-| `cancel_order(hash)` | Cancel an order |
-| `cancel_market_orders(id)` | Cancel all orders in market |
-| `get_positions(market_id)` | Positions for a market |
-| `get_user_positions(addr)` | All user positions |
-| `get_user_stats()` | User P&L stats |
-| `claim_winnings(addr)` | Gasless claim from resolved market |
-| `batch_claim_winnings(addrs)` | Batch gasless claim |
-| `approve_usdc_for_settlement()` | Gasless USDC max approval |
-| `approve_ctf_for_settlement()` | Gasless CTF approval |
-
----
-
-## Supported Chains
-
-| Chain | ID | Status |
-|---|---|---|
-| Polygon | 137 | ✅ Production |
-| Avalanche | 43114 | ✅ Production |
-| Base Sepolia | 84532 | 🧪 Testnet |
-
----
-
-## Development
-
-```bash
-git clone https://github.com/ojo-network/turbine-py-client.git
-cd turbine-py-client
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-pytest
-ruff check turbine_client/
-```
-
----
-
-## Claude Skill
-
-Generate a trading bot interactively with Claude Code:
-
-```bash
-curl -sSL turbinefi.com/claude | bash
-```
-
-Deploy to Railway (free $5 credit):
-
-```bash
-claude "/railway-deploy"
-```
+MIT License - see [LICENSE](LICENSE)
 
 ---
 
 ## Links
 
-- [Turbine App](https://beta.turbinefi.com)
-- [Documentation](https://docs.ojolabs.xyz)
+- [Turbine](https://turbine.markets)
 - [GitHub Issues](https://github.com/ojo-network/turbine-py-client/issues)
-
-## License
-
-MIT — see [LICENSE](LICENSE)
