@@ -560,17 +560,30 @@ class PriceActionBot:
         return quick_market.market_id, quick_market.end_time, quick_market.start_price
 
     async def cancel_all_orders(self) -> None:
-        """Cancel all active orders before switching markets."""
-        if not self.active_orders or not self.market_id:
+        """Cancel all open orders by querying the API."""
+        try:
+            open_orders = self.client.get_orders(
+                trader=self.client.address, status="open"
+            )
+        except Exception as e:
+            print(f"Failed to fetch open orders: {e}")
             return
 
-        print(f"Cancelling {len(self.active_orders)} orders...")
-        for order_hash in list(self.active_orders.keys()):
+        if not open_orders:
+            return
+
+        print(f"Cancelling {len(open_orders)} orders...")
+        for order in open_orders:
             try:
-                self.client.cancel_order(order_hash, market_id=self.market_id)
-                del self.active_orders[order_hash]
+                self.client.cancel_order(
+                    order.order_hash,
+                    market_id=order.market_id,
+                    side=Side(order.side),
+                )
             except TurbineApiError as e:
-                print(f"Failed to cancel order: {e}")
+                if "404" not in str(e):
+                    print(f"Failed to cancel order: {e}")
+        self.active_orders.clear()
 
     async def switch_to_new_market(self, new_market_id: str, start_price: int = 0) -> None:
         """Switch to a new market and ensure gasless USDC approval."""

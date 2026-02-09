@@ -138,6 +138,7 @@ TURBINE_API_PRIVATE_KEY={api_private_key}
 Present the user with these trading algorithm options for prediction markets:
 
 **Option 1: Price Action Trader (Recommended)**
+- Reference: `examples/price_action_bot.py`
 - Uses real-time BTC price from Pyth Network (same oracle Turbine uses)
 - Compares current price to the market's strike price
 - If BTC is above strike price → buy YES (bet it stays above)
@@ -146,65 +147,83 @@ Present the user with these trading algorithm options for prediction markets:
 - Best for: Beginners, following price momentum
 - Risk: Medium - follows current price action
 
-**Option 2: Simple Spread Market Maker**
-- Places bid and ask orders around the mid-price with a fixed spread
-- Best for: Learning the basics, stable markets
-- Risk: Medium - can accumulate inventory in trending markets
+**Option 2: Probability-Based Market Maker**
+- Reference: `examples/market_maker.py`
+- Dynamic pricing from Pyth BTC price vs strike with time decay
+- Multi-level bid/ask ladders on both YES and NO outcomes
+- Geometric size distribution concentrates liquidity at best prices
+- Spread tightens toward expiration (min 0.5%)
+- Best for: Providing liquidity, earning spread
+- Risk: Medium - manages both sides of the book
 
 **Option 3: Inventory-Aware Market Maker**
+- Reference: `examples/market_maker.py` (modify pricing to skew based on position)
 - Adjusts quotes based on current position to reduce inventory risk
 - Skews prices to encourage trades that reduce position
 - Best for: Balanced exposure, risk management
 - Risk: Lower - actively manages inventory
 
 **Option 4: Momentum-Following Trader**
+- Reference: `examples/price_action_bot.py` (modify signal logic)
 - Detects price direction from recent trades
 - Buys when momentum is up, sells when momentum is down
 - Best for: Trending markets, breakouts
 - Risk: Higher - can be wrong on reversals
 
 **Option 5: Mean Reversion Trader**
+- Reference: `examples/price_action_bot.py` (modify signal logic)
 - Fades large moves expecting price to revert
 - Buys after dips, sells after spikes
 - Best for: Range-bound markets, overreactions
 - Risk: Higher - can fight strong trends
 
 **Option 6: Probability-Weighted Trader**
+- Reference: `examples/price_action_bot.py` (modify signal logic)
 - Uses distance from 50% as a signal
 - Bets on extremes reverting toward uncertainty
 - Best for: Markets with overconfident pricing
 - Risk: Medium - based on market efficiency assumptions
 
-## Reference Implementation
+## Reference Implementations
 
-A complete, production-ready implementation exists for the **Price Action Trader**:
+There are two production-ready reference implementations. Choose based on the algorithm type:
 
-**`examples/price_action_bot.py`**
-- Signs a single gasless max USDC permit per settlement contract on first trade
-- All subsequent orders use the existing allowance (no per-order permit overhead)
-- Order sizing in USDC terms with position tracking
+### For Trading Bots (Options 1, 4, 5, 6): **`examples/price_action_bot.py`**
+- Directional trading: buys one side based on a signal
+- Position tracking and order verification
+- Pending order TX tracking to prevent double-ordering
+- Market expiration flag to stop trading 60s before expiry
+- Unclaimed winnings discovery from previous sessions
+
+### For Market Maker Bots (Options 2, 3): **`examples/market_maker.py`**
+- Two-sided quoting on both YES and NO outcomes
+- Multi-level geometric order distribution
+- Dynamic probability pricing from Pyth BTC price
+- Allocation-based budgeting (total USDC split across 4 sides x N levels)
+- Cancel-then-place order refresh to avoid self-trade issues
+- Timeout-based WS loop that doesn't block on quiet markets
 
 When generating a bot:
-1. **Read `examples/price_action_bot.py`** as the primary reference
-2. Copy the structure exactly, customizing only configuration parameters as needed
+1. **Read the appropriate reference file** based on the chosen algorithm type
+2. Copy the structure exactly, customizing only the strategy logic
 3. **DO NOT** use the simplified code snippets in this skill - they are incomplete
 
-For **other algorithm options**, use the same bot structure but replace the algorithm-specific methods:
+For **trading bots**, replace these methods from `price_action_bot.py`:
 - `calculate_signal()` - Replace with the chosen algorithm's signal logic
 - `execute_signal()` - Adapt order placement to match the algorithm
 - `price_action_loop()` - Rename and adapt the main loop for the algorithm
 
-The reference implementations include critical patterns that **MUST** be preserved in all bots:
-- Position syncing from API (`sync_position()`, `verify_position()`)
-- Pending order TX tracking (`pending_order_txs` set)
-- Trade verification (check failed_trades, pending_trades, recent trades)
-- Market transition detection with `market_expiring` flag
-- Unclaimed winnings discovery from previous sessions
-- Rate-limited claiming (15s delay between claims)
-- Async HTTP client for non-blocking external API calls
+For **market maker bots**, replace these methods from `market_maker.py`:
+- `calculate_target_prices_with_time()` - Replace with the chosen pricing model
+- `place_multi_level_quotes()` - Adapt quoting logic for the algorithm
+
+Critical patterns that **MUST** be preserved in all bots:
 - Gasless max permit approval when entering new markets (`ensure_settlement_approved()`)
 - USDC-based order sizing (`calculate_shares_from_usdc()`)
-- Position tracking in USDC terms (`position_usdc` dict)
+- Async HTTP client for non-blocking external API calls
+- Market transition handling and automatic winnings claiming
+- Order cancellation using API query with `side` parameter (not local tracking alone)
+- Rate-limited claiming (15s delay between claims)
 
 ## Step 5: Generate the Bot Code
 
@@ -590,27 +609,7 @@ When generating bots, use these implementations:
 
 **⚠️ IMPORTANT: Use the reference implementation at `examples/price_action_bot.py`**
 
-Read that file for the complete, production-ready implementation. The simplified snippet below is **incomplete** and missing critical patterns.
-
-**Key methods in the reference implementation:**
-
-- `get_current_btc_price()` - Fetches BTC price from Pyth Network (async, non-blocking)
-- `calculate_signal()` - Returns (action, confidence) based on price vs strike
-- `execute_signal()` - Places orders with proper verification flow
-- `price_action_loop()` - Main trading loop
-- `sync_position()` / `verify_position()` - Position management
-- `cleanup_pending_orders()` - Handles settling orders
-- `discover_unclaimed_markets()` - Finds winnings from previous sessions
-
-**The reference implementation handles (that the snippet below does NOT):**
-
-- Async HTTP client for non-blocking price fetches
-- Position verification after every order attempt
-- Pending order tracking to prevent double-ordering
-- Failed trade detection immediately after submission
-- Market expiration flag to stop trading 60s before expiry
-- Processed trade ID tracking to avoid double-counting fills
-- Rate-limited claiming with 15s delays
+Read that file for the complete, production-ready implementation. The simplified snippets in this skill are **incomplete** and missing critical patterns.
 
 **Algorithm summary:**
 
@@ -620,35 +619,28 @@ Read that file for the complete, production-ready implementation. The simplified
 - If BTC < strike by threshold → buy NO
 - Confidence scales with distance from strike (capped at 90%)
 
-### Simple Spread Market Maker
-```python
-SPREAD_BPS = 200  # 2% total spread (1% each side)
+### Probability-Based Market Maker
 
-def calculate_quotes(self, mid_price):
-    """Calculate bid/ask around mid price."""
-    half_spread = (mid_price * SPREAD_BPS) // 20000
-    bid = max(1, mid_price - half_spread)
-    ask = min(999999, mid_price + half_spread)
-    return bid, ask
-```
+**⚠️ IMPORTANT: Use the reference implementation at `examples/market_maker.py`**
+
+Read that file for the complete, production-ready implementation.
+
+**Algorithm summary:**
+
+- Fetches BTC price from Pyth Network, compares to strike price
+- YES target = 0.50 + (price_deviation% * sensitivity), with time decay
+- Quotes multi-level bid/ask ladders on both YES and NO outcomes
+- Geometric distribution (lambda=1.5) concentrates liquidity at best prices
+- Spread tightens toward expiration (min 0.5%)
+- Requotes only when target shifts >2% (rebalance threshold)
+- Cancel-then-place refresh avoids self-trade issues
+- Timeout-based WS recv loop prevents blocking on quiet markets
 
 ### Inventory-Aware Market Maker
-```python
-SPREAD_BPS = 200
-SKEW_FACTOR = 50  # BPS skew per share of inventory
 
-def calculate_quotes(self, mid_price):
-    """Skew quotes based on inventory."""
-    half_spread = (mid_price * SPREAD_BPS) // 20000
+**⚠️ IMPORTANT: Use `examples/market_maker.py` as the base, then modify pricing to skew based on position.**
 
-    # Skew to reduce inventory
-    inventory_shares = self.current_position / 1_000_000
-    skew = int(inventory_shares * SKEW_FACTOR)
-
-    bid = max(1, mid_price - half_spread - skew)
-    ask = min(999999, mid_price + half_spread - skew)
-    return bid, ask
-```
+Add position tracking and skew the target probability based on inventory to encourage trades that reduce exposure.
 
 ### Momentum Following
 ```python
