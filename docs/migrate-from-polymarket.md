@@ -9,14 +9,14 @@ Already running a Polymarket trading bot? Here's how to add Turbine markets in ~
 | Market type | Binary prediction | Binary prediction |
 | Orderbook | CLOB | CLOB |
 | BTC 15-min markets | ✅ (Oct 2025) | ✅ |
-| Gas costs | You pay gas | **Gasless** (Turbine covers it) |
+| Gas costs | Gasless (proxy wallet relayer) | Gasless (relayer) |
 | Chains | Polygon | Polygon + Avalanche |
 | Resolution | UMA Oracle | UMA Oracle |
 | API auth | HMAC + API key | EIP-712 + Ed25519 |
-| Claiming winnings | Manual tx | **Gasless auto-claim** |
+| Claiming winnings | Via proxy relayer | Gasless via relayer |
 | SDK | py-clob-client | turbine-py-client |
 
-**TL;DR:** Same market structure, no gas fees, faster onboarding.
+**TL;DR:** Same market structure, similar gasless execution, easy to run on both.
 
 ## Concept Mapping
 
@@ -145,7 +145,7 @@ client.post_order(order)
 
 ### 5. Gasless Claiming
 
-On Polymarket, you pay gas to redeem winning shares. On Turbine, it's free:
+Both platforms support gasless claiming. Here's how it works on Turbine:
 
 ```python
 # Claim winnings — no gas required
