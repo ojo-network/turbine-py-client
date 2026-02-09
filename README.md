@@ -30,6 +30,10 @@ bash scripts/deploy-railway.sh
 - A generated bot (run the Claude skill above first)
 - Railway CLI is installed automatically if not found
 
+## Coming from Polymarket?
+
+Check out our [migration guide](docs/migrate-from-polymarket.md) — concept mapping, code examples, and a multi-venue bot pattern.
+
 ## Overview
 
 This client provides a clean, typed interface for:
