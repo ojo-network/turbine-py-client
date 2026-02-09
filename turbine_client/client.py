@@ -2,7 +2,9 @@
 Main Turbine client for interacting with the CLOB API.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+import os
+import time as _time
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from turbine_client.auth import BearerTokenAuth, create_bearer_auth
 from turbine_client.config import get_chain_config
@@ -45,12 +47,32 @@ class TurbineClient:
     - Level 0 (Public): No authentication, read-only market data
     - Level 1 (Signing): Private key for order signing
     - Level 2 (Full): Private key + API credentials for all endpoints
+
+    Quick start::
+
+        # Easiest: load everything from environment variables
+        client = TurbineClient.from_env()
+
+        # Or with explicit credentials
+        client = TurbineClient(
+            private_key="0x...",
+            api_key_id="...",
+            api_private_key="...",
+        )
+
+        # Read-only (no credentials needed)
+        client = TurbineClient()
     """
+
+    # Default API host
+    DEFAULT_HOST = "https://api.turbinefi.com"
+    # Default chain (Polygon mainnet)
+    DEFAULT_CHAIN_ID = 137
 
     def __init__(
         self,
-        host: str,
-        chain_id: int,
+        host: Optional[str] = None,
+        chain_id: Optional[int] = None,
         private_key: Optional[str] = None,
         api_key_id: Optional[str] = None,
         api_private_key: Optional[str] = None,
@@ -59,16 +81,16 @@ class TurbineClient:
         """Initialize the Turbine client.
 
         Args:
-            host: The API host URL.
-            chain_id: The blockchain chain ID.
+            host: The API host URL. Defaults to https://api.turbinefi.com.
+            chain_id: The blockchain chain ID. Defaults to 137 (Polygon).
             private_key: Optional wallet private key for order signing.
             api_key_id: Optional API key ID for bearer token auth.
             api_private_key: Optional Ed25519 private key for bearer tokens.
             timeout: HTTP request timeout in seconds.
         """
-        self._host = host.rstrip("/")
-        self._chain_id = chain_id
-        self._chain_config = get_chain_config(chain_id)
+        self._host = (host or self.DEFAULT_HOST).rstrip("/")
+        self._chain_id = chain_id or self.DEFAULT_CHAIN_ID
+        self._chain_config = get_chain_config(self._chain_id)
 
         # Initialize signer if private key provided
         self._signer: Optional[Signer] = None
@@ -83,7 +105,7 @@ class TurbineClient:
             self._auth = create_bearer_auth(api_key_id, api_private_key)
 
         # Initialize HTTP client
-        self._http = HttpClient(host, auth=self._auth, timeout=timeout)
+        self._http = HttpClient(self._host, auth=self._auth, timeout=timeout)
 
         # Local permit nonce tracking for high-throughput scenarios
         # Key: (owner_address, contract_address), Value: next nonce to use
@@ -100,6 +122,100 @@ class TurbineClient:
     def __exit__(self, *args: Any) -> None:
         """Exit context manager."""
         self.close()
+
+    @classmethod
+    def from_env(
+        cls,
+        host: Optional[str] = None,
+        chain_id: Optional[int] = None,
+        dotenv: bool = True,
+        timeout: float = 30.0,
+    ) -> "TurbineClient":
+        """Create a client from environment variables.
+
+        Reads credentials from these env vars (or .env file):
+        - ``TURBINE_PRIVATE_KEY`` — wallet private key
+        - ``TURBINE_API_KEY_ID`` — API key identifier
+        - ``TURBINE_API_PRIVATE_KEY`` — Ed25519 API private key
+        - ``TURBINE_HOST`` — API host (optional)
+        - ``TURBINE_CHAIN_ID`` — chain ID (optional)
+
+        If API credentials are missing but a private key is present, the client
+        will automatically register for API credentials and print them.
+
+        Args:
+            host: Override the API host.
+            chain_id: Override the chain ID.
+            dotenv: Whether to load .env file. Defaults to True.
+            timeout: HTTP request timeout in seconds.
+
+        Returns:
+            A configured TurbineClient.
+
+        Example::
+
+            # Just set TURBINE_PRIVATE_KEY in .env and go
+            client = TurbineClient.from_env()
+            market = client.get_quick_market("BTC")
+        """
+        if dotenv:
+            try:
+                from dotenv import load_dotenv as _load_dotenv
+                _load_dotenv()
+            except ImportError:
+                pass  # dotenv is optional
+
+        private_key = os.environ.get("TURBINE_PRIVATE_KEY")
+        api_key_id = os.environ.get("TURBINE_API_KEY_ID")
+        api_private_key = os.environ.get("TURBINE_API_PRIVATE_KEY")
+        env_host = host or os.environ.get("TURBINE_HOST")
+        env_chain = chain_id or (
+            int(os.environ.get("TURBINE_CHAIN_ID"))
+            if os.environ.get("TURBINE_CHAIN_ID")
+            else None
+        )
+
+        # Auto-register if we have a private key but no API credentials
+        if private_key and not (api_key_id and api_private_key):
+            resolved_host = env_host or cls.DEFAULT_HOST
+            try:
+                print("No API credentials found. Auto-registering...")
+                creds = cls.request_api_credentials(
+                    host=resolved_host,
+                    private_key=private_key,
+                )
+                api_key_id = creds["api_key_id"]
+                api_private_key = creds["api_private_key"]
+                print(f"✓ API credentials created!")
+                print(f"  API Key ID:      {api_key_id}")
+                print(f"  API Private Key:  {api_private_key}")
+                print(f"\n  Save these to your .env file:")
+                print(f"  TURBINE_API_KEY_ID={api_key_id}")
+                print(f"  TURBINE_API_PRIVATE_KEY={api_private_key}")
+            except TurbineApiError as e:
+                if e.status_code == 409 and "Key ID:" in str(e):
+                    # Already registered — extract key ID from error
+                    import re
+                    match = re.search(r"Key ID: (\S+)", str(e))
+                    if match:
+                        api_key_id = match.group(1)
+                        print(
+                            f"⚠ API key already exists (ID: {api_key_id}). "
+                            f"Set TURBINE_API_KEY_ID and TURBINE_API_PRIVATE_KEY "
+                            f"in your .env file."
+                        )
+                else:
+                    print(f"⚠ Auto-registration failed: {e}")
+                    print("  You can still use the client for public endpoints and signing.")
+
+        return cls(
+            host=env_host,
+            chain_id=env_chain,
+            private_key=private_key,
+            api_key_id=api_key_id,
+            api_private_key=api_private_key,
+            timeout=timeout,
+        )
 
     @property
     def host(self) -> str:
@@ -134,7 +250,10 @@ class TurbineClient:
         """
         if not self._signer:
             raise AuthenticationError(
-                "Private key required for this operation",
+                "Private key required for this operation. "
+                "Pass private_key= to TurbineClient() or set TURBINE_PRIVATE_KEY "
+                "in your environment. Tip: use TurbineClient.from_env() to load "
+                "credentials automatically from .env",
                 required_level="signing",
             )
 
@@ -146,7 +265,10 @@ class TurbineClient:
         """
         if not self._auth:
             raise AuthenticationError(
-                "API credentials required for this operation",
+                "API credentials required for this operation. "
+                "Pass api_key_id= and api_private_key= to TurbineClient(), or set "
+                "TURBINE_API_KEY_ID and TURBINE_API_PRIVATE_KEY in your environment. "
+                "Tip: use TurbineClient.from_env() to auto-register and load credentials",
                 required_level="bearer token",
             )
 
@@ -507,6 +629,139 @@ class TurbineClient:
             expiration=expiration,
             settlement_address=settlement_address,
         )
+
+    # =========================================================================
+    # Convenience Methods (Create + Sign + Submit in one call)
+    # =========================================================================
+
+    def buy(
+        self,
+        market_id: str,
+        outcome: Union[Outcome, str],
+        price: Union[int, float],
+        size: Union[int, float],
+        expiration: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Buy shares in one call: creates, signs, and submits a limit buy order.
+
+        This is the simplest way to place a trade. It handles signing, settlement
+        address lookup, and submission automatically.
+
+        Args:
+            market_id: The market ID.
+            outcome: ``Outcome.YES``, ``Outcome.NO``, or the strings ``"yes"``/``"no"``.
+            price: Price as a scaled int (e.g. 500000 for 50%) **or** a float
+                   between 0 and 1 (e.g. 0.50 for 50%).
+            size: Size as a scaled int (e.g. 1_000_000 for 1 share) **or** a float
+                  number of shares (e.g. 1.0 for 1 share).
+            expiration: Unix timestamp. Defaults to 1 hour from now.
+
+        Returns:
+            The order submission response (contains ``orderHash``).
+
+        Example::
+
+            result = client.buy("0x...", "yes", price=0.50, size=1.0)
+            print(result["orderHash"])
+        """
+        self._require_signer()
+        self._require_auth()
+        outcome_val = self._parse_outcome(outcome)
+        price_int = self._parse_price(price)
+        size_int = self._parse_size(size)
+        signed = self.create_limit_buy(
+            market_id=market_id,
+            outcome=outcome_val,
+            price=price_int,
+            size=size_int,
+            expiration=expiration,
+        )
+        return self.post_order(signed)
+
+    def sell(
+        self,
+        market_id: str,
+        outcome: Union[Outcome, str],
+        price: Union[int, float],
+        size: Union[int, float],
+        expiration: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Sell shares in one call: creates, signs, and submits a limit sell order.
+
+        Args:
+            market_id: The market ID.
+            outcome: ``Outcome.YES``, ``Outcome.NO``, or the strings ``"yes"``/``"no"``.
+            price: Price as a scaled int (e.g. 500000 for 50%) **or** a float
+                   between 0 and 1 (e.g. 0.50 for 50%).
+            size: Size as a scaled int (e.g. 1_000_000 for 1 share) **or** a float
+                  number of shares (e.g. 1.0 for 1 share).
+            expiration: Unix timestamp. Defaults to 1 hour from now.
+
+        Returns:
+            The order submission response (contains ``orderHash``).
+
+        Example::
+
+            result = client.sell("0x...", "yes", price=0.60, size=1.0)
+        """
+        self._require_signer()
+        self._require_auth()
+        outcome_val = self._parse_outcome(outcome)
+        price_int = self._parse_price(price)
+        size_int = self._parse_size(size)
+        signed = self.create_limit_sell(
+            market_id=market_id,
+            outcome=outcome_val,
+            price=price_int,
+            size=size_int,
+            expiration=expiration,
+        )
+        return self.post_order(signed)
+
+    @staticmethod
+    def _parse_outcome(outcome: Union[Outcome, str]) -> Outcome:
+        """Parse an outcome from string or Outcome enum."""
+        if isinstance(outcome, Outcome):
+            return outcome
+        if isinstance(outcome, str):
+            lower = outcome.lower().strip()
+            if lower in ("yes", "y", "0"):
+                return Outcome.YES
+            if lower in ("no", "n", "1"):
+                return Outcome.NO
+            raise ValueError(
+                f"Invalid outcome '{outcome}'. Use Outcome.YES, Outcome.NO, 'yes', or 'no'."
+            )
+        raise TypeError(f"outcome must be Outcome enum or string, got {type(outcome)}")
+
+    @staticmethod
+    def _parse_price(price: Union[int, float]) -> int:
+        """Parse price: accepts scaled int (500000) or float (0.50)."""
+        if isinstance(price, float):
+            if 0 < price < 1:
+                # Treat as decimal probability → scale to int
+                return int(price * 1_000_000)
+            elif 1 <= price < 100:
+                # Likely a percentage like 50.0 → convert
+                return int(price * 10_000)
+            else:
+                raise ValueError(
+                    f"Float price {price} is ambiguous. Use a value between 0 and 1 "
+                    f"(e.g. 0.50 for 50%) or an int scaled by 1e6 (e.g. 500000)."
+                )
+        if isinstance(price, int):
+            return price
+        raise TypeError(f"price must be int or float, got {type(price)}")
+
+    @staticmethod
+    def _parse_size(size: Union[int, float]) -> int:
+        """Parse size: accepts scaled int (1000000) or float shares (1.0)."""
+        if isinstance(size, float):
+            # Treat as number of shares → scale to 6 decimals
+            return int(size * 1_000_000)
+        if isinstance(size, int):
+            return size
+        raise TypeError(f"size must be int or float, got {type(size)}")
 
     # =========================================================================
     # Authenticated Endpoints (Requires Bearer Token)

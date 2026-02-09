@@ -277,6 +277,7 @@ class MarketStats:
 
     market_id: str
     contract_address: str
+    settlement_address: str
     last_price: int
     total_volume: int
     volume_24h: int
@@ -287,6 +288,7 @@ class MarketStats:
         return cls(
             market_id=data.get("marketId", ""),
             contract_address=data.get("contractAddress", ""),
+            settlement_address=data.get("settlementAddress", ""),
             last_price=int(data.get("lastPrice", 0)),
             total_volume=int(data.get("totalVolume", 0)),
             volume_24h=int(data.get("volume24h", 0)),
