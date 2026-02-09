@@ -1,6 +1,6 @@
 ---
 name: railway-deploy
-description: Deploy a Turbine trading bot to Railway for 24/7 cloud operation. Use after creating a bot with /market-maker.
+description: Deploy a Turbine trading bot to Railway for 24/7 cloud operation. Use after creating a bot with /create-bot.
 disable-model-invocation: true
 argument-hint: "[bot-filename]"
 ---
@@ -36,12 +36,10 @@ Install it automatically. Try these in order:
 After installing, verify with `command -v railway && railway --version`. If installation fails, show the manual install options and STOP.
 
 **If .env is not found:**
-Tell the user to create their bot first:
+Tell the user to get set up first:
 ```
-No .env file found. Create your bot first:
-  curl -sSL turbinefi.com/claude | bash
-
-Or run: claude "/market-maker"
+No .env file found. Run /setup first to configure your environment,
+then /create-bot to generate a trading bot.
 ```
 STOP here.
 
