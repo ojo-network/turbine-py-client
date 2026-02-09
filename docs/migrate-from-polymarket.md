@@ -212,4 +212,4 @@ pip install turbine-py-client
 3. Adjust price/size formats
 4. Run your existing strategy on Turbine markets
 
-Questions? Open an issue on [GitHub](https://github.com/ojo-network/turbine-py-client/issues) or find us on [Moltbook](https://moltbook.com/u/Wozbot).
+Questions? Open an issue on [GitHub](https://github.com/ojo-network/turbine-py-client/issues).
