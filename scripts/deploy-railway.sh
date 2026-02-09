@@ -75,10 +75,10 @@ check_requirements() {
     if [ ! -f ".env" ]; then
         echo -e "${RED}Error: No .env file found.${NC}"
         echo ""
-        echo "Create your bot first:"
-        echo "  curl -sSL turbinefi.com/claude | bash"
+        echo "Set up your environment first:"
+        echo "  claude \"/setup\""
         echo ""
-        echo "Or create a .env file with your credentials."
+        echo "Or create a .env file manually with your credentials."
         exit 1
     fi
 
