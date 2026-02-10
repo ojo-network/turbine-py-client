@@ -44,10 +44,10 @@ Turbine's users fall into a 2x2 matrix (see CLAUDE.md for full details):
 Use `AskUserQuestion` with **two questions**:
 
 1. **"How comfortable are you with Python and the command line?"**
-   - Options: "Beginner — I'll need guidance" / "Comfortable — I've used Python before" / "Expert — just show me what to run"
+   - Options: "I'm new to Python" / "I've written some Python" / "I'm a developer"
 
 2. **"How familiar are you with prediction markets?"**
-   - Options: "Never heard of them" / "I get the concept but haven't traded" / "I've traded prediction markets before"
+   - Options: "I'm not sure how they work" / "I understand the basics" / "I've traded them before"
 
 **Adapt your behavior based on the answers:**
 
@@ -220,14 +220,14 @@ Once you have the private key, **create the file directly using the Write tool**
 TURBINE_PRIVATE_KEY=0x<their_key>
 TURBINE_API_KEY_ID=
 TURBINE_API_PRIVATE_KEY=
-CHAIN_ID=84532
+CHAIN_ID=137
 TURBINE_HOST=https://api.turbinefi.com
 ```
 
 **Explain the fields briefly:**
 - `TURBINE_PRIVATE_KEY` — Their wallet's signing key. Never leaves this machine.
 - `TURBINE_API_KEY_ID` / `TURBINE_API_PRIVATE_KEY` — Left blank intentionally. The bot auto-registers API credentials on first run and saves them back to this file.
-- `CHAIN_ID=84532` — Base Sepolia (testnet). Safe for learning. Switch to `137` (Polygon) for real trading later.
+- `CHAIN_ID=137` — Polygon mainnet. This is where Turbine's active markets are.
 - `TURBINE_HOST` — Turbine's API endpoint.
 
 ---
@@ -236,44 +236,35 @@ TURBINE_HOST=https://api.turbinefi.com
 
 **Skip if:** User says they already have USDC on their target chain.
 
-The bot needs USDC (a stablecoin pegged to $1) on whichever blockchain it trades on. No other tokens are needed — Turbine is fully gasless.
+The bot needs USDC (a stablecoin pegged to $1) on the Polygon network. No other tokens are needed — Turbine is fully gasless.
 
-> **For users new to prediction markets / crypto:** The concepts of "chains," "USDC," and "funding a wallet" are foreign. Explain before asking them to choose:
+**Turbine currently runs on Polygon mainnet.** The testnet (Base Sepolia) is not operational. This means users trade with real USDC — there is no free/fake-money option right now.
+
+> **For users new to prediction markets / crypto:** The concepts of "USDC" and "funding a wallet" are foreign. Explain clearly:
 > - "Your bot trades using **USDC**, which is a digital dollar — 1 USDC = $1 USD. It's the only currency you need."
-> - "Turbine runs on different **blockchains** (think of them as different networks). You pick which one your bot trades on."
-> - "The testnet option uses **fake money** — completely free, no risk. This is the right choice for learning. You can switch to real money later if you want to compete in the weekly contest."
->
-> **For non-PM users, strongly recommend Base Sepolia** and frame it as the obvious default. Don't present it as an equal choice with Polygon — a beginner shouldn't be spending real money until they understand what their bot is doing.
+> - "You'll need at least **$10 of USDC** on the Polygon network to start trading. The bot's default bet size is $0.10 per trade, so $10 goes a long way."
+> - "**No other cryptocurrency is needed** — no ETH, no MATIC. Turbine pays all the network fees for you."
 
-### Explain the chain options:
+### Getting USDC on Polygon
 
-Use `AskUserQuestion`:
-- **"Which chain do you want to trade on?"**
-- Options:
-  - "Base Sepolia — testnet, no real money (Recommended for learning)"
-  - "Polygon — real USDC, real trading, weekly competitions"
+The `.env` is already configured for Polygon (`CHAIN_ID=137`). The user needs USDC in their wallet.
 
-### If Base Sepolia (testnet):
+**If they already have crypto:**
+> "Send USDC to your wallet address on the Polygon network. If you have USDC on another chain, you can bridge it using a service like [Jumper](https://jumper.exchange)."
 
-> "Base Sepolia uses test USDC — no real money at risk. Great for learning how everything works before trading with real funds."
+**If they're new to crypto:**
+> "You'll need to buy USDC and send it to your wallet. The easiest path:"
+> 1. Create an account on an exchange like Coinbase
+> 2. Buy USDC (at least $10)
+> 3. Withdraw the USDC to your wallet address — make sure to select **Polygon** as the network
+> 4. Your wallet address is: `0x...` (show from the verification step or .env)
 
-Testnet USDC acquisition varies — the user may need to get test tokens from a faucet or from someone on the Turbine team. Guide them to check Turbine's Discord or docs for the current faucet flow.
-
-Update `.env` to set `CHAIN_ID=84532` (should already be the default).
-
-### If Polygon (mainnet):
-
-> "Polygon uses real USDC. You'll need at least ~$10 of USDC on the Polygon network. You can bridge USDC from other chains or withdraw from an exchange (Coinbase, Binance, etc.) that supports Polygon withdrawals."
-
-> **For non-PM users who chose Polygon:** This will be hard. They likely don't have USDC, don't know how to bridge, and may not have an exchange account. Be explicit about the steps: "You'll need to buy USDC on an exchange like Coinbase, then withdraw it to your wallet address on the Polygon network. If this sounds complicated, I'd recommend starting on Base Sepolia (testnet) first — it's free and you can switch to real trading anytime."
+> **For hackathon users:** If the hackathon organizer (Turbine team) is providing USDC, tell the user to share their wallet address with the organizer. This is the fastest path — avoids the exchange signup entirely.
 
 **USDC contract on Polygon:** `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359`
 
-Update `.env` to set `CHAIN_ID=137`:
-
-```
-CHAIN_ID=137
-```
+**Important:** Be upfront about the fact that this is real money. Don't sugarcoat it:
+> "This is real USDC — real money. The bot's default sizes are very small ($0.10 per trade, $1 maximum at risk), so you won't lose much while learning, but it's important to understand that real dollars are involved."
 
 Remind them: **No MATIC or other gas tokens needed.** Turbine's relayer pays all gas fees. They only need USDC.
 

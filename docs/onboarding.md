@@ -57,39 +57,34 @@ Create a `.env` file in the repo root:
 TURBINE_PRIVATE_KEY=0xYOUR_PRIVATE_KEY_HERE
 TURBINE_API_KEY_ID=
 TURBINE_API_PRIVATE_KEY=
-CHAIN_ID=84532
+CHAIN_ID=137
 TURBINE_HOST=https://api.turbinefi.com
 ```
 
 **What each field does:**
 - `TURBINE_PRIVATE_KEY` — Your wallet's signing key. Used locally to sign transactions.
 - `TURBINE_API_KEY_ID` / `TURBINE_API_PRIVATE_KEY` — Leave blank. The bot auto-registers API credentials on first run and fills these in.
-- `CHAIN_ID` — Which blockchain to trade on (see below).
+- `CHAIN_ID=137` — Polygon mainnet, where Turbine's active markets are.
 - `TURBINE_HOST` — Turbine's API endpoint.
 
-## 4. Choose a Chain
+## 4. Fund Your Wallet
 
-| Chain | ID | Type | Cost |
-|-------|-----|------|------|
-| **Base Sepolia** | 84532 | Testnet | Free (test USDC) |
-| **Polygon** | 137 | Mainnet | Real USDC (~$10 minimum) |
-| **Avalanche** | 43114 | Mainnet | Real USDC |
+Turbine currently runs on **Polygon mainnet**. Your wallet needs real USDC (minimum ~$10). **No gas tokens (ETH, MATIC) are needed** — Turbine is fully gasless.
 
-**Start with Base Sepolia** (already the default). It uses test USDC so there's no real money at risk. Switch to Polygon when you're ready for real trading and the weekly competition.
+The default bot sizes are small ($0.10 per trade), so $10 lasts a long time while you're learning.
 
-## 5. Fund Your Wallet
+**If you already have crypto:**
+- Send USDC to your wallet address on the Polygon network
+- Bridge from another chain using [Jumper](https://jumper.exchange) if needed
 
-Your wallet needs USDC on whichever chain you chose. **No gas tokens (ETH, MATIC, AVAX) are needed** — Turbine is fully gasless.
+**If you're new to crypto:**
+1. Create an account on an exchange like [Coinbase](https://coinbase.com)
+2. Buy USDC (at least $10)
+3. Withdraw to your wallet address — select **Polygon** as the network
 
-### Base Sepolia (testnet)
-Test USDC is free. Check Turbine's Discord or docs for the current faucet.
+**For hackathon participants:** Your hackathon organizer may provide USDC directly. Share your wallet address with them.
 
-### Polygon (mainnet)
-You need real USDC on the Polygon network. Options:
-- Withdraw USDC from an exchange (Coinbase, Binance) that supports Polygon withdrawals
-- Bridge USDC from another chain using a bridge like [Jumper](https://jumper.exchange)
-
-Minimum ~$10 to start trading. USDC contract on Polygon: `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359`
+USDC contract on Polygon: `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359`
 
 ## 6. Build a Bot
 

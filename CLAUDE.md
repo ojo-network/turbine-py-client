@@ -67,7 +67,7 @@ The typical user journey:
 1. Discover Turbine through a hackathon, competition, or word of mouth
 2. Clone this repo and set up a Python environment
 3. Create a crypto wallet (MetaMask), configure `.env` with their private key
-4. Fund the wallet with USDC (min ~$10 for Polygon mainnet, or free test USDC on Base Sepolia)
+4. Fund the wallet with USDC (~$10 minimum on Polygon mainnet)
 5. Use Claude Code (via the `/market-maker` skill) to generate a trading bot
 6. Run the bot — it trades automatically, switching to new markets every 15 minutes
 7. Compete in weekly PnL competitions or hackathon events
@@ -159,20 +159,19 @@ Then create a `.env` file (use the Write tool to create it for the user — don'
 TURBINE_PRIVATE_KEY=0x...
 TURBINE_API_KEY_ID=
 TURBINE_API_PRIVATE_KEY=
-CHAIN_ID=84532
+CHAIN_ID=137
 TURBINE_HOST=https://api.turbinefi.com
 ```
 
 The API credentials (`TURBINE_API_KEY_ID` and `TURBINE_API_PRIVATE_KEY`) don't need to be filled in manually. On first bot run, the SDK automatically registers API credentials by signing a message with the wallet, then saves them back to `.env`.
 
 ### 3. Funding
-The bot needs USDC on whichever chain it's trading on:
+Turbine currently runs on **Polygon mainnet**. The testnet (Base Sepolia) is not operational.
 
-- **Base Sepolia (84532):** Testnet — uses test USDC, no real money at risk. Good for learning.
-- **Polygon (137):** Recommended for real trading. Needs real USDC on Polygon (minimum ~$10). Bridge from other chains or withdraw from an exchange that supports Polygon. USDC contract: `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359`.
+- **Polygon (137):** The active chain. Needs real USDC on Polygon (minimum ~$10). Bridge from other chains or withdraw from an exchange that supports Polygon. USDC contract: `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359`.
 - **Avalanche (43114):** Alternative mainnet.
 
-No native gas tokens (MATIC, AVAX) are needed on any chain. Everything is gasless.
+No native gas tokens (MATIC, AVAX) are needed. Everything is gasless. Default bot sizes are small ($0.10 per trade) so $10 lasts a long time while learning.
 
 ### 4. Build a Bot
 The fastest path is the `/market-maker` skill — it walks the user through algorithm selection and generates a complete trading bot.
@@ -257,7 +256,7 @@ client.batch_claim_winnings(addrs)       # Claim from multiple markets at once
 ### Supported Chains
 | Chain | ID | Type | Notes |
 |-------|-----|------|-------|
-| Base Sepolia | 84532 | Testnet (default) | Safe for experimentation, test USDC |
+| Base Sepolia | 84532 | Testnet (not operational) | Currently non-functional |
 | Polygon | 137 | Mainnet | Recommended for real trading, real USDC |
 | Avalanche | 43114 | Mainnet | Alternative mainnet |
 

@@ -49,10 +49,10 @@ test -f user-context.md && echo "USER_CONTEXT_EXISTS" || echo "NO_USER_CONTEXT"
 **If it doesn't exist**, the user may have skipped `/setup` or set up manually. Ask directly using `AskUserQuestion` with **two questions**:
 
 1. **"How comfortable are you with Python?"**
-   - Options: "Beginner" / "Comfortable" / "Expert"
+   - Options: "I'm new to Python" / "I've written some Python" / "I'm a developer"
 
 2. **"How familiar are you with prediction markets?"**
-   - Options: "New to them" / "Understand the concept" / "Experienced trader"
+   - Options: "I'm not sure how they work" / "I understand the basics" / "I've traded them before"
 
 This matters because it changes how you explain things throughout the rest of this flow. A beginner needs the intro explained carefully. An expert wants to skip to algorithm selection.
 
@@ -249,23 +249,18 @@ After generating, walk the user through the key parameters they can tweak:
 
 **Universal parameters (all algorithms):**
 
-Check the user's chain from `user-context.md` or `.env` (`CHAIN_ID`) to determine defaults:
+**IMPORTANT — use exactly these defaults. Do not increase them:**
+- `--order-size` — **$0.10** (ten cents per trade)
+- `--max-position` — **$1.00** (one dollar maximum at risk per market)
 
-**Base Sepolia (testnet, chain 84532):**
-- `--order-size` — default: $1.00
-- `--max-position` — default: $10.00
-- It's fake money, so larger defaults are fine. The user gets to see more action and the bot behaves more realistically with meaningful amounts.
-- Tell them: "These are test dollars — not real money. I've set the sizes larger so you can see the bot actively trading."
+This is real USDC on Polygon mainnet. Keep defaults tiny. The user can always increase once they see the bot working and understand the risk.
 
-**Polygon or Avalanche (mainnet, chains 137/43114):**
-- `--order-size` — default: $0.10
-- `--max-position` — default: $1.00
-- Real money. Keep defaults tiny. The user can always increase once they see the bot working and understand the risk.
-- Tell them: "I've set these small on purpose — this is real USDC. Start by watching how your bot behaves, then increase the amounts once you're comfortable."
+Tell them: "I've set these small on purpose — this is real money. Your bot risks ten cents per trade. Start by watching how it behaves, then increase the amounts once you're comfortable."
 
 > **For users new to PMs:** Explain what these numbers mean in context:
-> - "**Order size** is how much you bet each time. Your bot spends this amount per trade. If the trade wins, you get back more. If it loses, you lose the order size."
-> - "**Max position** is the most your bot can have on the line at once. Even if the bot places many trades, it won't risk more than this amount total in any single market."
+> - "**Order size** is how much you bet each time — ten cents. If the trade wins, you get back more than that. If it loses, you lose the ten cents."
+> - "**Max position** is the most your bot can have on the line at once. Even if the bot places many trades, it won't risk more than $1 total in any single market."
+> - "With $10 in your wallet, you can run the bot for a long time at these sizes."
 
 **Algorithm-specific parameters:**
 - Spread bots: spread width (BPS)
