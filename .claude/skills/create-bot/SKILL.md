@@ -93,7 +93,14 @@ Explain clearly:
 > Each strategy is a separate Python file. You can create multiple bots with different strategies and compare how they perform.
 
 **Adapt the depth based on the user's profile:**
-- **New to PMs:** Give the full explanation above. Make sure they understand YES/NO shares, strike price, and the payout mechanic. Reference `docs/prediction-markets.md` if they want to go deeper.
+
+- **New to PMs:** Give the full explanation above, PLUS walk through a concrete example with real dollar amounts:
+  > "Here's a specific example: the market asks 'Will BTC be above $97,250 at 3:15 PM?' Your bot checks the live BTC price and sees it's at $97,400 — above the strike. So it buys a YES share at $0.65. If BTC stays above $97,250 by 3:15, the share pays out $1.00 — that's a $0.35 profit. If BTC drops below, the share is worth $0.00 and you lose the $0.65."
+  >
+  > "The **strategy** is the part that decides *when* to buy and *which side* to take. That's what we're about to pick."
+
+  **Do not proceed to strategy selection until they confirm they understand this.** A user who doesn't grasp the payout mechanic can't evaluate whether a strategy makes sense. If they seem uncertain, reference `docs/prediction-markets.md` for a fuller explanation.
+
 - **Knows PMs:** Keep it brief — "We're building a Python bot to trade Turbine's 15-min BTC binary markets. Let's pick a strategy."
 - **Expert:** Skip entirely if they already indicated what they want.
 
@@ -134,6 +141,15 @@ Each algorithm answers the same core question differently: *"Given the current m
 | 6 | **Probability-Weighted** | Bets that prices far from 50% will revert toward uncertainty. | Medium | Markets with overconfident pricing. |
 
 **Why Price Action is recommended for beginners:** It uses Pyth Network — the same oracle Turbine uses to resolve markets. The bot's trading signal is directly aligned with how winners are determined. It's the simplest to understand and the most intuitive to reason about.
+
+> **For users new to PMs:** The algorithm table above is meaningless without PM context. Don't just show the table — translate each strategy into plain English tied to what they now understand:
+> - **Price Action:** "Checks the live BTC price. If BTC is above the strike, buy YES. If below, buy NO. The simplest possible logic."
+> - **Momentum:** "Watches what other traders are doing. If lots of people are buying YES, follow the crowd."
+> - **Mean Reversion:** "If the price spikes in one direction, bet it comes back. Contrarian approach."
+>
+> For beginners, **strongly recommend Price Action** and don't overwhelm them with all 6 options. Say: "I'd recommend starting with Price Action — it's the most intuitive and directly aligned with how markets resolve. You can always create another bot with a different strategy later."
+
+> **For users new to technical concepts (low tech):** They can't evaluate algorithmic tradeoffs. Don't ask them to choose from a table of options they can't meaningfully compare. Instead, recommend Price Action directly and explain it in one sentence: "Your bot will check if Bitcoin is above or below the target price and trade accordingly." Only present the full table if they ask for options.
 
 **If the user has their own idea:** Listen to what they describe. Map it to the closest algorithm type above, or if it's truly novel, design a custom signal function that fits into the standard bot structure. The infrastructure stays the same — only the signal logic changes.
 
@@ -232,8 +248,24 @@ Tell the user where you saved it.
 After generating, walk the user through the key parameters they can tweak:
 
 **Universal parameters (all algorithms):**
-- `--order-size` — USDC per trade (default: $1). Start small.
-- `--max-position` — Maximum total USDC exposed (default: $10). Limits risk.
+
+Check the user's chain from `user-context.md` or `.env` (`CHAIN_ID`) to determine defaults:
+
+**Base Sepolia (testnet, chain 84532):**
+- `--order-size` — default: $1.00
+- `--max-position` — default: $10.00
+- It's fake money, so larger defaults are fine. The user gets to see more action and the bot behaves more realistically with meaningful amounts.
+- Tell them: "These are test dollars — not real money. I've set the sizes larger so you can see the bot actively trading."
+
+**Polygon or Avalanche (mainnet, chains 137/43114):**
+- `--order-size` — default: $0.10
+- `--max-position` — default: $1.00
+- Real money. Keep defaults tiny. The user can always increase once they see the bot working and understand the risk.
+- Tell them: "I've set these small on purpose — this is real USDC. Start by watching how your bot behaves, then increase the amounts once you're comfortable."
+
+> **For users new to PMs:** Explain what these numbers mean in context:
+> - "**Order size** is how much you bet each time. Your bot spends this amount per trade. If the trade wins, you get back more. If it loses, you lose the order size."
+> - "**Max position** is the most your bot can have on the line at once. Even if the bot places many trades, it won't risk more than this amount total in any single market."
 
 **Algorithm-specific parameters:**
 - Spread bots: spread width (BPS)
@@ -241,18 +273,32 @@ After generating, walk the user through the key parameters they can tweak:
 - Mean Reversion: reversion threshold, lookback trades
 - Probability-Weighted: edge threshold (distance from 50%)
 
-**Important: Remind them about risk.**
-> "Start with small sizes while you're testing. You can increase later once you see how the bot performs. If you're on Base Sepolia (testnet), there's no real money at risk."
+> **For non-technical users:** Don't present algorithm-specific parameters unless they ask. Use sensible defaults and move on. Say: "I've set the defaults to reasonable values. You can tweak them later once you see how the bot performs."
 
 ---
 
 ## Step 5: Run It
 
-Tell the user how to run their bot:
+Give the user the command to run their bot themselves. **Do NOT offer to run the bot for them** — the user should see the output live in their own terminal. This is the payoff moment.
 
 ```bash
+source .venv/bin/activate    # If not already active
 python <bot_filename>.py
 ```
+
+> **For non-technical users:** Running a Python file may not be obvious. Be explicit:
+> - "To run the bot, you'll need a separate terminal window from this one (this one is for Claude). Open a new terminal window, then navigate to the project folder:"
+>   ```
+>   cd [path to repo]
+>   source .venv/bin/activate
+>   python price_action_bot.py
+>   ```
+> - "Make sure you see `(.venv)` at the start of your prompt — that means the virtual environment is active."
+> - "You'll see text scrolling — that's your bot thinking and trading. Don't close this window or the bot stops."
+> - "To stop the bot, press `Ctrl+C` (hold Control and press C)."
+> - "You can come back to this Claude window anytime to ask questions about what's happening."
+>
+> If they're in an IDE with an integrated terminal, this is simpler: "Open a new terminal tab in your IDE (usually the + button next to the terminal) and run the command there."
 
 Explain what will happen on first run:
 1. **API credentials auto-register** — the bot signs a message with the wallet, gets API keys, and saves them to `.env`. This takes a few seconds on the very first run.
@@ -260,6 +306,8 @@ Explain what will happen on first run:
 3. **Trading begins** — the bot fetches the current BTC market, runs its algorithm, and places trades.
 4. **Market rotation** — every 15 minutes, the market rotates. The bot detects this automatically, cancels old orders, and switches to the new market.
 5. **Claiming** — when past markets resolve, the bot automatically claims any winnings via the gasless relayer.
+
+> **For non-technical users:** Also explain what the output means as it scrolls by: "The first few lines are setup — registering credentials and approving USDC. After that, you'll see lines about the current market, the BTC price, and what your bot decided to do. If you see 'BUY_YES' or 'BUY_NO', your bot is actively trading."
 
 > "You can leave it running — it handles everything. Press `Ctrl+C` to stop. The bot cancels all open orders on shutdown."
 

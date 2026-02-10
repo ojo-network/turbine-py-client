@@ -90,30 +90,40 @@ Add `user-context.md` to `.gitignore` if it's not already there — this file is
 
 ---
 
+## Step 0.5: Set the Stage
+
+After profiling, **don't immediately jump into running commands.** Have a brief conversational moment first. The user just answered 3 questions — acknowledge them and set expectations for what's coming.
+
+**For all users**, give a quick roadmap:
+
+> "Great — here's the plan. There are a few things we need to get set up: a Python environment, a wallet (for signing trades), and a connection to Turbine's API. I'll check what's already done and handle the rest. Should take just a few minutes."
+
+**Adapt the tone based on their profile:**
+
+- **Low tech + low PM:** Add warmth and reassurance: "Don't worry if any of this sounds unfamiliar — I'll explain each step as we go. You don't need to know crypto or Python internals to get this working."
+- **Low tech + high PM:** "You know the trading side — I'll handle the technical plumbing and explain what I'm doing along the way."
+- **High tech + low PM:** "The setup itself is straightforward. Once we're done, I'll make sure you understand what you're actually trading before we build anything."
+- **High tech + high PM:** Keep it short: "Let me check what's already set up." (They don't need a roadmap.)
+
+**For users new to PMs**, this is also a good moment for a one-line hook about what they're building toward:
+
+> "By the end of this, you'll have a bot that automatically trades Bitcoin prediction markets — betting on whether BTC goes up or down every 15 minutes."
+
+Then move to the environment check.
+
+---
+
 ## Step 1: Assess Current State
 
-Before doing anything, figure out where the user already is. Run these checks silently — don't ask the user, just detect:
+Check where the user already is. Run this as a **single command** (not separate calls — this avoids noisy parallel failures):
 
 ```bash
-# Python available?
-python3 --version 2>&1
-
-# In a virtual environment?
-echo "VIRTUAL_ENV: ${VIRTUAL_ENV:-not set}"
-
-# Can we import the SDK?
-python3 -c "import turbine_client; print('SDK importable')" 2>&1
-
-# Does .env exist with a private key?
-test -f .env && grep -q "TURBINE_PRIVATE_KEY=0x" .env && echo "PRIVATE_KEY_SET" || echo "NO_PRIVATE_KEY"
-
-# Are API credentials populated?
-test -f .env && grep -q "TURBINE_API_KEY_ID=." .env && echo "API_CREDS_SET" || echo "NO_API_CREDS"
+echo "=== Environment Check ===" && python3 --version 2>&1 && echo "VENV: ${VIRTUAL_ENV:-not_set}" && (python3 -c "import turbine_client; print('SDK: OK')" 2>/dev/null || echo "SDK: NOT_INSTALLED") && (test -f .env && grep -q "TURBINE_PRIVATE_KEY=0x" .env && echo "PRIVATE_KEY: SET" || echo "PRIVATE_KEY: NOT_SET") && (test -f .env && grep -q "TURBINE_API_KEY_ID=." .env && echo "API_CREDS: SET" || echo "API_CREDS: NOT_SET")
 ```
 
-Based on results, skip any steps that are already complete. Tell the user what you found:
+Based on results, skip any steps that are already complete. Summarize for the user in plain language — don't show them the raw output:
 
-> "Here's where you stand: [Python OK / venv active / SDK installed / .env missing]. Let me help you with the remaining steps."
+> "Here's where you stand: Python is ready, but you still need [X, Y, Z]. Let me take care of that."
 
 If **everything** is already set up, say so and suggest `/create-bot`:
 
@@ -133,13 +143,20 @@ python3 -m venv .venv && source .venv/bin/activate
 
 Explain briefly: *"A virtual environment keeps Turbine's dependencies separate from your system Python. This prevents version conflicts."*
 
+> **For non-technical users:** This step can be confusing. Explain clearly:
+> - "Think of a virtual environment like a separate workspace. It keeps this project's tools from interfering with anything else on your computer."
+> - "The `source .venv/bin/activate` command activates this workspace. You'll need to run it every time you open a new terminal window before running your bot. If you see `(.venv)` at the start of your terminal prompt, you're in the right workspace."
+> - Run the commands for them — don't ask them to type them.
+
 ### If SDK not installed:
 
 ```bash
 pip install -e .
 ```
 
-This installs the Turbine SDK and all its dependencies from the repo's `pyproject.toml`.
+This installs the Turbine SDK and all its dependencies from the repo's `pyproject.toml`. The install may take 30-60 seconds.
+
+> **For non-technical users:** If they see a wall of text scrolling by during install, reassure them: "That's normal — it's downloading and installing the libraries the bot needs. Just wait for it to finish."
 
 ### Verify:
 
@@ -160,6 +177,13 @@ If this fails, troubleshoot:
 
 The user needs an Ethereum-compatible private key. This is what the bot uses to sign transactions — it never leaves their machine.
 
+> **For users new to prediction markets / crypto:** This step is often the most confusing part of setup. They may not know what a wallet, private key, or Ethereum even is. Explain before asking:
+> - "To trade on Turbine, your bot needs a **wallet** — think of it like a bank account number. It has two parts: a **public address** (like an account number — safe to share) and a **private key** (like a password — never share this with anyone)."
+> - "Your bot uses the private key to sign its trades. This happens entirely on your computer — the key is never sent to Turbine or anywhere else."
+> - "We'll generate one for you right now in Python — it takes one second. You don't need to download anything or create any accounts."
+>
+> For non-PM users, **strongly recommend Option A** (generate in Python). MetaMask adds steps that aren't necessary and will feel like a detour into crypto-land.
+
 ### Ask first:
 
 Use `AskUserQuestion`:
@@ -173,16 +197,16 @@ Ask them to paste it. **Reassure them:**
 
 ### If they need to create one:
 
-Offer two options:
+> **For non-PM users:** Skip the MetaMask option and go straight to Python generation. Present it as the default: "Let me generate a wallet for you." Don't make them choose between two options they don't have context to evaluate.
 
-**Option A — Generate in Python (fastest):**
+**Option A — Generate in Python (fastest, recommended for new users):**
 ```bash
 python3 -c "from eth_account import Account; a = Account.create(); print(f'Address: {a.address}'); print(f'Private Key: {a.key.hex()}')"
 ```
 
 Tell them to **save the address** (they'll need it for funding) and that you'll put the private key in `.env` for them.
 
-**Option B — MetaMask (if they want a browser wallet):**
+**Option B — MetaMask (only offer if they ask, or for users who already know crypto):**
 1. Install MetaMask browser extension from metamask.io
 2. Create a new wallet (save the seed phrase somewhere safe)
 3. Export private key: Click account icon → Settings → Security & Privacy → Export Private Key
@@ -214,6 +238,13 @@ TURBINE_HOST=https://api.turbinefi.com
 
 The bot needs USDC (a stablecoin pegged to $1) on whichever blockchain it trades on. No other tokens are needed — Turbine is fully gasless.
 
+> **For users new to prediction markets / crypto:** The concepts of "chains," "USDC," and "funding a wallet" are foreign. Explain before asking them to choose:
+> - "Your bot trades using **USDC**, which is a digital dollar — 1 USDC = $1 USD. It's the only currency you need."
+> - "Turbine runs on different **blockchains** (think of them as different networks). You pick which one your bot trades on."
+> - "The testnet option uses **fake money** — completely free, no risk. This is the right choice for learning. You can switch to real money later if you want to compete in the weekly contest."
+>
+> **For non-PM users, strongly recommend Base Sepolia** and frame it as the obvious default. Don't present it as an equal choice with Polygon — a beginner shouldn't be spending real money until they understand what their bot is doing.
+
 ### Explain the chain options:
 
 Use `AskUserQuestion`:
@@ -233,6 +264,8 @@ Update `.env` to set `CHAIN_ID=84532` (should already be the default).
 ### If Polygon (mainnet):
 
 > "Polygon uses real USDC. You'll need at least ~$10 of USDC on the Polygon network. You can bridge USDC from other chains or withdraw from an exchange (Coinbase, Binance, etc.) that supports Polygon withdrawals."
+
+> **For non-PM users who chose Polygon:** This will be hard. They likely don't have USDC, don't know how to bridge, and may not have an exchange account. Be explicit about the steps: "You'll need to buy USDC on an exchange like Coinbase, then withdraw it to your wallet address on the Polygon network. If this sounds complicated, I'd recommend starting on Base Sepolia (testnet) first — it's free and you can switch to real trading anytime."
 
 **USDC contract on Polygon:** `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359`
 
@@ -294,6 +327,14 @@ Report results to the user clearly:
 - Whether the API is reachable
 - Whether there's an active BTC market (confirms everything works end-to-end)
 
+> **For non-technical users:** Don't just dump the output. Interpret it for them in plain language:
+> - "Your wallet address is `0x...` — this is like your account number on Turbine."
+> - "You're connected to Base Sepolia (the testnet), so no real money is involved."
+> - "I can see there's an active BTC market right now with a strike price of $X — that means your bot will be betting on whether Bitcoin goes above or below that price."
+> - "Everything is working. You're ready to create your first bot."
+
+> **For users new to PMs:** This is a good moment to connect the dots. They've been doing technical setup and may have lost the thread of *what* they're building. Briefly remind them: "Your setup is connected to a live prediction market right now — it's asking whether BTC will be above $X in the next 15 minutes. When we build your bot next, it'll trade on markets exactly like this one."
+
 **Update `user-context.md`** with the wallet address and chain from the verification output. This keeps the user context file current for other skills.
 
 ---
@@ -317,9 +358,34 @@ Everything is set up. Tell the user what they've accomplished and what's next:
 > - Check `docs/prediction-markets.md` to understand how Turbine's markets work
 > - Browse `examples/README.md` for a guide to all example files
 
+**For users new to PMs:** Before handing off to `/create-bot`, make sure they have enough context to make a meaningful choice about strategy. If they said "Never heard of them" in profiling, add:
+
+> "Before we build your bot, it's worth understanding what you're trading. Here's the short version: every 15 minutes, there's a new question — 'Will Bitcoin be above $X?' You can buy YES or NO shares. If you're right, each share pays $1. If you're wrong, you lose what you paid. Your bot automates this decision. If you want a deeper explanation, check out `docs/prediction-markets.md` — or I can walk you through it right now."
+
+This bridges the gap between setup (technical) and create-bot (requires understanding the domain).
+
+### Where to go next — terminal vs IDE
+
+**If the user is comfortable with an IDE** (technical users), suggest moving to their editor:
+
+> "Your repo is all set up. If you use VSCode, Cursor, or another IDE, I'd recommend opening this folder there — you get syntax highlighting, a built-in terminal, and Claude Code works the same way."
+>
+> "To pick up where we left off, open your IDE's integrated terminal and run:"
+> ```
+> claude "/create-bot"
+> ```
+> "That'll start Claude Code and jump straight into bot creation."
+
+**If the user prefers to stay in terminal** (or is non-technical), explain the two-terminal workflow they'll need when it's time to run the bot:
+
+> "One thing to know: when you run your bot later, it takes over the terminal window — so you won't be able to talk to Claude and run the bot in the same window. The easy fix is to open a **second terminal window** when it's time to run the bot. One window stays for Claude, the other runs your bot."
+
+Don't suggest this for non-technical users upfront — wait until they get to the "run it" step. Just keep them in the current terminal for now.
+
 Use `AskUserQuestion`:
 - **"Want to create your first trading bot now?"**
 - Options: "Yes, let's build a bot" / "No, I want to explore first"
 
-If yes: Tell them to run `/create-bot`.
+If yes and staying in this terminal: Tell them to run `/create-bot`.
+If yes and switching to IDE: Give them the command to copy: `claude "/create-bot"`
 If no: Wish them well and remind them `/create-bot` is there when they're ready.
