@@ -16,8 +16,6 @@ Every 15 minutes, Turbine opens a new market asking "Will BTC be above $X at [ti
 
 The creative core is the **signal function** — that's where the user's trading idea lives. Everything else is plumbing that follows a standard pattern.
 
-**This skill replaces the old `/market-maker` skill.** If a user mentions `/market-maker`, they mean this.
-
 ### Key URLs
 
 Reference these when explaining algorithms, linking users to docs, or looking up details:
