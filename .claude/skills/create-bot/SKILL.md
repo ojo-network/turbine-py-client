@@ -131,14 +131,14 @@ Options:
 
 Each algorithm answers the same core question differently: *"Given the current market, should I buy YES, buy NO, or hold?"*
 
-| # | Algorithm | How It Decides | Risk | Best For |
-|---|-----------|---------------|------|----------|
-| 1 | **Price Action** (recommended) | Compares live BTC price (Pyth) to strike price. Above strike → YES, below → NO. | Medium | Beginners. Signal aligns with how markets resolve. |
-| 2 | **Simple Spread** | Places bid + ask around mid-price with fixed spread. Profits from the spread. | Medium | Learning market making basics. |
-| 3 | **Inventory-Aware** | Like Simple Spread, but skews quotes to reduce accumulated position. | Lower | Balanced exposure, less directional risk. |
-| 4 | **Momentum** | Detects which direction recent trades are flowing. Follows the trend. | Higher | Trending markets, breakouts. |
-| 5 | **Mean Reversion** | Fades large moves — buys after dips, sells after spikes. Bets on reversion. | Higher | Range-bound markets, overreactions. |
-| 6 | **Probability-Weighted** | Bets that prices far from 50% will revert toward uncertainty. | Medium | Markets with overconfident pricing. |
+| # | Algorithm | How It Decides | Risk | Best For | Reference File |
+|---|-----------|---------------|------|----------|----------------|
+| 1 | **Price Action** (recommended) | Compares live BTC price (Pyth) to strike price. Above strike → YES, below → NO. | Medium | Beginners. Signal aligns with how markets resolve. | `price_action_bot.py` |
+| 2 | **Simple Spread** | Places bid + ask around mid-price with fixed spread. Profits from the spread. | Medium | Learning market making basics. | `market_maker.py` |
+| 3 | **Inventory-Aware** | Like Simple Spread, but skews quotes to reduce accumulated position. | Lower | Balanced exposure, less directional risk. | `market_maker.py` (modified) |
+| 4 | **Momentum** | Detects which direction recent trades are flowing. Follows the trend. | Higher | Trending markets, breakouts. | `price_action_bot.py` (modified) |
+| 5 | **Mean Reversion** | Fades large moves — buys after dips, sells after spikes. Bets on reversion. | Higher | Range-bound markets, overreactions. | `price_action_bot.py` (modified) |
+| 6 | **Probability-Weighted** | Bets that prices far from 50% will revert toward uncertainty. | Medium | Markets with overconfident pricing. | `price_action_bot.py` (modified) |
 
 **Why Price Action is recommended for beginners:** It uses Pyth Network — the same oracle Turbine uses to resolve markets. The bot's trading signal is directly aligned with how winners are determined. It's the simplest to understand and the most intuitive to reason about.
 
@@ -159,17 +159,27 @@ Use `AskUserQuestion` to confirm their choice.
 
 ## Step 3: Generate the Bot
 
-### Reference implementation
+### Reference implementations
 
-**Read `examples/price_action_bot.py` first.** This is the canonical reference — a complete, production-ready bot (~787 lines) that handles the entire lifecycle. Every generated bot should follow its structure.
+There are **two** reference implementations to use depending on the algorithm type:
 
-**CRITICAL: Do not use inline code snippets from this skill as the basis for generated code.** Always read the actual reference file. It contains tested patterns for:
+**`examples/price_action_bot.py`** — For directional trading strategies (algorithms 1, 4, 5, 6)
+- Price Action, Momentum, Mean Reversion, Probability-Weighted
+- Complete, production-ready bot (~787 lines) that handles the entire lifecycle
+- Single-sided orders (BUY_YES, BUY_NO, or HOLD based on a signal)
+
+**`examples/market_maker.py`** — For market making strategies (algorithms 2, 3)
+- Simple Spread, Inventory-Aware
+- Dual-sided orderbook management (places both bids and asks)
+- Real-time orderbook updates via WebSocket
+- Periodic quote refreshing
+
+**CRITICAL: Do not use inline code snippets from this skill as the basis for generated code.** Always read the actual reference file. Both contain tested patterns for:
 - Credential loading and auto-registration
 - Gasless USDC approval (one-time max permit per settlement)
 - Order creation, submission, and verification
-- Position tracking in USDC terms
-- Market transition detection and handling
-- Background claiming of winnings from resolved markets
+- Market transition detection and handling (price_action_bot only)
+- Background claiming of winnings from resolved markets (price_action_bot only)
 - Clean shutdown on Ctrl+C
 
 ### What changes between strategies
@@ -188,7 +198,17 @@ Everything else — credentials, market management, USDC approval, order executi
 **For Price Action (algorithm 1):**
 The reference implementation IS a Price Action bot. Copy it and let the user customize parameters (order size, max position, confidence thresholds).
 
-**For all other algorithms (2-6):**
+**For Simple Spread and Inventory-Aware (algorithms 2-3):**
+Use `examples/market_maker.py` as the base:
+1. Read `examples/market_maker.py` for the full market making infrastructure
+2. For Simple Spread (2): Copy the reference as-is, let user customize spread_bps and order_size
+3. For Inventory-Aware (3): Copy the reference, then add:
+   - Position tracking (query `get_user_positions()` periodically)
+   - Skew logic in `calculate_quotes()` that adjusts bid/ask based on inventory
+   - Parameter for skew sensitivity (e.g., `inventory_skew_bps`)
+
+**For directional strategies (algorithms 4-6):**
+Use `examples/price_action_bot.py` as the base:
 1. Read `examples/price_action_bot.py` for the full infrastructure
 2. Keep ALL infrastructure code identical
 3. Replace `calculate_signal()` with the new algorithm's logic
@@ -198,18 +218,23 @@ The reference implementation IS a Price Action bot. Copy it and let the user cus
 
 ### Signal logic for each algorithm
 
-When generating non-Price-Action bots, here's the core signal logic to implement. **These are conceptual — adapt them to fit the reference implementation's structure (Signal dataclass, confidence scores, etc.).**
+When generating bots, here's the core logic to implement. **These are conceptual — adapt them to fit the reference implementation's structure.**
 
-**Simple Spread (2):**
+**Simple Spread (2) — Based on `market_maker.py`:**
 - Get orderbook mid-price: `(best_bid + best_ask) / 2`
 - Place a BUY order at `mid - half_spread` and a SELL order at `mid + half_spread`
 - Spread parameter: configurable BPS (default 200 = 2%)
 - Requires placing TWO orders per cycle (both sides)
+- Uses WebSocket for real-time orderbook updates
+- Periodically cancels and replaces quotes (default: every 30 seconds)
 
-**Inventory-Aware (3):**
+**Inventory-Aware (3) — Based on `market_maker.py` with modifications:**
 - Same as Simple Spread, but skew the quotes based on current position
-- If holding YES shares → lower the bid more (discourage more buying, encourage selling)
+- Query `client.get_user_positions(address)` to track inventory
+- If holding YES shares → widen the bid, tighten the ask (discourage more buying, encourage selling)
+- If holding NO shares → tighten the bid, widen the ask
 - Skew factor: `position_shares * skew_bps` adjustment to both bid and ask
+- Requires adding position tracking logic to the market maker base
 
 **Momentum (4):**
 - Track the last N trades from `client.get_trades(market_id)`
@@ -332,7 +357,9 @@ After the bot is running, suggest next steps based on the user's goals (from `us
 
 ## Critical Infrastructure Patterns
 
-**DO NOT modify these when generating bots.** They exist in the reference implementation for a reason and must be preserved exactly:
+**DO NOT modify these when generating bots.** They exist in the reference implementations for a reason and must be preserved exactly:
+
+### For directional trading bots (price_action_bot.py - algorithms 1, 4, 5, 6):
 
 1. **Order verification chain:** After `post_order()`, sleep 2 seconds, then check failed trades → pending trades → recent trades → open orders. This sequence ensures the bot knows the true state of its order. Skipping steps causes phantom orders or missed fills.
 
@@ -346,4 +373,17 @@ After the bot is running, suggest next steps based on the user's goals (from `us
 
 6. **Pending order tracking:** Track TX hashes of submitted orders. Don't place new orders while any are still pending settlement. Clean up pending orders by checking the API.
 
-These patterns are battle-tested in the reference implementation. When in doubt, copy exactly.
+### For market making bots (market_maker.py - algorithms 2, 3):
+
+**NOTE:** The current `market_maker.py` reference is a simplified example that does NOT include automatic market transitions, claiming, or position tracking. When generating market making bots:
+
+- **If using as-is:** The bot will continue quoting on a single market. Users must manually restart when markets rotate (every 15 minutes). This is acceptable for learning/testing.
+
+- **For production use:** Consider enhancing with patterns from `price_action_bot.py`:
+  - Add market transition detection (poll for new markets)
+  - Add background claiming task
+  - For Inventory-Aware: Add position tracking via `get_user_positions()`
+
+Mention this limitation to the user and offer to add these enhancements if they plan to run the bot continuously.
+
+These patterns are battle-tested in the reference implementations. When in doubt, copy exactly.
