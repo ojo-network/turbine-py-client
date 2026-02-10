@@ -60,7 +60,7 @@ if [ -d "$INSTALL_DIR" ]; then
     fi
 else
     echo "Cloning turbine-py-client..."
-    git clone --quiet https://github.com/ojo-network/turbine-py-client.git "$INSTALL_DIR"
+    git clone --quiet -b pr1-docs-and-skills https://github.com/spartypkp/turbine-py-client.git "$INSTALL_DIR"
 fi
 
 echo -e "${GREEN}Repository ready at ${INSTALL_DIR}/${NC}"
