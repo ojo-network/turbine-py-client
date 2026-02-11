@@ -1,7 +1,7 @@
 ---
 name: railway-deploy
 description: Deploy a Turbine trading bot to Railway for 24/7 cloud operation. Use after creating a bot with /create-bot.
-disable-model-invocation: true
+disable-model-invocation: false
 argument-hint: "[bot-filename]"
 ---
 
