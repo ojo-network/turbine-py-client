@@ -1593,8 +1593,10 @@ class TurbineClient:
             AuthenticationError: If no auth is configured.
         """
         self._require_auth()
+        self._require_signer()
         data = {
             "chainId": self._chain_id,
+            "owner": self._signer.address,
             "redemptions": redemptions,
         }
         return self._http.post(
