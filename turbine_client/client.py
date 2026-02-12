@@ -89,6 +89,10 @@ class TurbineClient:
         # Key: (owner_address, contract_address), Value: next nonce to use
         self._permit_nonces: Dict[Tuple[str, str], int] = {}
 
+        # Cached Web3 instance (lazy-initialized)
+        self._w3 = None
+        self._w3_rpc_url: Optional[str] = None
+
     def close(self) -> None:
         """Close the client and release resources."""
         self._http.close()
@@ -149,6 +153,128 @@ class TurbineClient:
                 "API credentials required for this operation",
                 required_level="bearer token",
             )
+
+    # =========================================================================
+    # Internal Helpers
+    # =========================================================================
+
+    # RPC URLs per chain (single source of truth)
+    _RPC_URLS = {
+        137: "https://polygon-bor-rpc.publicnode.com",
+        43114: "https://avalanche-c-chain-rpc.publicnode.com",
+        84532: "https://base-sepolia-rpc.publicnode.com",
+    }
+
+    # Multicall3 address (same on all EVM chains)
+    _MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
+
+    def _get_web3(self):
+        """Get or create a cached Web3 instance for the current chain."""
+        from web3 import Web3
+
+        rpc_url = self._RPC_URLS.get(self._chain_id)
+        if not rpc_url:
+            raise ValueError(f"No RPC URL for chain {self._chain_id}")
+
+        if self._w3 is None or self._w3_rpc_url != rpc_url:
+            self._w3 = Web3(Web3.HTTPProvider(rpc_url))
+            self._w3_rpc_url = rpc_url
+
+        return self._w3
+
+    def _multicall_read(self, calls: list) -> list:
+        """Execute multiple eth_call reads in a single RPC call via Multicall3.
+
+        Args:
+            calls: List of (to_address, calldata_hex) tuples.
+
+        Returns:
+            List of raw bytes results (one per call).
+        """
+        w3 = self._get_web3()
+
+        # Encode aggregate3 call: aggregate3((address target, bool allowFailure, bytes callData)[])
+        # We use tryAggregate(false, calls) which is simpler to encode
+        # tryAggregate(bool requireSuccess, (address target, bytes callData)[] calls)
+        # selector: 0xbce38bd7
+        from eth_abi import encode, decode
+
+        encoded_calls = [(addr, data if isinstance(data, bytes) else bytes.fromhex(data.replace("0x", "")))
+                         for addr, data in calls]
+
+        calldata = bytes.fromhex("bce38bd7") + encode(
+            ["bool", "(address,bytes)[]"],
+            [False, encoded_calls]
+        )
+
+        result = w3.eth.call({
+            "to": self._MULTICALL3,
+            "data": "0x" + calldata.hex(),
+        })
+
+        # Decode: (bool success, bytes returnData)[]
+        decoded = decode(["(bool,bytes)[]"], result)[0]
+        return [d[1] for d in decoded]  # Return just the returnData bytes
+
+    def _get_market_claim_data(self, market_address: str, owner: str):
+        """Fetch all data needed to claim from a market in a single Multicall3 call.
+
+        Returns dict with: ctf_address, collateral_token, condition_id,
+        yes_token_id, no_token_id, resolved, winning_outcome, balance
+        or None if market is not claimable.
+        """
+        from web3 import Web3
+
+        market_address = Web3.to_checksum_address(market_address)
+
+        # First batch: get market static data + resolution status
+        calls = [
+            (market_address, "0x22a9339f"),      # ctf()
+            (market_address, "0xb2016bd4"),      # collateralToken()
+            (market_address, "0x2ddc7de7"),      # conditionId()
+            (market_address, "0x76cd28a2"),      # yesTokenId()
+            (market_address, "0x8c2557a8"),      # noTokenId()
+            (market_address, "0x13b63fce"),      # getResolutionStatus()
+        ]
+
+        results = self._multicall_read(calls)
+
+        ctf_address = Web3.to_checksum_address("0x" + results[0][12:32].hex())
+        collateral_token = Web3.to_checksum_address("0x" + results[1][12:32].hex())
+        condition_id = "0x" + results[2].hex()
+        yes_token_id = int(results[3].hex(), 16)
+        no_token_id = int(results[4].hex(), 16)
+
+        res_data = results[5]
+        resolved = bool(res_data[63])
+        winning_outcome = int(res_data[96:128].hex(), 16)
+
+        if not resolved:
+            return None
+
+        # Second call: check balance of winning token
+        winning_token_id = yes_token_id if winning_outcome == 0 else no_token_id
+        balance_calldata = "0x00fdd58e" + owner[2:].lower().zfill(64) + hex(winning_token_id)[2:].zfill(64)
+
+        balance_results = self._multicall_read([
+            (ctf_address, balance_calldata),
+        ])
+        balance = int(balance_results[0].hex(), 16)
+
+        if balance == 0:
+            return None
+
+        return {
+            "market_address": market_address,
+            "ctf_address": ctf_address,
+            "collateral_token": collateral_token,
+            "condition_id": condition_id,
+            "yes_token_id": yes_token_id,
+            "no_token_id": no_token_id,
+            "resolved": resolved,
+            "winning_outcome": winning_outcome,
+            "balance": balance,
+        }
 
     # =========================================================================
     # Public Endpoints (No Auth Required)
@@ -1036,21 +1162,8 @@ class TurbineClient:
 
     def _get_contract_nonce(self, owner: str, contract_address: str) -> int:
         """Get the current nonce for an owner from a contract's nonces() function."""
-        from web3 import Web3
-
-        # Get RPC URL based on chain
-        rpc_urls = {
-            137: "https://polygon-rpc.com",
-            43114: "https://api.avax.network/ext/bc/C/rpc",
-            84532: "https://sepolia.base.org",
-        }
-        rpc_url = rpc_urls.get(self._chain_id)
-        if not rpc_url:
-            print(f"Warning: No RPC URL for chain {self._chain_id}, using nonce 0")
-            return 0
-
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc_url))
+            w3 = self._get_web3()
             # nonces(address) -> uint256
             nonce_data = w3.eth.call({
                 "to": contract_address,
@@ -1368,144 +1481,15 @@ class TurbineClient:
             data["marketAddress"] = market_address
         return self._http.post(ENDPOINTS["ctf_redemption"], data=data, authenticated=True)
 
-    def claim_winnings(
-        self,
-        market_contract_address: str,
-    ) -> Dict[str, Any]:
-        """Claim winnings from a resolved market using gasless permit.
-
-        This queries the market contract for resolution status and condition data,
-        signs an EIP-712 permit, and submits to the relayer for gasless execution.
-
-        Args:
-            market_contract_address: The market's contract address.
-
-        Returns:
-            The relayer response with tx_hash on success.
-
-        Raises:
-            ValueError: If market is not resolved or user has no winnings.
-            AuthenticationError: If no signer is configured.
-        """
-        self._require_signer()
-        self._require_auth()
-
+    def _sign_redemption_permit(self, data: dict, ctf_address: str, nonce: int) -> dict:
+        """Sign an EIP-712 RedeemPositions permit and return v, r, s."""
         import time
         from eth_account import Account
-        from web3 import Web3
 
         owner = self._signer.address
-
-        # Get RPC URL
-        rpc_urls = {
-            137: "https://polygon-bor-rpc.publicnode.com",
-            43114: "https://avalanche-c-chain-rpc.publicnode.com",
-            84532: "https://base-sepolia-rpc.publicnode.com",
-        }
-        rpc_url = rpc_urls.get(self._chain_id)
-        if not rpc_url:
-            raise ValueError(f"No RPC URL for chain {self._chain_id}")
-
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-        print(f"Connected to RPC: {rpc_url}")
-
-        # Ensure address is checksummed
-        market_contract_address = Web3.to_checksum_address(market_contract_address)
-        print(f"Market address: {market_contract_address}")
-
-        # Query individual getters from market contract
-        # ctf() -> address
-        print("Querying ctf()...")
-        ctf_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": "0x22a9339f",  # ctf()
-        })
-        ctf_address = Web3.to_checksum_address("0x" + ctf_data[12:32].hex())
-        print(f"CTF address: {ctf_address}")
-
-        # collateralToken() -> address
-        collateral_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": "0xb2016bd4",  # collateralToken()
-        })
-        collateral_token = Web3.to_checksum_address("0x" + collateral_data[12:32].hex())
-
-        # conditionId() -> bytes32
-        condition_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": "0x2ddc7de7",  # conditionId()
-        })
-        condition_id = "0x" + condition_data.hex()
-
-        # yesTokenId() -> uint256
-        yes_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": "0x76cd28a2",  # yesTokenId()
-        })
-        yes_token_id = int(yes_data.hex(), 16)
-
-        # noTokenId() -> uint256
-        no_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": "0x8c2557a8",  # noTokenId()
-        })
-        no_token_id = int(no_data.hex(), 16)
-
-        print(f"Market data:")
-        print(f"  CTF: {ctf_address}")
-        print(f"  Collateral: {collateral_token}")
-        print(f"  Condition ID: {condition_id}")
-
-        # Query getResolutionStatus() from market contract
-        # Returns: (expired, resolved, assertionId, winningOutcome, canPropose, canSettle)
-        resolution_selector = "0x13b63fce"  # getResolutionStatus()
-        resolution_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": resolution_selector,
-        })
-
-        # Decode: bool, bool, bytes32, uint8, bool, bool
-        # Each value is padded to 32 bytes:
-        # expired: bytes 0-32 (value at byte 31)
-        # resolved: bytes 32-64 (value at byte 63)
-        # assertionId: bytes 64-96
-        # winningOutcome: bytes 96-128 (uint8 padded)
-        resolved = bool(resolution_data[63])
-        winning_outcome = int(resolution_data[96:128].hex(), 16)
-
-        if not resolved:
-            raise ValueError("Market is not resolved yet")
-
-        print(f"  Resolved: {resolved}")
-        print(f"  Winning outcome: {'YES' if winning_outcome == 0 else 'NO'}")
-
-        # Check user's winning token balance
-        winning_token_id = yes_token_id if winning_outcome == 0 else no_token_id
-
-        # balanceOf(address, uint256) -> uint256
-        balance_selector = "0x00fdd58e"  # balanceOf(address,uint256)
-        balance_call = balance_selector + owner[2:].lower().zfill(64) + hex(winning_token_id)[2:].zfill(64)
-        balance_data = w3.eth.call({
-            "to": ctf_address,
-            "data": balance_call,
-        })
-        balance = int(balance_data.hex(), 16)
-
-        if balance == 0:
-            raise ValueError("No winning tokens to redeem")
-
-        print(f"  Winning token balance: {balance / 1_000_000:.2f}")
-
-        # Get nonce from CTF contract
-        nonce = self._get_contract_nonce(owner, ctf_address)
-
-        # Set deadline
         deadline = int(time.time()) + 3600
+        index_sets = [1 if data["winning_outcome"] == 0 else 2]
 
-        # indexSets: [1] for YES, [2] for NO
-        index_sets = [1 if winning_outcome == 0 else 2]
-
-        # Build EIP-712 typed data for RedeemPositions
         typed_data = {
             "types": {
                 "EIP712Domain": [
@@ -1533,38 +1517,81 @@ class TurbineClient:
             },
             "message": {
                 "owner": owner,
-                "collateralToken": collateral_token,
+                "collateralToken": data["collateral_token"],
                 "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                "conditionId": condition_id,
+                "conditionId": data["condition_id"],
                 "indexSets": index_sets,
                 "nonce": nonce,
                 "deadline": deadline,
             },
         }
 
-        # Sign the typed data
         signed = Account.sign_typed_data(
             self._signer._account.key,
             full_message=typed_data,
         )
 
-        v = signed.v
-        r = "0x" + hex(signed.r)[2:].zfill(64)
-        s = "0x" + hex(signed.s)[2:].zfill(64)
+        return {
+            "v": signed.v,
+            "r": "0x" + hex(signed.r)[2:].zfill(64),
+            "s": "0x" + hex(signed.s)[2:].zfill(64),
+            "deadline": deadline,
+            "index_sets": index_sets,
+        }
+
+    def claim_winnings(
+        self,
+        market_contract_address: str,
+    ) -> Dict[str, Any]:
+        """Claim winnings from a resolved market using gasless permit.
+
+        This queries the market contract for resolution status and condition data,
+        signs an EIP-712 permit, and submits to the relayer for gasless execution.
+        Uses Multicall3 to batch RPC reads (2 RPC calls instead of 8).
+
+        Args:
+            market_contract_address: The market's contract address.
+
+        Returns:
+            The relayer response with tx_hash on success.
+
+        Raises:
+            ValueError: If market is not resolved or user has no winnings.
+            AuthenticationError: If no signer is configured.
+        """
+        self._require_signer()
+        self._require_auth()
+
+        owner = self._signer.address
+
+        # Fetch all market data in 2 batched RPC calls (was 8 sequential)
+        data = self._get_market_claim_data(market_contract_address, owner)
+        if data is None:
+            raise ValueError("Market is not resolved or no winning tokens to redeem")
+
+        print(f"Market: {data['market_address']}")
+        print(f"  Winning outcome: {'YES' if data['winning_outcome'] == 0 else 'NO'}")
+        print(f"  Balance: {data['balance'] / 1_000_000:.2f}")
+
+        # Get nonce using tracked permit nonce (handles concurrent claims correctly)
+        nonce = self._get_and_increment_permit_nonce(owner, data["ctf_address"])
+
+        # Sign permit
+        sig = self._sign_redemption_permit(data, data["ctf_address"], nonce)
 
         print(f"Submitting redemption...")
 
         return self.request_ctf_redemption(
             owner=owner,
-            collateral_token=collateral_token,
+            collateral_token=data["collateral_token"],
             parent_collection_id="0x0000000000000000000000000000000000000000000000000000000000000000",
-            condition_id=condition_id,
-            index_sets=[str(i) for i in index_sets],
-            deadline=deadline,
-            v=v,
-            r=r,
-            s=s,
-            market_address=market_contract_address,
+            condition_id=data["condition_id"],
+            index_sets=[str(i) for i in sig["index_sets"]],
+            deadline=sig["deadline"],
+            v=sig["v"],
+            r=sig["r"],
+            s=sig["s"],
+            market_address=data["market_address"],
         )
 
     def request_batch_ctf_redemption(
@@ -1609,8 +1636,8 @@ class TurbineClient:
     ) -> Dict[str, Any]:
         """Claim winnings from multiple resolved markets using gasless permits.
 
-        This queries each market contract for resolution status and condition data,
-        signs EIP-712 permits for each, and submits a batch to the relayer.
+        Uses Multicall3 to batch RPC reads (2 calls per market instead of 8),
+        and properly increments permit nonces for the batch transaction.
 
         Args:
             market_contract_addresses: List of market contract addresses to claim from.
@@ -1619,170 +1646,44 @@ class TurbineClient:
             The relayer response with txHash on success.
 
         Raises:
-            ValueError: If any market is not resolved or user has no winnings.
+            ValueError: If no markets have winning tokens to redeem.
             AuthenticationError: If no signer is configured.
         """
         self._require_signer()
         self._require_auth()
 
-        import time
-        from eth_account import Account
-        from web3 import Web3
-
         owner = self._signer.address
-
-        # Get RPC URL
-        rpc_urls = {
-            137: "https://polygon-bor-rpc.publicnode.com",
-            43114: "https://avalanche-c-chain-rpc.publicnode.com",
-            84532: "https://base-sepolia-rpc.publicnode.com",
-        }
-        rpc_url = rpc_urls.get(self._chain_id)
-        if not rpc_url:
-            raise ValueError(f"No RPC URL for chain {self._chain_id}")
-
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
         redemptions = []
 
+        # Fetch claim data for all markets (2 RPC calls each via Multicall3)
+        claimable = []
         for market_address in market_contract_addresses:
-            market_address = Web3.to_checksum_address(market_address)
-
-            # Query market contract data
-            ctf_data = w3.eth.call({
-                "to": market_address,
-                "data": "0x22a9339f",  # ctf()
-            })
-            ctf_address = Web3.to_checksum_address("0x" + ctf_data[12:32].hex())
-
-            collateral_data = w3.eth.call({
-                "to": market_address,
-                "data": "0xb2016bd4",  # collateralToken()
-            })
-            collateral_token = Web3.to_checksum_address("0x" + collateral_data[12:32].hex())
-
-            condition_data = w3.eth.call({
-                "to": market_address,
-                "data": "0x2ddc7de7",  # conditionId()
-            })
-            condition_id = "0x" + condition_data.hex()
-
-            yes_data = w3.eth.call({
-                "to": market_address,
-                "data": "0x76cd28a2",  # yesTokenId()
-            })
-            yes_token_id = int(yes_data.hex(), 16)
-
-            no_data = w3.eth.call({
-                "to": market_address,
-                "data": "0x8c2557a8",  # noTokenId()
-            })
-            no_token_id = int(no_data.hex(), 16)
-
-            # Check resolution status
-            resolution_data = w3.eth.call({
-                "to": market_address,
-                "data": "0x13b63fce",  # getResolutionStatus()
-            })
-            resolved = bool(resolution_data[63])
-            winning_outcome = int(resolution_data[96:128].hex(), 16)
-
-            if not resolved:
-                print(f"Skipping {market_address}: not resolved")
+            data = self._get_market_claim_data(market_address, owner)
+            if data is None:
+                print(f"Skipping {market_address}: not resolved or no winning tokens")
                 continue
+            claimable.append(data)
+            print(f"Added {data['market_address']} to batch (balance: {data['balance'] / 1_000_000:.2f})")
 
-            # Check balance
-            winning_token_id = yes_token_id if winning_outcome == 0 else no_token_id
-            balance_call = "0x00fdd58e" + owner[2:].lower().zfill(64) + hex(winning_token_id)[2:].zfill(64)
-            balance_data = w3.eth.call({
-                "to": ctf_address,
-                "data": balance_call,
-            })
-            balance = int(balance_data.hex(), 16)
-
-            if balance == 0:
-                print(f"Skipping {market_address}: no winning tokens")
-                continue
-
-            # Get nonce and sign
-            # For batch claims, we must increment the nonce locally for each
-            # redemption because the Multicall3 tx will execute them sequentially
-            # and each redeemPositionsWithPermit increments nonces[owner] on-chain.
-            if not redemptions:
-                # First redemption: read on-chain nonce
-                nonce = self._get_contract_nonce(owner, ctf_address)
-            else:
-                # Subsequent redemptions: increment from previous
-                nonce = redemptions[-1]["_nonce"] + 1
-            deadline = int(time.time()) + 3600
-            index_sets = [1 if winning_outcome == 0 else 2]
-
-            typed_data = {
-                "types": {
-                    "EIP712Domain": [
-                        {"name": "name", "type": "string"},
-                        {"name": "version", "type": "string"},
-                        {"name": "chainId", "type": "uint256"},
-                        {"name": "verifyingContract", "type": "address"},
-                    ],
-                    "RedeemPositions": [
-                        {"name": "owner", "type": "address"},
-                        {"name": "collateralToken", "type": "address"},
-                        {"name": "parentCollectionId", "type": "bytes32"},
-                        {"name": "conditionId", "type": "bytes32"},
-                        {"name": "indexSets", "type": "uint256[]"},
-                        {"name": "nonce", "type": "uint256"},
-                        {"name": "deadline", "type": "uint256"},
-                    ],
-                },
-                "primaryType": "RedeemPositions",
-                "domain": {
-                    "name": "ConditionalTokensWithPermit",
-                    "version": "1",
-                    "chainId": self._chain_id,
-                    "verifyingContract": ctf_address,
-                },
-                "message": {
-                    "owner": owner,
-                    "collateralToken": collateral_token,
-                    "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                    "conditionId": condition_id,
-                    "indexSets": index_sets,
-                    "nonce": nonce,
-                    "deadline": deadline,
-                },
-            }
-
-            signed = Account.sign_typed_data(
-                self._signer._account.key,
-                full_message=typed_data,
-            )
-
-            v = signed.v
-            r = "0x" + hex(signed.r)[2:].zfill(64)
-            s = "0x" + hex(signed.s)[2:].zfill(64)
-
-            redemptions.append({
-                "owner": owner,
-                "collateralToken": collateral_token,
-                "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                "conditionId": condition_id,
-                "indexSets": [str(i) for i in index_sets],
-                "deadline": str(deadline),
-                "v": v,
-                "r": r,
-                "s": s,
-                "marketAddress": market_address,
-                "_nonce": nonce,  # Track nonce locally for incrementing (stripped before sending)
-            })
-
-            print(f"Added {market_address} to batch (balance: {balance / 1_000_000:.2f})")
-
-        if not redemptions:
+        if not claimable:
             raise ValueError("No markets with winning tokens to redeem")
 
-        # Strip internal _nonce field before sending to API
-        for r in redemptions:
-            r.pop("_nonce", None)
+        # Sign permits with incrementing nonces (uses _get_and_increment_permit_nonce)
+        for data in claimable:
+            nonce = self._get_and_increment_permit_nonce(owner, data["ctf_address"])
+            sig = self._sign_redemption_permit(data, data["ctf_address"], nonce)
+
+            redemptions.append({
+                "collateralToken": data["collateral_token"],
+                "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "conditionId": data["condition_id"],
+                "indexSets": [str(i) for i in sig["index_sets"]],
+                "deadline": str(sig["deadline"]),
+                "v": sig["v"],
+                "r": sig["r"],
+                "s": sig["s"],
+                "marketAddress": data["market_address"],
+            })
 
         print(f"Submitting batch redemption for {len(redemptions)} markets...")
         return self.request_batch_ctf_redemption(redemptions)
