@@ -452,6 +452,30 @@ class PendingTrade:
 
 
 @dataclass
+class ClaimablePosition:
+    """A position in a resolved market that can be claimed."""
+
+    market_id: str
+    question: str
+    contract_address: str
+    winning_outcome: int
+    winning_shares: int
+    payout: int
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ClaimablePosition":
+        """Create from API response dictionary."""
+        return cls(
+            market_id=data.get("marketId", ""),
+            question=data.get("question", ""),
+            contract_address=data.get("contractAddress", ""),
+            winning_outcome=int(data.get("winningOutcome", 0)),
+            winning_shares=int(data.get("winningShares", 0)),
+            payout=int(data.get("payout", 0)),
+        )
+
+
+@dataclass
 class FailedClaim:
     """A failed claim."""
 

@@ -52,6 +52,7 @@ ENDPOINTS = {
     "user_positions": "/api/v1/users/{address}/positions",
     "user_orders": "/api/v1/users/{address}/orders",
     "user_activity": "/api/v1/users/{address}/activity",
+    "user_claimable": "/api/v1/users/{address}/claimable",
     "user_stats": "/api/v1/user-stats",
 
     # Relayer endpoints
