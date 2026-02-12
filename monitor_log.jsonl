@@ -1,0 +1,22 @@
+{"type": "market_change", "time": "22:10:48", "market_id": "0x27391505f0", "strike": 67369.738811, "remaining": 252}
+{"type": "signal", "time": "22:10:48", "btc": 67117.68, "strike": 67369.74, "diff_pct": -0.374, "action": "BUY_NO", "confidence": 0.187, "market_remaining": 252}
+{"type": "signal", "time": "22:10:58", "btc": 67117.93, "strike": 67369.74, "diff_pct": -0.374, "action": "BUY_NO", "confidence": 0.187, "market_remaining": 242}
+{"type": "signal", "time": "22:11:09", "btc": 67103.31, "strike": 67369.74, "diff_pct": -0.395, "action": "BUY_NO", "confidence": 0.198, "market_remaining": 231}
+{"type": "signal", "time": "22:11:20", "btc": 67060.38, "strike": 67369.74, "diff_pct": -0.459, "action": "BUY_NO", "confidence": 0.23, "market_remaining": 221}
+{"type": "signal", "time": "22:11:30", "btc": 67030.33, "strike": 67369.74, "diff_pct": -0.504, "action": "BUY_NO", "confidence": 0.252, "market_remaining": 210}
+{"type": "signal", "time": "22:11:41", "btc": 67056.75, "strike": 67369.74, "diff_pct": -0.465, "action": "BUY_NO", "confidence": 0.232, "market_remaining": 199}
+{"type": "signal", "time": "22:11:51", "btc": 67069.53, "strike": 67369.74, "diff_pct": -0.446, "action": "BUY_NO", "confidence": 0.223, "market_remaining": 189}
+{"type": "signal", "time": "22:12:02", "btc": 67068.37, "strike": 67369.74, "diff_pct": -0.447, "action": "BUY_NO", "confidence": 0.224, "market_remaining": 178}
+{"type": "signal", "time": "22:12:12", "btc": 67093.28, "strike": 67369.74, "diff_pct": -0.41, "action": "BUY_NO", "confidence": 0.205, "market_remaining": 168}
+{"type": "signal", "time": "22:12:23", "btc": 67076.41, "strike": 67369.74, "diff_pct": -0.435, "action": "BUY_NO", "confidence": 0.218, "market_remaining": 158}
+{"type": "signal", "time": "22:12:33", "btc": 67095.01, "strike": 67369.74, "diff_pct": -0.408, "action": "BUY_NO", "confidence": 0.204, "market_remaining": 147}
+{"type": "signal", "time": "22:12:44", "btc": 67047.04, "strike": 67369.74, "diff_pct": -0.479, "action": "BUY_NO", "confidence": 0.24, "market_remaining": 137}
+{"type": "signal", "time": "22:12:54", "btc": 67000.06, "strike": 67369.74, "diff_pct": -0.549, "action": "BUY_NO", "confidence": 0.274, "market_remaining": 126}
+{"type": "signal", "time": "22:13:05", "btc": 66958.54, "strike": 67369.74, "diff_pct": -0.61, "action": "BUY_NO", "confidence": 0.305, "market_remaining": 116}
+{"type": "signal", "time": "22:13:15", "btc": 66927.55, "strike": 67369.74, "diff_pct": -0.656, "action": "BUY_NO", "confidence": 0.328, "market_remaining": 105}
+{"type": "signal", "time": "22:13:26", "btc": 66941.45, "strike": 67369.74, "diff_pct": -0.636, "action": "BUY_NO", "confidence": 0.318, "market_remaining": 95}
+{"type": "signal", "time": "22:13:36", "btc": 66950.19, "strike": 67369.74, "diff_pct": -0.623, "action": "BUY_NO", "confidence": 0.311, "market_remaining": 84}
+{"type": "signal", "time": "22:13:47", "btc": 66930.25, "strike": 67369.74, "diff_pct": -0.652, "action": "BUY_NO", "confidence": 0.326, "market_remaining": 74}
+{"type": "signal", "time": "22:13:57", "btc": 66918.18, "strike": 67369.74, "diff_pct": -0.67, "action": "BUY_NO", "confidence": 0.335, "market_remaining": 63}
+{"type": "signal", "time": "22:14:08", "btc": 66859.2, "strike": 67369.74, "diff_pct": -0.758, "action": "BUY_NO", "confidence": 0.379, "market_remaining": 53}
+{"type": "signal", "time": "22:14:18", "btc": 66824.86, "strike": 67369.74, "diff_pct": -0.809, "action": "BUY_NO", "confidence": 0.404, "market_remaining": 42}

@@ -874,14 +874,17 @@ class TurbineClient:
     def get_claimable_positions(
         self,
         address: Optional[str] = None,
+        verify: bool = False,
     ) -> Dict[str, Any]:
         """Get resolved markets where the user has winning tokens to claim.
 
-        Fast DB-only query — no RPC calls. Returns claimable positions,
-        count, and total payout.
+        By default, fast DB-only query (no RPC calls). Pass verify=True to
+        check on-chain balances and backfill already-claimed positions.
 
         Args:
             address: User address. Defaults to the signer's address.
+            verify: If True, verify each position on-chain and backfill
+                already-claimed ones. Slower but handles pre-fix data.
 
         Returns:
             Dict with 'claimable' (list of ClaimablePosition), 'count', and 'totalPayout'.
@@ -896,8 +899,11 @@ class TurbineClient:
             address = self._signer.address
 
         endpoint = ENDPOINTS["user_claimable"].format(address=address)
+        params = {"chain_id": str(self._chain_id)}
+        if verify:
+            params["verify"] = "true"
         response = self._http.get(
-            endpoint, params={"chain_id": str(self._chain_id)}, authenticated=True
+            endpoint, params=params, authenticated=True
         )
         positions = [
             ClaimablePosition.from_dict(p)
@@ -925,7 +931,7 @@ class TurbineClient:
         self._require_signer()
         self._require_auth()
 
-        result = self.get_claimable_positions()
+        result = self.get_claimable_positions(verify=True)
         positions = result["claimable"]
 
         if not positions:

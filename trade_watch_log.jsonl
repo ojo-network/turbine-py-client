@@ -1,0 +1,7 @@
+{"type": "market", "time": "22:14:52", "market_id": "0x27391505f0", "strike": 67369.74, "remaining": 8}
+{"type": "trade", "time": "22:14:52", "trader": "0xd66e4F3D...", "outcome": "NO", "size_usd": 0.2, "shares": 0.5361, "price_pct": 37.3, "market_remaining": 8}
+{"type": "trade", "time": "22:14:52", "trader": "0xA32048D7...", "outcome": "NO", "size_usd": 0.2, "shares": 0.4367, "price_pct": 45.8, "market_remaining": 8}
+{"type": "trade", "time": "22:14:52", "trader": "0xB7E4CAc6...", "outcome": "NO", "size_usd": 0.0025, "shares": 0.0026, "price_pct": 95.3, "market_remaining": 8}
+{"type": "trade", "time": "22:14:52", "trader": "0xB7E4CAc6...", "outcome": "NO", "size_usd": 0.0471, "shares": 0.0494, "price_pct": 95.3, "market_remaining": 8}
+{"type": "market", "time": "22:15:30", "market_id": "0x148a5068ea", "strike": 66849.39, "remaining": 870}
+{"type": "trade", "time": "22:16:13", "trader": "0xd66e4F3D...", "outcome": "NO", "size_usd": 0.2, "shares": 0.4995, "price_pct": 40.0, "market_remaining": 828}
