@@ -13,6 +13,7 @@ from turbine_client.order_builder import OrderBuilder
 from turbine_client.signer import Signer, create_signer
 from turbine_client.types import (
     AssetPrice,
+    ClaimablePosition,
     FailedClaim,
     FailedTrade,
     Holder,
@@ -1703,8 +1704,10 @@ class TurbineClient:
                 print(f"Skipping {market_address}: no winning tokens")
                 continue
 
-            # Get nonce and sign
-            nonce = self._get_contract_nonce(owner, ctf_address)
+            # Get nonce and sign — use local tracking to increment for each
+            # permit in the batch, since redeemPositionsWithPermit increments
+            # nonces[owner]++ on-chain for each call in the Multicall3 batch.
+            nonce = self._get_and_increment_permit_nonce(owner, ctf_address)
             deadline = int(time.time()) + 3600
             index_sets = [1 if winning_outcome == 0 else 2]
 
@@ -1773,6 +1776,92 @@ class TurbineClient:
 
         print(f"Submitting batch redemption for {len(redemptions)} markets...")
         return self.request_batch_ctf_redemption(redemptions)
+
+    # =========================================================================
+    # Claimable Positions Discovery
+    # =========================================================================
+
+    def get_claimable_positions(
+        self,
+        address: Optional[str] = None,
+        verify: bool = False,
+    ) -> Dict[str, Any]:
+        """Get positions in resolved markets that can be claimed.
+
+        Queries the /claimable endpoint which returns positions where the user
+        has winning shares in resolved markets, excluding markets with pending
+        or confirmed redemptions.
+
+        Args:
+            address: The user address. Defaults to the signer's address.
+            verify: If True, the server verifies on-chain balances and backfills
+                stale data. Slower but catches already-claimed markets.
+
+        Returns:
+            Dictionary with 'positions' (list of ClaimablePosition dicts),
+            'count', and 'totalPayout'.
+
+        Raises:
+            AuthenticationError: If no auth is configured.
+        """
+        self._require_auth()
+
+        addr = address or (self._signer.address if self._signer else None)
+        if not addr:
+            raise AuthenticationError("No address provided and no signer configured")
+
+        endpoint = ENDPOINTS["user_claimable"].format(address=addr)
+        params = {"chain_id": str(self._chain_id)}
+        if verify:
+            params["verify"] = "true"
+
+        result = self._http.get(endpoint, params=params, authenticated=True)
+
+        # Parse positions into ClaimablePosition objects
+        if isinstance(result, dict) and "positions" in result:
+            result["positions"] = [
+                ClaimablePosition.from_dict(p) if isinstance(p, dict) else p
+                for p in result["positions"]
+            ]
+
+        return result
+
+    def claim_all_winnings(self) -> Dict[str, Any]:
+        """Discover and claim all winning positions in one call.
+
+        This is a convenience method that:
+        1. Queries /claimable with verify=True to find all claimable markets
+        2. Calls batch_claim_winnings() with the discovered market addresses
+
+        Returns:
+            The relayer response with txHash on success.
+
+        Raises:
+            ValueError: If no claimable positions found.
+            AuthenticationError: If no signer or auth is configured.
+        """
+        self._require_signer()
+        self._require_auth()
+
+        # Discover claimable positions with on-chain verification
+        result = self.get_claimable_positions(verify=True)
+        positions = result.get("positions", [])
+
+        if not positions:
+            raise ValueError("No claimable positions found")
+
+        # Extract contract addresses
+        market_addresses = []
+        for pos in positions:
+            addr = pos.contract_address if isinstance(pos, ClaimablePosition) else pos.get("contractAddress", "")
+            if addr:
+                market_addresses.append(addr)
+
+        if not market_addresses:
+            raise ValueError("No market addresses found in claimable positions")
+
+        print(f"Found {len(market_addresses)} claimable market(s), submitting batch claim...")
+        return self.batch_claim_winnings(market_addresses)
 
     # =========================================================================
     # API Key Registration (Self-Service Credentials)
