@@ -1704,7 +1704,15 @@ class TurbineClient:
                 continue
 
             # Get nonce and sign
-            nonce = self._get_contract_nonce(owner, ctf_address)
+            # For batch claims, we must increment the nonce locally for each
+            # redemption because the Multicall3 tx will execute them sequentially
+            # and each redeemPositionsWithPermit increments nonces[owner] on-chain.
+            if not redemptions:
+                # First redemption: read on-chain nonce
+                nonce = self._get_contract_nonce(owner, ctf_address)
+            else:
+                # Subsequent redemptions: increment from previous
+                nonce = redemptions[-1]["_nonce"] + 1
             deadline = int(time.time()) + 3600
             index_sets = [1 if winning_outcome == 0 else 2]
 
@@ -1764,12 +1772,17 @@ class TurbineClient:
                 "r": r,
                 "s": s,
                 "marketAddress": market_address,
+                "_nonce": nonce,  # Track nonce locally for incrementing (stripped before sending)
             })
 
             print(f"Added {market_address} to batch (balance: {balance / 1_000_000:.2f})")
 
         if not redemptions:
             raise ValueError("No markets with winning tokens to redeem")
+
+        # Strip internal _nonce field before sending to API
+        for r in redemptions:
+            r.pop("_nonce", None)
 
         print(f"Submitting batch redemption for {len(redemptions)} markets...")
         return self.request_batch_ctf_redemption(redemptions)
