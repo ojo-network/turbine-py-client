@@ -452,6 +452,37 @@ class PendingTrade:
 
 
 @dataclass
+class ClaimablePosition:
+    """A resolved market where the user has winning tokens to claim."""
+
+    market_id: str
+    market_question: str
+    contract_address: str
+    winning_outcome: int  # 0 = YES, 1 = NO
+    winning_shares: int  # Raw units (6 decimals)
+    payout: str  # Human-readable payout (e.g. "10.50")
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ClaimablePosition":
+        return cls(
+            market_id=data.get("marketId", ""),
+            market_question=data.get("marketQuestion", ""),
+            contract_address=data.get("contractAddress", ""),
+            winning_outcome=int(data.get("winningOutcome", 0)),
+            winning_shares=int(data.get("winningShares", 0)),
+            payout=data.get("payout", "0.00"),
+        )
+
+    @property
+    def outcome_label(self) -> str:
+        return "YES" if self.winning_outcome == 0 else "NO"
+
+    @property
+    def payout_float(self) -> float:
+        return self.winning_shares / 1_000_000
+
+
+@dataclass
 class FailedClaim:
     """A failed claim."""
 
