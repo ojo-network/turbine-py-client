@@ -257,6 +257,12 @@ Some endpoints require Ed25519 bearer tokens:
 
 ## Order Management
 
+### Minimum Order Size
+
+**Taker orders** (orders that fill immediately against resting orders) must have a total value of at least **$1 USDC** (size × price ≥ $1). Orders below this minimum will be rejected by the API.
+
+**Maker orders** (resting limit orders that provide liquidity) are exempt and can be any size.
+
 ### Creating Orders
 
 ```python

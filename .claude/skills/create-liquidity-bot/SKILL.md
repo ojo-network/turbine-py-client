@@ -10,6 +10,8 @@ Here's what you're helping the user build: **a Python file that provides liquidi
 
 Unlike directional trading bots that bet on outcomes, a **market maker** (MM) places both buy and sell orders — offering to trade with anyone. The MM earns from the **spread** (the gap between its buy and sell prices) and from **maker rebates** (Turbine rewards resting orders that get filled).
 
+> **Good news for market makers:** Turbine enforces a $1 minimum on taker orders, but **maker orders are exempt**. Since MM bots place resting (maker) orders, they can use any order size — including the small sizes typical of multi-level quoting strategies.
+
 Every 15 minutes, Turbine opens a new market asking "Will BTC be above $X at [time]?" The user's MM bot quotes both YES and NO outcomes with multi-level bid/ask ladders, dynamically adjusting prices based on the live BTC price from Pyth Network. When someone trades against the MM's resting orders, the MM collects the spread — and earns rebates on top.
 
 **A liquidity bot is a single Python file.** When you run `python my_mm_bot.py`, it connects to Turbine, starts quoting the current BTC market on both sides, and manages its orders automatically — refreshing quotes as prices move, handling market rotation every 15 minutes, approving USDC gaslessly, and claiming winnings.
