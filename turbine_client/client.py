@@ -748,7 +748,7 @@ class TurbineClient:
     def get_claimable_positions(
         self,
         address: Optional[str] = None,
-        verify: bool = False,
+        verify: bool = True,
     ) -> Dict[str, Any]:
         """Get resolved markets where the user has winning tokens to claim.
 
