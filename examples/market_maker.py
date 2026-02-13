@@ -1,13 +1,14 @@
 """
 Turbine Market Maker Bot
 
-Probability-based market maker for BTC 15-minute prediction markets. Fetches
-real-time BTC price from Pyth Network to compute YES/NO target probabilities,
-then quotes multi-level bid/ask ladders with geometric size distribution.
-USDC is approved gaslessly via a one-time max permit per settlement contract.
+Probability-based market maker for BTC, ETH, and SOL 15-minute prediction
+markets. Fetches real-time prices from Pyth Network to compute YES/NO target
+probabilities, then quotes multi-level bid/ask ladders with geometric size
+distribution. USDC is approved gaslessly via a one-time max permit per
+settlement contract.
 
-Algorithm: Fetches real-time BTC price from Pyth Network (same oracle Turbine
-           uses) and compares it to the market's strike price.
+Algorithm: Fetches real-time prices from Pyth Network (same oracle Turbine
+           uses) and compares them to each market's strike price.
            - YES target = 0.50 + (price_deviation% * sensitivity)
            - Sensitivity increases toward expiration (time decay)
            - Spread tightens toward expiration (minimum 0.5%)
@@ -15,11 +16,12 @@ Algorithm: Fetches real-time BTC price from Pyth Network (same oracle Turbine
            - Requotes only when target shifts >2% (rebalance threshold)
 
 Features:
-- Probability-based dynamic pricing from Pyth BTC price
+- Multi-asset: trades BTC, ETH, and SOL simultaneously (configurable via --assets)
+- Probability-based dynamic pricing from Pyth prices
 - Multi-level quoting with geometric size distribution (default 6 levels)
 - Time-decay sensitivity and spread tightening toward expiration
 - Cancel-then-place order refresh to avoid self-trade issues
-- Allocation-based budgeting (total USDC split across 4 sides x N levels)
+- Allocation-based budgeting per asset (total USDC split across 4 sides x N levels)
 - Auto-approves USDC gaslessly when entering a new market
 - Automatic market transition when 15-minute markets rotate
 - Automatic claiming of winnings from resolved markets
@@ -33,6 +35,10 @@ Usage:
         --spread 0.02 \\
         --levels 6 \\
         --sensitivity 0.10
+
+    # Trade only BTC and ETH
+    TURBINE_PRIVATE_KEY=0x... python examples/market_maker.py \\
+        --assets BTC,ETH
 """
 
 import argparse
@@ -61,7 +67,7 @@ CHAIN_ID = int(os.environ.get("CHAIN_ID", "84532"))
 TURBINE_HOST = os.environ.get("TURBINE_HOST", "http://localhost:8080")
 
 # Default trading parameters (in USDC terms)
-DEFAULT_ALLOCATION_USDC = 50.0  # $10 total allocation split across all sides/levels
+DEFAULT_ALLOCATION_USDC = 50.0  # $50 total allocation per asset split across all sides/levels
 
 # Quick market pricing parameters (matching Go MM defaults)
 DEFAULT_SPREAD = 0.02  # 2% spread around target probability
@@ -81,7 +87,16 @@ REFRESH_INTERVAL = 10  # Seconds between price checks
 
 # Pyth Network Hermes API - same price source Turbine uses
 PYTH_HERMES_URL = "https://hermes.pyth.network/v2/updates/price/latest"
-PYTH_BTC_FEED_ID = "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"
+
+# Pyth feed IDs per asset
+PYTH_FEED_IDS = {
+    "BTC": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+    "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+    "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+}
+
+# Supported assets
+SUPPORTED_ASSETS = list(PYTH_FEED_IDS.keys())
 
 
 def get_or_create_api_credentials(env_path: Path = None):
@@ -139,30 +154,11 @@ def _save_credentials_to_env(env_path: Path, api_key_id: str, api_private_key: s
         env_path.write_text(content)
 
 
-class MarketMaker:
-    """Probability-based market maker for BTC 15-minute prediction markets.
+class AssetState:
+    """Per-asset market making state."""
 
-    Computes YES/NO target probabilities from live BTC price vs strike,
-    then quotes multi-level bid/ask ladders with geometric size distribution.
-    Sensitivity increases and spread tightens toward expiration. USDC is
-    approved gaslessly via one-time max EIP-2612 permit through the relayer.
-    """
-
-    def __init__(
-        self,
-        client: TurbineClient,
-        allocation_usdc: float = DEFAULT_ALLOCATION_USDC,
-        spread: float = DEFAULT_SPREAD,
-        num_levels: int = DEFAULT_NUM_LEVELS,
-        sensitivity: float = DEFAULT_PRICE_SENSITIVITY,
-    ):
-        self.client = client
-        self.allocation_usdc = allocation_usdc
-        self.base_spread = spread
-        self.num_levels = num_levels
-        self.price_sensitivity = sensitivity
-
-        # Market state
+    def __init__(self, asset: str):
+        self.asset = asset
         self.market_id: str | None = None
         self.settlement_address: str | None = None
         self.contract_address: str | None = None
@@ -172,19 +168,50 @@ class MarketMaker:
 
         # Dynamic pricing state
         self.yes_target: float = DEFAULT_BASE_PROBABILITY
-        self.current_spread: float = spread
+        self.current_spread: float = DEFAULT_SPREAD
         self.yes_target_at_rebalance: float = DEFAULT_BASE_PROBABILITY
         self.last_rebalance_time: int = 0
 
         # Order tracking
         self.active_orders: dict[str, str] = {}  # order_hash -> side
-        self.running = True
-
-        # Track approved settlement contracts
-        self.approved_settlements: dict[str, int] = {}
 
         # Track markets we've traded in for claiming winnings
         self.traded_markets: dict[str, str] = {}  # market_id -> contract_address
+
+
+class MarketMaker:
+    """Probability-based market maker for BTC, ETH, and SOL 15-minute prediction markets.
+
+    Computes YES/NO target probabilities from live prices vs strike per asset,
+    then quotes multi-level bid/ask ladders with geometric size distribution.
+    Sensitivity increases and spread tightens toward expiration. USDC is
+    approved gaslessly via one-time max EIP-2612 permit through the relayer.
+    """
+
+    def __init__(
+        self,
+        client: TurbineClient,
+        assets: list[str],
+        allocation_usdc: float = DEFAULT_ALLOCATION_USDC,
+        spread: float = DEFAULT_SPREAD,
+        num_levels: int = DEFAULT_NUM_LEVELS,
+        sensitivity: float = DEFAULT_PRICE_SENSITIVITY,
+    ):
+        self.client = client
+        self.assets = assets
+        self.allocation_usdc = allocation_usdc
+        self.base_spread = spread
+        self.num_levels = num_levels
+        self.price_sensitivity = sensitivity
+        self.running = True
+
+        # Per-asset state
+        self.asset_states: dict[str, AssetState] = {
+            asset: AssetState(asset) for asset in assets
+        }
+
+        # Track approved settlement contracts (shared across assets)
+        self.approved_settlements: dict[str, int] = {}
 
         # Async HTTP client for non-blocking price fetches
         self._http_client: httpx.AsyncClient | None = None
@@ -204,39 +231,48 @@ class MarketMaker:
         if self._http_client is not None and not self._http_client.is_closed:
             await self._http_client.aclose()
 
-    async def get_current_btc_price(self) -> float:
-        """Fetch current BTC price from Pyth Network."""
+    async def get_current_prices(self) -> dict[str, float]:
+        """Fetch current prices for all active assets from Pyth Network in one request."""
         try:
             http_client = await self._get_http_client()
+            feed_ids = [PYTH_FEED_IDS[asset] for asset in self.assets]
             response = await http_client.get(
                 PYTH_HERMES_URL,
-                params={"ids[]": PYTH_BTC_FEED_ID},
+                params=[("ids[]", fid) for fid in feed_ids],
             )
             response.raise_for_status()
             data = response.json()
 
+            prices: dict[str, float] = {}
             if not data.get("parsed"):
-                print("No price data from Pyth")
-                return 0.0
+                return prices
 
-            price_data = data["parsed"][0]["price"]
-            price_int = int(price_data["price"])
-            expo = price_data["expo"]
+            # Map feed IDs back to assets
+            feed_to_asset = {PYTH_FEED_IDS[asset]: asset for asset in self.assets}
 
-            return price_int * (10 ** expo)
+            for parsed in data["parsed"]:
+                feed_id = "0x" + parsed["id"]
+                asset = feed_to_asset.get(feed_id)
+                if asset:
+                    price_data = parsed["price"]
+                    price_int = int(price_data["price"])
+                    expo = price_data["expo"]
+                    prices[asset] = price_int * (10 ** expo)
+
+            return prices
 
         except Exception as e:
-            print(f"Failed to fetch BTC price from Pyth: {e}")
-            return 0.0
+            print(f"Failed to fetch prices from Pyth: {e}")
+            return {}
 
     # ------------------------------------------------------------------
     # Dynamic probability pricing (matching Go MM)
     # ------------------------------------------------------------------
 
     def calculate_target_prices_with_time(
-        self, current_price: float
+        self, state: AssetState, current_price: float
     ) -> tuple[float, float]:
-        """Calculate YES target probability and dynamic spread.
+        """Calculate YES target probability and dynamic spread for an asset.
 
         Uses the same formula as the Go MM's calculateTargetPricesWithTime:
         - Time factor: elapsed / total duration (0.0 at start, 1.0 at expiration)
@@ -247,17 +283,17 @@ class MarketMaker:
         Returns:
             (yes_target, spread) as floats (e.g., 0.65 = 65%, 0.02 = 2%)
         """
-        strike_usd = self.strike_price / 1e6
+        strike_usd = state.strike_price / 1e6
         if strike_usd <= 0 or current_price <= 0:
             return DEFAULT_BASE_PROBABILITY, self.base_spread
 
         # Time factor (0.0 at start, 1.0 at expiration)
         now = int(time.time())
-        total_duration = self.market_end_time - self.market_start_time
+        total_duration = state.market_end_time - state.market_start_time
         if total_duration <= 0:
             time_factor = 0.0
         else:
-            elapsed = now - self.market_start_time
+            elapsed = now - state.market_start_time
             time_factor = max(0.0, min(1.0, elapsed / total_duration))
 
         # Price deviation as percentage
@@ -457,14 +493,17 @@ class MarketMaker:
                 if "404" not in str(e):
                     print(f"  Failed to cancel {order.order_hash[:10]}...: {e}")
         print(f"  Cancelled {cancelled}/{len(open_orders)} orders")
-        self.active_orders.clear()
+        for state in self.asset_states.values():
+            state.active_orders.clear()
 
-    async def cancel_market_orders(self) -> None:
-        """Cancel all open orders for the current market by querying the API."""
+    async def cancel_asset_orders(self, state: AssetState) -> None:
+        """Cancel all open orders for a specific asset's market."""
+        if not state.market_id:
+            return
         try:
             open_orders = self.client.get_orders(
                 trader=self.client.address,
-                market_id=self.market_id,
+                market_id=state.market_id,
                 status="open",
             )
         except Exception:
@@ -479,10 +518,10 @@ class MarketMaker:
                 )
             except TurbineApiError:
                 pass
-        self.active_orders.clear()
+        state.active_orders.clear()
 
-    async def place_multi_level_quotes(self) -> dict[str, str]:
-        """Place multi-level bid and ask orders on both YES and NO outcomes.
+    async def place_multi_level_quotes(self, state: AssetState) -> dict[str, str]:
+        """Place multi-level bid and ask orders on both YES and NO outcomes for an asset.
 
         YES side: Bids below yes_target, asks above yes_target.
         NO side: Bids below no_target (1 - yes_target), asks above no_target.
@@ -493,8 +532,8 @@ class MarketMaker:
         new_orders: dict[str, str] = {}
 
         n = self.num_levels
-        half_spread = self.current_spread / 2
-        no_target = 1.0 - self.yes_target
+        half_spread = state.current_spread / 2
+        no_target = 1.0 - state.yes_target
         expiration = int(time.time()) + 300  # 5 minute expiration
 
         # Generate geometric weights
@@ -505,20 +544,20 @@ class MarketMaker:
         usdc_per_side = self.allocation_usdc / 4
 
         print(
-            f"Quoting {n} levels x 2 outcomes: "
-            f"YES {self.yes_target:.1%} / NO {no_target:.1%} | "
-            f"Spread {self.current_spread:.1%} | "
+            f"[{state.asset}] Quoting {n} levels x 2 outcomes: "
+            f"YES {state.yes_target:.1%} / NO {no_target:.1%} | "
+            f"Spread {state.current_spread:.1%} | "
             f"${usdc_per_side:.2f}/side"
         )
 
-        for outcome, target in [(Outcome.YES, self.yes_target), (Outcome.NO, no_target)]:
+        for outcome, target in [(Outcome.YES, state.yes_target), (Outcome.NO, no_target)]:
             outcome_name = "YES" if outcome == Outcome.YES else "NO"
 
             # Derive bid/ask ranges for this outcome
             bid_max = target - half_spread  # Best bid
-            bid_min = max(0.01, bid_max - self.current_spread)
+            bid_min = max(0.01, bid_max - state.current_spread)
             ask_min = target + half_spread  # Best ask
-            ask_max = min(0.99, ask_min + self.current_spread)
+            ask_max = min(0.99, ask_min + state.current_spread)
 
             # Clamp
             bid_min = max(0.01, bid_min)
@@ -540,17 +579,17 @@ class MarketMaker:
                     continue
                 try:
                     order = self.client.create_limit_buy(
-                        market_id=self.market_id,
+                        market_id=state.market_id,
                         outcome=outcome,
                         price=price,
                         size=shares,
                         expiration=expiration,
-                        settlement_address=self.settlement_address,
+                        settlement_address=state.settlement_address,
                     )
                     self.client.post_order(order)
                     new_orders[order.order_hash] = f"BUY_{outcome_name}"
                 except TurbineApiError as e:
-                    print(f"  Failed {outcome_name} bid L{i}: {e}")
+                    print(f"  [{state.asset}] Failed {outcome_name} bid L{i}: {e}")
 
             # Place ask levels (SELL outcome)
             for i in range(n):
@@ -563,43 +602,43 @@ class MarketMaker:
                     continue
                 try:
                     order = self.client.create_limit_sell(
-                        market_id=self.market_id,
+                        market_id=state.market_id,
                         outcome=outcome,
                         price=price,
                         size=shares,
                         expiration=expiration,
-                        settlement_address=self.settlement_address,
+                        settlement_address=state.settlement_address,
                     )
                     self.client.post_order(order)
                     new_orders[order.order_hash] = f"SELL_{outcome_name}"
                 except TurbineApiError as e:
-                    print(f"  Failed {outcome_name} ask L{i}: {e}")
+                    print(f"  [{state.asset}] Failed {outcome_name} ask L{i}: {e}")
 
         if new_orders:
             yes_orders = sum(1 for s in new_orders.values() if "YES" in s)
             no_orders = sum(1 for s in new_orders.values() if "NO" in s)
-            print(f"  Placed {yes_orders} YES + {no_orders} NO orders ({len(new_orders)} total)")
+            print(f"  [{state.asset}] Placed {yes_orders} YES + {no_orders} NO orders ({len(new_orders)} total)")
 
         return new_orders
 
-    async def update_quotes(self) -> None:
-        """Cancel all open orders for the current market, then place new ones."""
-        await self.cancel_market_orders()
+    async def update_quotes(self, state: AssetState) -> None:
+        """Cancel all open orders for an asset's market, then place new ones."""
+        await self.cancel_asset_orders(state)
 
-        new_orders = await self.place_multi_level_quotes()
-        self.active_orders.update(new_orders)
+        new_orders = await self.place_multi_level_quotes(state)
+        state.active_orders.update(new_orders)
 
     # ------------------------------------------------------------------
     # Market lifecycle
     # ------------------------------------------------------------------
 
-    async def get_active_market(self) -> tuple[str, int, int, int] | None:
-        """Get the currently active BTC quick market.
+    async def get_active_market(self, asset: str) -> tuple[str, int, int, int] | None:
+        """Get the currently active quick market for an asset.
 
         Returns:
             (market_id, start_time, end_time, start_price) or None
         """
-        response = self.client._http.get("/api/v1/quick-markets/BTC")
+        response = self.client._http.get(f"/api/v1/quick-markets/{asset}")
         quick_market_data = response.get("quickMarket")
         if not quick_market_data:
             return None
@@ -612,80 +651,86 @@ class MarketMaker:
         )
 
     async def switch_to_new_market(
-        self, new_market_id: str, start_time: int = 0, end_time: int = 0, start_price: int = 0
+        self, state: AssetState, new_market_id: str, start_time: int = 0, end_time: int = 0, start_price: int = 0
     ) -> None:
-        """Switch to a new market and ensure gasless USDC approval."""
-        old_market_id = self.market_id
+        """Switch an asset to a new market and ensure gasless USDC approval."""
+        old_market_id = state.market_id
 
         # Track old market for claiming winnings
-        if old_market_id and self.contract_address:
-            self.traded_markets[old_market_id] = self.contract_address
+        if old_market_id and state.contract_address:
+            state.traded_markets[old_market_id] = state.contract_address
 
         if old_market_id:
             print(f"\n{'='*50}")
-            print(f"MARKET TRANSITION")
+            print(f"[{state.asset}] MARKET TRANSITION")
             print(f"Old: {old_market_id[:8]}... | New: {new_market_id[:8]}...")
             print(f"{'='*50}\n")
             # Orders on expired markets are auto-removed by the API — just clear tracking
-            self.active_orders.clear()
+            state.active_orders.clear()
 
         # Update market state
-        self.market_id = new_market_id
-        self.strike_price = start_price
-        self.market_start_time = start_time
-        self.market_end_time = end_time
-        self.active_orders = {}
+        state.market_id = new_market_id
+        state.strike_price = start_price
+        state.market_start_time = start_time
+        state.market_end_time = end_time
+        state.active_orders = {}
 
         # Reset dynamic pricing state
-        self.yes_target = DEFAULT_BASE_PROBABILITY
-        self.current_spread = self.base_spread
-        self.yes_target_at_rebalance = DEFAULT_BASE_PROBABILITY
-        self.last_rebalance_time = 0
+        state.yes_target = DEFAULT_BASE_PROBABILITY
+        state.current_spread = self.base_spread
+        state.yes_target_at_rebalance = DEFAULT_BASE_PROBABILITY
+        state.last_rebalance_time = 0
 
         # Fetch settlement and contract addresses
         try:
             markets = self.client.get_markets()
             for market in markets:
                 if market.id == new_market_id:
-                    self.settlement_address = market.settlement_address
+                    state.settlement_address = market.settlement_address
                     try:
                         stats = self.client.get_market(new_market_id)
-                        self.contract_address = stats.contract_address
+                        state.contract_address = stats.contract_address
                     except Exception:
                         pass
                     break
         except Exception as e:
-            print(f"Warning: Could not fetch market addresses: {e}")
+            print(f"[{state.asset}] Warning: Could not fetch market addresses: {e}")
 
         # Ensure gasless USDC approval for this settlement contract
-        if self.settlement_address:
-            self.ensure_settlement_approved(self.settlement_address)
+        if state.settlement_address:
+            self.ensure_settlement_approved(state.settlement_address)
 
         strike_usd = start_price / 1e6 if start_price else 0
         per_side = self.allocation_usdc / 4
-        print(f"Trading market: {new_market_id[:8]}... | Strike: ${strike_usd:,.2f} | ${self.allocation_usdc:.2f} allocation (${per_side:.2f}/side)")
+        print(f"[{state.asset}] Trading market: {new_market_id[:8]}... | Strike: ${strike_usd:,.2f} | ${self.allocation_usdc:.2f} allocation (${per_side:.2f}/side)")
 
     async def monitor_market_transitions(self) -> None:
-        """Background task that polls for new markets."""
+        """Background task that polls for new markets across all assets."""
         POLL_INTERVAL = 5
 
         while self.running:
             try:
-                market_info = await self.get_active_market()
+                for asset in self.assets:
+                    state = self.asset_states[asset]
 
-                if not market_info:
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
+                    try:
+                        market_info = await self.get_active_market(asset)
+                    except Exception as e:
+                        print(f"[{asset}] Market monitor error: {e}")
+                        continue
 
-                new_market_id, start_time, end_time, start_price = market_info
+                    if not market_info:
+                        continue
 
-                if new_market_id != self.market_id:
-                    await self.switch_to_new_market(
-                        new_market_id, start_time, end_time, start_price
-                    )
-                else:
-                    # Update end_time in case it changed
-                    self.market_end_time = end_time
+                    new_market_id, start_time, end_time, start_price = market_info
+
+                    if new_market_id != state.market_id:
+                        await self.switch_to_new_market(
+                            state, new_market_id, start_time, end_time, start_price
+                        )
+                    else:
+                        # Update end_time in case it changed
+                        state.market_end_time = end_time
 
             except Exception as e:
                 print(f"Market monitor error: {e}")
@@ -693,37 +738,39 @@ class MarketMaker:
             await asyncio.sleep(POLL_INTERVAL)
 
     async def claim_resolved_markets(self) -> None:
-        """Background task to claim winnings from resolved markets."""
+        """Background task to claim winnings from resolved markets across all assets."""
         retry_delay = 120
 
         while self.running:
             try:
-                if not self.traded_markets:
+                # Collect all traded markets across all assets
+                all_traded: list[tuple[str, str, AssetState]] = []
+                for state in self.asset_states.values():
+                    for market_id, contract_address in list(state.traded_markets.items()):
+                        all_traded.append((market_id, contract_address, state))
+
+                if not all_traded:
                     await asyncio.sleep(retry_delay)
                     continue
 
-                market_items = list(self.traded_markets.items())
-                resolved_markets = []
-
-                for market_id, contract_address in market_items:
+                for market_id, contract_address, state in all_traded:
                     try:
                         resolution = self.client.get_resolution(market_id)
-                        if resolution and resolution.resolved:
-                            resolved_markets.append((market_id, contract_address))
+                        if not (resolution and resolution.resolved):
+                            continue
                     except Exception:
-                        pass
+                        continue
 
-                for market_id, contract_address in resolved_markets:
                     try:
                         result = self.client.claim_winnings(contract_address)
                         tx_hash = result.get("txHash", result.get("tx_hash", "unknown"))
-                        print(f"Claimed winnings from {market_id[:8]}... TX: {tx_hash}")
-                        del self.traded_markets[market_id]
+                        print(f"[{state.asset}] 💰 Claimed winnings from {market_id[:8]}... TX: {tx_hash}")
+                        del state.traded_markets[market_id]
                     except ValueError as e:
                         if "no winning tokens" in str(e).lower():
-                            del self.traded_markets[market_id]
+                            del state.traded_markets[market_id]
                     except Exception as e:
-                        print(f"Claim error: {e}")
+                        print(f"[{state.asset}] Claim error: {e}")
 
                     await asyncio.sleep(15)
 
@@ -739,9 +786,9 @@ class MarketMaker:
     async def market_making_loop(self) -> None:
         """Price-driven market making loop with WebSocket for trade/book events.
 
-        Primary quoting is probability-based from Pyth BTC price.
-        WebSocket provides trade notifications.
-        Requotes only when YES target shifts by >REBALANCE_THRESHOLD.
+        Primary quoting is probability-based from Pyth prices per asset.
+        WebSocket provides trade notifications for all active markets.
+        Requotes only when YES target shifts by >REBALANCE_THRESHOLD per asset.
         """
         if CLAIM_ONLY_MODE:
             print("CLAIM ONLY MODE - Trading disabled")
@@ -750,7 +797,9 @@ class MarketMaker:
             return
 
         while self.running:
-            if not self.market_id:
+            # Wait until at least one asset has an active market
+            active_assets = [a for a in self.assets if self.asset_states[a].market_id]
+            if not active_assets:
                 await asyncio.sleep(1)
                 continue
 
@@ -758,26 +807,31 @@ class MarketMaker:
 
             try:
                 async with ws.connect() as stream:
-                    await stream.subscribe(self.market_id)
-                    print(f"Subscribed to orderbook updates for {self.market_id[:10]}...")
+                    # Subscribe to all active asset markets
+                    subscribed_markets: dict[str, str] = {}  # market_id -> asset
+                    for asset in active_assets:
+                        state = self.asset_states[asset]
+                        await stream.subscribe(state.market_id)
+                        subscribed_markets[state.market_id] = asset
+                        print(f"[{asset}] Subscribed to orderbook updates for {state.market_id[:10]}...")
 
-                    subscribed_market = self.market_id
                     last_price_check = 0
 
                     # Initial price fetch and quote placement
-                    btc_price = await self.get_current_btc_price()
-                    if btc_price > 0:
-                        self.yes_target, self.current_spread = self.calculate_target_prices_with_time(btc_price)
-                        self.yes_target_at_rebalance = self.yes_target
-                        self.last_rebalance_time = int(time.time())
+                    prices = await self.get_current_prices()
+                    for asset in active_assets:
+                        state = self.asset_states[asset]
+                        current_price = prices.get(asset, 0.0)
+                        if current_price > 0:
+                            state.yes_target, state.current_spread = self.calculate_target_prices_with_time(state, current_price)
+                            state.yes_target_at_rebalance = state.yes_target
+                            state.last_rebalance_time = int(time.time())
 
-                    new_orders = await self.place_multi_level_quotes()
-                    self.active_orders.update(new_orders)
+                        new_orders = await self.place_multi_level_quotes(state)
+                        state.active_orders.update(new_orders)
+
                     last_price_check = time.time()
 
-                    # Use timeout-based recv instead of blocking async for,
-                    # so the loop wakes up every REFRESH_INTERVAL even when
-                    # no WS messages arrive (e.g. quiet market after transition).
                     while self.running:
                         try:
                             messages = await asyncio.wait_for(
@@ -788,34 +842,59 @@ class MarketMaker:
                         except WebSocketError:
                             break  # Connection closed — reconnect
 
-                        # If market changed, resubscribe and place initial quotes
-                        if self.market_id != subscribed_market:
-                            await stream.unsubscribe(subscribed_market)
-                            await stream.subscribe(self.market_id)
-                            subscribed_market = self.market_id
+                        # Check if any asset's market changed — resubscribe as needed
+                        needs_reconnect = False
+                        for asset in self.assets:
+                            state = self.asset_states[asset]
+                            if not state.market_id:
+                                continue
 
-                            # Fetch price and place initial quotes on new market
-                            btc_price = await self.get_current_btc_price()
-                            if btc_price > 0:
-                                self.yes_target, self.current_spread = self.calculate_target_prices_with_time(btc_price)
-                                self.yes_target_at_rebalance = self.yes_target
-                                self.last_rebalance_time = int(time.time())
+                            if state.market_id not in subscribed_markets:
+                                # New market for this asset — need to subscribe
+                                # Find and unsubscribe old market for this asset
+                                old_market_ids = [mid for mid, a in subscribed_markets.items() if a == asset]
+                                for old_mid in old_market_ids:
+                                    await stream.unsubscribe(old_mid)
+                                    del subscribed_markets[old_mid]
 
-                            new_orders = await self.place_multi_level_quotes()
-                            self.active_orders.update(new_orders)
-                            last_price_check = time.time()
-                            continue
+                                await stream.subscribe(state.market_id)
+                                subscribed_markets[state.market_id] = asset
+                                print(f"[{asset}] Subscribed to new market {state.market_id[:10]}...")
+
+                                # Fetch price and place initial quotes on new market
+                                prices = await self.get_current_prices()
+                                current_price = prices.get(asset, 0.0)
+                                if current_price > 0:
+                                    state.yes_target, state.current_spread = self.calculate_target_prices_with_time(state, current_price)
+                                    state.yes_target_at_rebalance = state.yes_target
+                                    state.last_rebalance_time = int(time.time())
+
+                                new_orders = await self.place_multi_level_quotes(state)
+                                state.active_orders.update(new_orders)
 
                         # Process received messages
                         for message in messages:
                             if message.type == "trade":
                                 if hasattr(message, "trade") and message.trade:
                                     trade = message.trade
+                                    # Find which asset this trade belongs to
+                                    trade_asset = None
+                                    for asset in self.assets:
+                                        s = self.asset_states[asset]
+                                        if s.market_id and hasattr(trade, 'market_id') and trade.market_id == s.market_id:
+                                            trade_asset = asset
+                                            break
+                                    if not trade_asset:
+                                        # Try to match via subscribed_markets
+                                        for mid, a in subscribed_markets.items():
+                                            trade_asset = a
+                                            break
+
                                     price_pct = trade.price / 10000
                                     shares = trade.size / 1_000_000
                                     outcome_str = "YES" if trade.outcome == 0 else "NO"
                                     is_ours = trade.buyer.lower() == self.client.address.lower()
-                                    prefix = "  -> Our fill" if is_ours else "Trade"
+                                    prefix = f"  [{trade_asset or '?'}] -> Our fill" if is_ours else f"[{trade_asset or '?'}] Trade"
                                     print(f"{prefix}: {shares:.2f} {outcome_str} @ {price_pct:.2f}%")
 
                         # Periodic price check and rebalance evaluation
@@ -823,28 +902,37 @@ class MarketMaker:
                         if now - last_price_check >= REFRESH_INTERVAL:
                             last_price_check = now
 
-                            btc_price = await self.get_current_btc_price()
-                            if btc_price > 0:
-                                new_yes_target, new_spread = self.calculate_target_prices_with_time(btc_price)
-                                self.yes_target = new_yes_target
-                                self.current_spread = new_spread
+                            prices = await self.get_current_prices()
+
+                            for asset in self.assets:
+                                state = self.asset_states[asset]
+                                if not state.market_id:
+                                    continue
+
+                                current_price = prices.get(asset, 0.0)
+                                if current_price <= 0:
+                                    continue
+
+                                new_yes_target, new_spread = self.calculate_target_prices_with_time(state, current_price)
+                                state.yes_target = new_yes_target
+                                state.current_spread = new_spread
 
                                 # Check rebalance threshold
-                                target_diff = abs(new_yes_target - self.yes_target_at_rebalance)
-                                time_since_rebalance = int(now) - self.last_rebalance_time
+                                target_diff = abs(new_yes_target - state.yes_target_at_rebalance)
+                                time_since_rebalance = int(now) - state.last_rebalance_time
 
                                 if (target_diff > REBALANCE_THRESHOLD
                                         and time_since_rebalance >= MIN_REBALANCE_INTERVAL):
-                                    strike_usd = self.strike_price / 1e6
-                                    dev_pct = ((btc_price - strike_usd) / strike_usd) * 100 if strike_usd > 0 else 0
+                                    strike_usd = state.strike_price / 1e6
+                                    dev_pct = ((current_price - strike_usd) / strike_usd) * 100 if strike_usd > 0 else 0
                                     print(
-                                        f"Rebalance: BTC ${btc_price:,.2f} ({dev_pct:+.2f}% from ${strike_usd:,.2f}) | "
-                                        f"YES {self.yes_target_at_rebalance:.1%} -> {new_yes_target:.1%} "
+                                        f"[{asset}] Rebalance: ${current_price:,.2f} ({dev_pct:+.2f}% from ${strike_usd:,.2f}) | "
+                                        f"YES {state.yes_target_at_rebalance:.1%} -> {new_yes_target:.1%} "
                                         f"(delta {target_diff:.1%}) | Spread {new_spread:.1%}"
                                     )
-                                    await self.update_quotes()
-                                    self.yes_target_at_rebalance = new_yes_target
-                                    self.last_rebalance_time = int(now)
+                                    await self.update_quotes(state)
+                                    state.yes_target_at_rebalance = new_yes_target
+                                    state.last_rebalance_time = int(now)
 
             except WebSocketError as e:
                 print(f"WebSocket error: {e}")
@@ -860,15 +948,19 @@ class MarketMaker:
         trading_task = asyncio.create_task(self.market_making_loop())
 
         try:
-            if not self.market_id:
-                market_info = await self.get_active_market()
-                if market_info:
-                    market_id, start_time, end_time, start_price = market_info
-                    await self.switch_to_new_market(
-                        market_id, start_time, end_time, start_price
-                    )
-                else:
-                    print("Waiting for BTC market...")
+            # Initialize all asset markets
+            for asset in self.assets:
+                try:
+                    market_info = await self.get_active_market(asset)
+                    if market_info:
+                        market_id, start_time, end_time, start_price = market_info
+                        await self.switch_to_new_market(
+                            self.asset_states[asset], market_id, start_time, end_time, start_price
+                        )
+                    else:
+                        print(f"[{asset}] Waiting for market...")
+                except Exception as e:
+                    print(f"[{asset}] Failed to get initial market: {e}")
 
             while self.running:
                 await asyncio.sleep(1)
@@ -886,13 +978,13 @@ class MarketMaker:
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Turbine market maker for BTC 15-minute prediction markets"
+        description="Turbine market maker for BTC, ETH, and SOL 15-minute prediction markets"
     )
     parser.add_argument(
         "-a", "--allocation",
         type=float,
         default=DEFAULT_ALLOCATION_USDC,
-        help=f"Total USDC allocation per market, split across all sides and levels (default: ${DEFAULT_ALLOCATION_USDC})"
+        help=f"Total USDC allocation per asset per market, split across all sides and levels (default: ${DEFAULT_ALLOCATION_USDC})"
     )
     parser.add_argument(
         "--spread",
@@ -912,7 +1004,20 @@ async def main():
         default=DEFAULT_PRICE_SENSITIVITY,
         help=f"Probability shift per 1%% price move (default: {DEFAULT_PRICE_SENSITIVITY})"
     )
+    parser.add_argument(
+        "--assets",
+        type=str,
+        default=",".join(SUPPORTED_ASSETS),
+        help=f"Comma-separated list of assets to trade (default: {','.join(SUPPORTED_ASSETS)})"
+    )
     args = parser.parse_args()
+
+    # Parse and validate assets
+    assets = [a.strip().upper() for a in args.assets.split(",")]
+    for asset in assets:
+        if asset not in PYTH_FEED_IDS:
+            print(f"Error: Unsupported asset '{asset}'. Supported: {', '.join(SUPPORTED_ASSETS)}")
+            return
 
     private_key = os.environ.get("TURBINE_PRIVATE_KEY")
     if not private_key:
@@ -934,17 +1039,29 @@ async def main():
     print(f"{'='*60}")
     print(f"Wallet: {client.address}")
     print(f"Chain: {CHAIN_ID}")
+    print(f"Assets: {', '.join(assets)}")
     per_side = args.allocation / 4
-    print(f"Allocation: ${args.allocation:.2f} USDC (${per_side:.2f}/side x 4 sides, {args.levels} levels each)")
+    print(f"Allocation: ${args.allocation:.2f} USDC per asset (${per_side:.2f}/side x 4 sides, {args.levels} levels each)")
     print(f"Spread: {args.spread * 100:.1f}% (tightens to {MIN_SPREAD * 100:.1f}% at expiry)")
     print(f"Sensitivity: {args.sensitivity} per 1% move (x{1 + DEFAULT_TIME_DECAY_FACTOR:.0f} at expiry)")
     print(f"Rebalance: >{REBALANCE_THRESHOLD * 100:.0f}% target shift, min {MIN_REBALANCE_INTERVAL}s apart")
     print(f"Lambda: {DEFAULT_GEOMETRIC_LAMBDA} (geometric distribution)")
     print(f"USDC approval: gasless (one-time max permit per settlement)")
+    try:
+        usdc_balance = client.get_usdc_balance()
+        balance_display = usdc_balance / 1_000_000
+        print(f"USDC balance: ${balance_display:.2f}")
+        min_needed = args.allocation * len(assets)
+        if balance_display < min_needed:
+            print(f"⚠️  Warning: Balance (${balance_display:.2f}) may be low for {len(assets)} assets x ${args.allocation:.2f}")
+            print(f"   Fund your wallet: {client.address}")
+    except Exception as e:
+        print(f"USDC balance: unknown ({e})")
     print(f"{'='*60}\n")
 
     bot = MarketMaker(
         client,
+        assets=assets,
         allocation_usdc=args.allocation,
         spread=args.spread,
         num_levels=args.levels,
