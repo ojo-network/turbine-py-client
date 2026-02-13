@@ -1225,6 +1225,46 @@ class TurbineClient:
 
         return int(result.hex(), 16)
 
+    def get_usdc_balance(self, owner: Optional[str] = None) -> int:
+        """Get the USDC balance for an address.
+
+        Args:
+            owner: The address to check. Defaults to signer address.
+
+        Returns:
+            The USDC balance (raw, 6 decimals).
+        """
+        from web3 import Web3
+
+        owner = owner or (self._signer.address if self._signer else None)
+        if not owner:
+            raise ValueError("Owner address required (no signer configured)")
+
+        usdc_address = self._chain_config.usdc_address
+
+        # Get RPC URL
+        rpc_urls = {
+            137: "https://polygon-rpc.com",
+            43114: "https://api.avax.network/ext/bc/C/rpc",
+            84532: "https://sepolia.base.org",
+        }
+        rpc_url = rpc_urls.get(self._chain_id)
+        if not rpc_url:
+            raise ValueError(f"No RPC URL for chain {self._chain_id}")
+
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+        # balanceOf(address) -> uint256
+        balance_selector = "0x70a08231"
+        balance_data = balance_selector + owner[2:].lower().zfill(64)
+
+        result = w3.eth.call({
+            "to": usdc_address,
+            "data": balance_data,
+        })
+
+        return int(result.hex(), 16)
+
     def sign_usdc_permit(
         self,
         value: int,
