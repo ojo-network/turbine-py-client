@@ -8,6 +8,7 @@ from turbine_client.client import TurbineClient
 from turbine_client.types import (
     AssetPrice,
     ChainStats,
+    ClaimablePosition,
     FailedClaim,
     FailedTrade,
     Holder,
@@ -48,6 +49,7 @@ __all__ = [
     # Types
     "AssetPrice",
     "ChainStats",
+    "ClaimablePosition",
     "FailedClaim",
     "FailedTrade",
     "Holder",

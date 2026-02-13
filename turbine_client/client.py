@@ -13,6 +13,7 @@ from turbine_client.order_builder import OrderBuilder
 from turbine_client.signer import Signer, create_signer
 from turbine_client.types import (
     AssetPrice,
+    ClaimablePosition,
     FailedClaim,
     FailedTrade,
     Holder,
@@ -743,6 +744,79 @@ class TurbineClient:
         self._require_auth()
         response = self._http.get(ENDPOINTS["user_stats"], authenticated=True)
         return UserStats.from_dict(response)
+
+    def get_claimable_positions(
+        self,
+        address: Optional[str] = None,
+        verify: bool = True,
+    ) -> Dict[str, Any]:
+        """Get resolved markets where the user has winning tokens to claim.
+
+        By default, fast DB-only query (no RPC calls). Pass verify=True to
+        check on-chain balances and backfill already-claimed positions.
+
+        Args:
+            address: User address. Defaults to the signer's address.
+            verify: If True, verify each position on-chain and backfill
+                already-claimed ones. Slower but handles pre-fix data.
+
+        Returns:
+            Dict with 'claimable' (list of ClaimablePosition), 'count', and 'totalPayout'.
+
+        Raises:
+            AuthenticationError: If no auth is configured.
+            ValueError: If no address provided and no signer configured.
+        """
+        self._require_auth()
+        if address is None:
+            self._require_signer()
+            address = self._signer.address
+
+        endpoint = ENDPOINTS["user_claimable"].format(address=address)
+        params = {"chain_id": str(self._chain_id)}
+        if verify:
+            params["verify"] = "true"
+        response = self._http.get(
+            endpoint, params=params, authenticated=True
+        )
+        positions = [
+            ClaimablePosition.from_dict(p)
+            for p in response.get("claimable", [])
+        ]
+        return {
+            "claimable": positions,
+            "count": response.get("count", 0),
+            "totalPayout": response.get("totalPayout", "0.00"),
+        }
+
+    def claim_all_winnings(self) -> Dict[str, Any]:
+        """Discover and claim all winnings in one call.
+
+        Uses the /claimable endpoint for fast discovery (DB-only, no RPC),
+        then batch claims all found markets.
+
+        Returns:
+            The relayer response with txHash on success.
+
+        Raises:
+            ValueError: If no claimable positions found.
+            AuthenticationError: If no signer is configured.
+        """
+        self._require_signer()
+        self._require_auth()
+
+        result = self.get_claimable_positions(verify=True)
+        positions = result["claimable"]
+
+        if not positions:
+            raise ValueError("No claimable positions found")
+
+        print(f"Found {len(positions)} claimable market(s) — total payout: ${result['totalPayout']}")
+        for p in positions:
+            print(f"  {p.contract_address}: {p.outcome_label} won, ${p.payout}")
+
+        market_addresses = [p.contract_address for p in positions]
+        return self.batch_claim_winnings(market_addresses)
 
     # =========================================================================
     # Relayer Endpoints (Gasless Operations)
@@ -1643,6 +1717,7 @@ class TurbineClient:
 
         w3 = Web3(Web3.HTTPProvider(rpc_url))
         redemptions = []
+        nonce_tracker = {}  # {ctf_address: next_nonce} — incremented locally per redemption
 
         for market_address in market_contract_addresses:
             market_address = Web3.to_checksum_address(market_address)
@@ -1703,8 +1778,12 @@ class TurbineClient:
                 print(f"Skipping {market_address}: no winning tokens")
                 continue
 
-            # Get nonce and sign
-            nonce = self._get_contract_nonce(owner, ctf_address)
+            # Get nonce and sign — track per-CTF nonces locally to avoid
+            # stale nonce when batching multiple redemptions through the same CTF
+            if ctf_address not in nonce_tracker:
+                nonce_tracker[ctf_address] = self._get_contract_nonce(owner, ctf_address)
+            nonce = nonce_tracker[ctf_address]
+            nonce_tracker[ctf_address] = nonce + 1
             deadline = int(time.time()) + 3600
             index_sets = [1 if winning_outcome == 0 else 2]
 
