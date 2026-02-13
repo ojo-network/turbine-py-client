@@ -420,6 +420,17 @@ class PriceActionBot:
             print(f"Order too small: ${self.order_size_usdc:.2f} at {price/10000:.1f}%")
             return
 
+        # Check USDC balance before trading
+        try:
+            usdc_balance = self.client.get_usdc_balance()
+            balance_usdc = usdc_balance / 1_000_000
+            if balance_usdc < self.order_size_usdc:
+                print(f"⚠️  Insufficient USDC balance: ${balance_usdc:.2f} < ${self.order_size_usdc:.2f} order size")
+                print(f"   Fund wallet: {self.client.address}")
+                return
+        except Exception:
+            pass  # Don't block trading if balance check fails
+
         try:
             # Create order without per-trade permit (using max permit allowance)
             order = self.client.create_limit_buy(
@@ -454,7 +465,15 @@ class PriceActionBot:
 
                     if my_failed:
                         failed = my_failed[0]
-                        print(f"✗ Order FAILED: {failed.reason}")
+                        reason = failed.reason
+                        if "simulation" in reason.lower():
+                            try:
+                                usdc_balance = self.client.get_usdc_balance()
+                                balance_usdc = usdc_balance / 1_000_000
+                                reason += f" (USDC balance: ${balance_usdc:.2f})"
+                            except Exception:
+                                pass
+                        print(f"✗ Order FAILED: {reason}")
                         return
                 except Exception as e:
                     print(f"  Warning: Could not check failed trades: {e}")
@@ -773,6 +792,15 @@ async def main():
     print(f"Order size: ${args.order_size:.2f} USDC")
     print(f"Max position: ${args.max_position:.2f} USDC per market")
     print(f"USDC approval: gasless (one-time max permit per settlement)")
+    try:
+        usdc_balance = client.get_usdc_balance()
+        balance_display = usdc_balance / 1_000_000
+        print(f"USDC balance: ${balance_display:.2f}")
+        if balance_display < args.order_size:
+            print(f"⚠️  Warning: Balance (${balance_display:.2f}) is less than order size (${args.order_size:.2f})")
+            print(f"   Fund your wallet: {client.address}")
+    except Exception as e:
+        print(f"USDC balance: unknown ({e})")
     print(f"{'='*60}\n")
 
     bot = PriceActionBot(
