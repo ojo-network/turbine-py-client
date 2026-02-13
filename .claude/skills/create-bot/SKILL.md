@@ -6,11 +6,11 @@ argument-hint: "[algorithm]"
 
 # Create a Turbine Trading Bot
 
-Here's what you're helping the user build: **a Python file that automatically trades on Turbine's Bitcoin prediction markets.**
+Here's what you're helping the user build: **a Python file that automatically trades on Turbine's BTC, ETH, and SOL prediction markets.**
 
-Every 15 minutes, Turbine opens a new market asking "Will BTC be above $X at [time]?" The user's bot watches these markets and places trades — buying YES shares if it thinks BTC will be above the strike, or NO shares if it thinks BTC will be below. When the market resolves 15 minutes later, winning shares pay out $1.00.
+Every 15 minutes, Turbine opens new markets asking "Will BTC/ETH/SOL be above $X at [time]?" The user's bot watches these markets and places trades — buying YES shares if it thinks the price will be above the strike, or NO shares if it thinks it will be below. When the market resolves 15 minutes later, winning shares pay out $1.00.
 
-**A trading bot is a single Python file.** When you run `python my_bot.py`, it connects to Turbine, starts watching the current BTC market, and executes trades according to its strategy. It handles everything automatically — market rotation every 15 minutes, gasless USDC approval, order management, and claiming winnings.
+**A trading bot is a single Python file.** When you run `python my_bot.py`, it connects to Turbine, starts watching the current markets for all configured assets, and executes trades according to its strategy. It handles everything automatically — market rotation every 15 minutes, gasless USDC approval, order management, and claiming winnings. Use `--assets BTC,ETH,SOL` to choose which assets to trade (default: all three).
 
 **Different strategies = different Python files.** A Price Action bot and a Momentum bot are two separate files. Each one implements its own signal logic (the "should I buy YES, buy NO, or hold?" decision) while sharing the same underlying infrastructure for connecting to Turbine, managing orders, and handling the market lifecycle.
 
@@ -82,11 +82,11 @@ Before jumping into algorithm selection, make sure the user understands what the
 
 Explain clearly:
 
-> **Here's what we're building:** A Python bot that trades on Turbine's Bitcoin prediction markets.
+> **Here's what we're building:** A Python bot that trades on Turbine's BTC, ETH, and SOL prediction markets.
 >
-> Every 15 minutes, a new market opens: *"Will BTC be above $X?"* Your bot will decide whether to buy YES (bet BTC stays above) or NO (bet BTC goes below), based on a strategy you choose. If your bot is right, each share pays out $1.00. If it's wrong, you lose what you paid.
+> Every 15 minutes, new markets open: *"Will BTC/ETH/SOL be above $X?"* Your bot will decide whether to buy YES (bet price stays above) or NO (bet price goes below), based on a strategy you choose. If your bot is right, each share pays out $1.00. If it's wrong, you lose what you paid.
 >
-> The bot handles everything automatically — connecting to Turbine, placing trades, switching to new markets every 15 minutes, and claiming winnings. You just pick the strategy and run it.
+> The bot handles everything automatically — connecting to Turbine, placing trades on all configured assets simultaneously, switching to new markets every 15 minutes, and claiming winnings. You just pick the strategy and run it.
 >
 > Each strategy is a separate Python file. You can create multiple bots with different strategies and compare how they perform.
 
@@ -131,17 +131,17 @@ Each algorithm answers the same core question differently: *"Given the current m
 
 | # | Algorithm | How It Decides | Risk | Best For | Reference File |
 |---|-----------|---------------|------|----------|----------------|
-| 1 | **Price Action** (recommended) | Compares live BTC price (Pyth) to strike price. Above strike → YES, below → NO. | Medium | Beginners. Signal aligns with how markets resolve. | `price_action_bot.py` |
+| 1 | **Price Action** (recommended) | Compares live asset price (Pyth) to strike price. Above strike → YES, below → NO. Trades BTC, ETH, SOL simultaneously. | Medium | Beginners. Signal aligns with how markets resolve. | `price_action_bot.py` |
 | 2 | **Simple Spread** | Places bid + ask around mid-price with fixed spread. Profits from the spread. | Medium | Learning market making basics. | `market_maker.py` |
 | 3 | **Inventory-Aware** | Like Simple Spread, but skews quotes to reduce accumulated position. | Lower | Balanced exposure, less directional risk. | `market_maker.py` (modified) |
 | 4 | **Momentum** | Detects which direction recent trades are flowing. Follows the trend. | Higher | Trending markets, breakouts. | `price_action_bot.py` (modified) |
 | 5 | **Mean Reversion** | Fades large moves — buys after dips, sells after spikes. Bets on reversion. | Higher | Range-bound markets, overreactions. | `price_action_bot.py` (modified) |
 | 6 | **Probability-Weighted** | Bets that prices far from 50% will revert toward uncertainty. | Medium | Markets with overconfident pricing. | `price_action_bot.py` (modified) |
 
-**Why Price Action is recommended for beginners:** It uses Pyth Network — the same oracle Turbine uses to resolve markets. The bot's trading signal is directly aligned with how winners are determined. It's the simplest to understand and the most intuitive to reason about.
+**Why Price Action is recommended for beginners:** It uses Pyth Network — the same oracle Turbine uses to resolve markets. The bot's trading signal is directly aligned with how winners are determined. It's the simplest to understand and the most intuitive to reason about. It trades all three assets (BTC, ETH, SOL) by default, configurable via `--assets`.
 
 > **For users new to PMs:** The algorithm table above is meaningless without PM context. Don't just show the table — translate each strategy into plain English tied to what they now understand:
-> - **Price Action:** "Checks the live BTC price. If BTC is above the strike, buy YES. If below, buy NO. The simplest possible logic."
+> - **Price Action:** "Checks the live price of each asset (BTC, ETH, SOL). If the price is above the strike, buy YES. If below, buy NO. The simplest possible logic."
 > - **Momentum:** "Watches what other traders are doing. If lots of people are buying YES, follow the crowd."
 > - **Mean Reversion:** "If the price spikes in one direction, bet it comes back. Contrarian approach."
 >
@@ -274,7 +274,8 @@ After generating, walk the user through the key parameters they can tweak:
 
 **IMPORTANT — use exactly these defaults. Do not increase them:**
 - `--order-size` — **$1.00** (one dollar per trade)
-- `--max-position` — **$5.00** (five dollars maximum at risk per market)
+- `--max-position` — **$5.00** (five dollars maximum at risk per asset per market)
+- `--assets` — **BTC,ETH,SOL** (which assets to trade; comma-separated)
 
 This is real USDC on Polygon mainnet. Keep defaults small. The user can always increase once they see the bot working and understand the risk.
 
