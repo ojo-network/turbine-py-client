@@ -1717,6 +1717,7 @@ class TurbineClient:
 
         w3 = Web3(Web3.HTTPProvider(rpc_url))
         redemptions = []
+        nonce_tracker = {}  # {ctf_address: next_nonce} — incremented locally per redemption
 
         for market_address in market_contract_addresses:
             market_address = Web3.to_checksum_address(market_address)
@@ -1777,8 +1778,12 @@ class TurbineClient:
                 print(f"Skipping {market_address}: no winning tokens")
                 continue
 
-            # Get nonce and sign
-            nonce = self._get_contract_nonce(owner, ctf_address)
+            # Get nonce and sign — track per-CTF nonces locally to avoid
+            # stale nonce when batching multiple redemptions through the same CTF
+            if ctf_address not in nonce_tracker:
+                nonce_tracker[ctf_address] = self._get_contract_nonce(owner, ctf_address)
+            nonce = nonce_tracker[ctf_address]
+            nonce_tracker[ctf_address] = nonce + 1
             deadline = int(time.time()) + 3600
             index_sets = [1 if winning_outcome == 0 else 2]
 
