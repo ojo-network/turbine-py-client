@@ -73,6 +73,8 @@ Turbine currently runs on **Polygon mainnet**. Your wallet needs real USDC (mini
 
 The default bot sizes are small ($0.10 per trade), so $10 lasts a long time while you're learning.
 
+> **Minimum order size:** Taker orders (orders that fill immediately) must be at least **$1 USDC** (size × price ≥ $1). Maker orders (resting limit orders) have no minimum. This is enforced by the API.
+
 **If you already have crypto:**
 - Send USDC to your wallet address on the Polygon network
 - Bridge from another chain using [Jumper](https://jumper.exchange) if needed

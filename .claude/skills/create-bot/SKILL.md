@@ -273,16 +273,18 @@ After generating, walk the user through the key parameters they can tweak:
 **Universal parameters (all algorithms):**
 
 **IMPORTANT — use exactly these defaults. Do not increase them:**
-- `--order-size` — **$0.10** (ten cents per trade)
-- `--max-position` — **$1.00** (one dollar maximum at risk per market)
+- `--order-size` — **$1.00** (one dollar per trade)
+- `--max-position` — **$5.00** (five dollars maximum at risk per market)
 
-This is real USDC on Polygon mainnet. Keep defaults tiny. The user can always increase once they see the bot working and understand the risk.
+This is real USDC on Polygon mainnet. Keep defaults small. The user can always increase once they see the bot working and understand the risk.
 
-Tell them: "I've set these small on purpose — this is real money. Your bot risks ten cents per trade. Start by watching how it behaves, then increase the amounts once you're comfortable."
+> **Minimum taker order size:** The Turbine API enforces a **$1 minimum on taker orders** (size × price ≥ $1 USDC). Orders below this threshold will be rejected. Maker orders (resting limit orders) are exempt. Since directional bots typically place taker orders, the default order size must be at least $1.
+
+Tell them: "I've set these conservatively — this is real money. Your bot risks one dollar per trade. Start by watching how it behaves, then increase the amounts once you're comfortable."
 
 > **For users new to PMs:** Explain what these numbers mean in context:
-> - "**Order size** is how much you bet each time — ten cents. If the trade wins, you get back more than that. If it loses, you lose the ten cents."
-> - "**Max position** is the most your bot can have on the line at once. Even if the bot places many trades, it won't risk more than $1 total in any single market."
+> - "**Order size** is how much you bet each time — one dollar. If the trade wins, you get back more than that. If it loses, you lose the dollar."
+> - "**Max position** is the most your bot can have on the line at once. Even if the bot places many trades, it won't risk more than $5 total in any single market."
 > - "With $10 in your wallet, you can run the bot for a long time at these sizes."
 
 **Algorithm-specific parameters:**

@@ -173,6 +173,8 @@ Turbine currently runs on **Polygon mainnet**. The testnet (Base Sepolia) is not
 
 No native gas tokens (MATIC, AVAX) are needed. Everything is gasless. Default bot sizes are small ($0.10 per trade) so $10 lasts a long time while learning.
 
+> **Note:** Taker orders (orders that fill immediately against resting orders) must be at least **$1 USDC** (size × price ≥ $1). Maker orders (resting limit orders that provide liquidity) have no minimum. The API enforces this — the SDK does not.
+
 ### 4. Build a Bot
 The fastest path is the `/market-maker` skill — it walks the user through algorithm selection and generates a complete trading bot.
 
@@ -230,6 +232,11 @@ Outcome.YES = 0, Outcome.NO = 1
 - **Prices:** 0 to 1,000,000 = 0% to 100% (6 decimals). 500,000 = 50%.
 - **Sizes:** 6 decimals. 1,000,000 = 1 share.
 - **Strike price:** `quick_market.start_price / 1e6` = USD price. (Note: the README says `/1e8` in one place — that is wrong. Always use `/1e6`.)
+
+### Minimum Order Size (Taker Orders)
+- **$1 minimum on taker orders.** The total order cost (size × price) must be ≥ $1 USDC. The API will reject taker orders below this threshold.
+- **Makers are exempt** — maker orders (resting orders that provide liquidity) can be any size.
+- This is enforced API-side, not in the SDK. If a user gets a rejection on a small taker order, this is why.
 
 ### Common API Calls
 ```python
