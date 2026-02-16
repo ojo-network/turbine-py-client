@@ -1391,6 +1391,38 @@ async def main():
         print(f"Balance:     unknown ({e})")
     print(f"{'='*60}\n")
 
+    # --- Pre-approve USDC for known settlement contracts ---
+    # External market makers often hit silent order failures because USDC
+    # hasn't been approved for the settlement contract. We check and approve
+    # upfront so the trading loop can start immediately without issues.
+    print("Checking USDC approvals for active markets...")
+    for asset in assets:
+        try:
+            response = client._http.get(f"/api/v1/quick-markets/{asset}")
+            qm_data = response.get("quickMarket")
+            if not qm_data:
+                continue
+            qm = QuickMarket.from_dict(qm_data)
+            # Look up the settlement address from the full market info
+            try:
+                markets = client.get_markets()
+                for m in markets:
+                    if m.id == qm.market_id and m.settlement_address:
+                        current_allowance = client.get_usdc_allowance(spender=m.settlement_address)
+                        min_allowance = (2**256 - 1) // 2
+                        if current_allowance < min_allowance:
+                            print(f"  [{asset}] USDC allowance insufficient for {m.settlement_address[:10]}... — approving...")
+                            client.approve_usdc_for_settlement(m.settlement_address)
+                            print(f"  [{asset}] USDC approved ✓")
+                        else:
+                            print(f"  [{asset}] USDC already approved ✓")
+                        break
+            except Exception as e:
+                print(f"  [{asset}] Could not pre-approve: {e}")
+        except Exception as e:
+            print(f"  [{asset}] Could not fetch market for pre-approval: {e}")
+    print()
+
     bot = MarketMaker(
         client,
         assets=assets,
