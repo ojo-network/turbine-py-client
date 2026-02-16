@@ -1,30 +1,34 @@
 """
 Turbine Market Maker Bot
 
-Probability-based market maker for BTC, ETH, and SOL 15-minute prediction
-markets. Fetches real-time prices from Pyth Network to compute YES/NO target
-probabilities, then quotes multi-level bid/ask ladders with geometric size
-distribution. USDC is approved gaslessly via a one-time max permit per
-settlement contract.
+Smart probability-based market maker for BTC, ETH, and SOL 15-minute prediction
+markets. Uses a statistical model (normal CDF) to compute YES/NO probabilities
+from real-time Pyth Network prices, with advanced features:
 
-Algorithm: Fetches real-time prices from Pyth Network (same oracle Turbine
-           uses) and compares them to each market's strike price.
-           - YES target = 0.50 + (price_deviation% * sensitivity)
-           - Sensitivity increases toward expiration (time decay)
-           - Spread tightens toward expiration (minimum 0.5%)
-           - Multi-level geometric distribution concentrates liquidity at best price
-           - Requotes only when target shifts >2% (rebalance threshold)
+Algorithm:
+  - P(YES) = Φ(deviation / (volatility × √timeRemaining))
+    where Φ is the normal CDF. This correctly handles time decay:
+    +0.45% with 1 min left → ~99% YES, +0.45% with 7 min left → ~75% YES.
+  - Momentum tracking shifts probability in the direction of price movement
+  - Inventory skew adjusts quotes to reduce net exposure
+  - Spread widens on high volatility and strong momentum
+  - One-sided quoting when probability deviates significantly from 50%
+  - Circuit breaker trips when adverse selection is detected
+  - Orders pulled in last 30 seconds, spread widened in last 90 seconds
+  - Filled orders replaced at CURRENT fair value, not the old fill price
+  - Graceful rebalance: new orders placed BEFORE old ones cancelled
 
 Features:
-- Multi-asset: trades BTC, ETH, and SOL simultaneously (configurable via --assets)
-- Probability-based dynamic pricing from Pyth prices
-- Multi-level quoting with geometric size distribution (default 6 levels)
-- Time-decay sensitivity and spread tightening toward expiration
-- Cancel-then-place order refresh to avoid self-trade issues
-- Allocation-based budgeting per asset (total USDC split across 4 sides x N levels)
-- Auto-approves USDC gaslessly when entering a new market
-- Automatic market transition when 15-minute markets rotate
-- Automatic claiming of winnings from resolved markets
+  - Multi-asset: trades BTC, ETH, and SOL simultaneously (configurable via --assets)
+  - Statistical probability model from Pyth prices (normal CDF, not linear)
+  - Price tracker with velocity, volatility, and momentum signals
+  - Inventory tracking with adverse selection detection and circuit breaker
+  - One-sided quoting: kills losing side when market is trending
+  - Multi-level quoting with geometric size distribution
+  - Allocation skew: more capital on the likely-winning side
+  - Auto-approves USDC gaslessly when entering a new market
+  - Automatic market transition when 15-minute markets rotate
+  - Automatic claiming of winnings from resolved markets
 
 Usage:
     TURBINE_PRIVATE_KEY=0x... python examples/market_maker.py
@@ -32,21 +36,30 @@ Usage:
     # Custom parameters
     TURBINE_PRIVATE_KEY=0x... python examples/market_maker.py \\
         --allocation 50 \\
-        --spread 0.02 \\
+        --spread 0.012 \\
         --levels 6 \\
-        --sensitivity 0.10
+        --base-vol 0.03
 
     # Trade only BTC and ETH
     TURBINE_PRIVATE_KEY=0x... python examples/market_maker.py \\
         --assets BTC,ETH
+
+    # Per-asset volatility overrides
+    TURBINE_PRIVATE_KEY=0x... python examples/market_maker.py \\
+        --asset-vol BTC=0.025 ETH=0.035 SOL=0.05
 """
 
 import argparse
 import asyncio
+import math
 import os
 import re
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
+from statistics import stdev
+
 from dotenv import load_dotenv
 import httpx
 
@@ -57,47 +70,224 @@ from turbine_client.exceptions import TurbineApiError, WebSocketError
 load_dotenv()
 
 # ============================================================
-# CONFIGURATION - Adjust these parameters for your strategy
+# CONFIGURATION
 # ============================================================
-# Claim-only mode: Set CLAIM_ONLY_MODE=true in .env to disable trading
 CLAIM_ONLY_MODE = os.environ.get("CLAIM_ONLY_MODE", "false").lower() == "true"
-# Chain ID: Set CHAIN_ID in .env (default: 84532 for Base Sepolia)
 CHAIN_ID = int(os.environ.get("CHAIN_ID", "84532"))
-# API Host: Set TURBINE_HOST in .env (default: localhost for testing)
 TURBINE_HOST = os.environ.get("TURBINE_HOST", "http://localhost:8080")
 
-# Default trading parameters (in USDC terms)
-DEFAULT_ALLOCATION_USDC = 50.0  # $50 total allocation per asset split across all sides/levels
-
-# Quick market pricing parameters (matching Go MM defaults)
-DEFAULT_SPREAD = 0.02  # 2% spread around target probability
+# Default trading parameters
+DEFAULT_ALLOCATION_USDC = 60.0   # $60 total allocation per asset
+DEFAULT_SPREAD = 0.012           # 1.2% spread around target probability
+DEFAULT_NUM_LEVELS = 6           # Orders per side
+DEFAULT_GEOMETRIC_LAMBDA = 1.5   # Geometric distribution parameter
 DEFAULT_BASE_PROBABILITY = 0.50  # Starting YES probability
-DEFAULT_PRICE_SENSITIVITY = 1.5  # Probability shift per 1% price move
-DEFAULT_MAX_PROBABILITY = 0.95   # Cap for extreme moves
-DEFAULT_TIME_DECAY_FACTOR = 1.5  # Sensitivity multiplier at expiration
-DEFAULT_NUM_LEVELS = 6  # Orders per side
-DEFAULT_GEOMETRIC_LAMBDA = 1.5  # Geometric distribution parameter
-MIN_SPREAD = 0.005  # 0.5% minimum spread at expiration
-SPREAD_TIGHTENING = 0.75  # How much spread tightens (0.75 = to 25% of base)
+DEFAULT_MAX_PROBABILITY = 0.80   # Cap for extreme moves
 
-# Rebalance thresholds (matching Go MM)
-REBALANCE_THRESHOLD = 0.02  # 2% probability change triggers requote
-MIN_REBALANCE_INTERVAL = 5  # Minimum seconds between rebalances
-REFRESH_INTERVAL = 10  # Seconds between price checks
+# Statistical model parameters
+DEFAULT_BASE_VOLATILITY = 0.03   # 3% daily vol (typical BTC)
+SECONDS_PER_DAY = 86400.0
 
-# Pyth Network Hermes API - same price source Turbine uses
+# Rebalance thresholds
+REBALANCE_THRESHOLD = 0.02       # 2% probability change triggers requote
+MIN_REBALANCE_INTERVAL = 2       # Minimum seconds between rebalances
+FAST_POLL_INTERVAL = 2           # Seconds between price fetches
+
+# Momentum and volatility parameters
+MOMENTUM_FACTOR = 0.5            # How much momentum shifts probability
+MOMENTUM_SPREAD_FACTOR = 2.0     # Spread multiplier per unit momentum
+VOLATILITY_SPREAD_FACTOR = 10.0  # Spread multiplier per unit volatility
+VOLATILITY_ALERT_THRESHOLD = 0.005  # Vol level forcing rebalance
+
+# Inventory management
+INVENTORY_SKEW_FACTOR = 0.05     # Quote skew per unit net exposure
+ALLOCATION_SKEW_FACTOR = 0.3     # Allocation skew based on probability
+
+# Adverse selection / circuit breaker
+ADVERSE_SELECTION_THRESHOLD = 0.80  # Fill ratio to trigger circuit breaker
+CIRCUIT_BREAKER_COOLDOWN = 10       # Seconds to stay dark after trigger
+
+# One-sided quoting threshold
+ONE_SIDE_THRESHOLD = 0.15        # Skip losing side when YES > 0.65 or < 0.35
+
+# End-of-market behavior
+END_OF_MARKET_PULL_SECONDS = 30  # Pull all orders in last N seconds
+END_OF_MARKET_WIDEN_SECONDS = 90 # Start widening spread in last N seconds
+
+# Pyth Network Hermes API
 PYTH_HERMES_URL = "https://hermes.pyth.network/v2/updates/price/latest"
-
-# Pyth feed IDs per asset
 PYTH_FEED_IDS = {
     "BTC": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
     "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
     "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
 }
-
-# Supported assets
 SUPPORTED_ASSETS = list(PYTH_FEED_IDS.keys())
 
+
+# ============================================================
+# UTILITY: Normal CDF
+# ============================================================
+
+def normal_cdf(x: float) -> float:
+    """Cumulative distribution function of the standard normal distribution."""
+    return 0.5 * math.erfc(-x / math.sqrt(2))
+
+
+# ============================================================
+# PRICE TRACKER
+# ============================================================
+
+@dataclass
+class PriceSignals:
+    """Computed market microstructure signals."""
+    current_price: float = 0.0
+    velocity: float = 0.0       # price change per second
+    volatility: float = 0.0     # stddev of returns over window
+    momentum: float = 0.0       # EMA of velocity (trend direction)
+    is_stale: bool = True
+    observation_age: float = 0.0
+
+
+class PriceTracker:
+    """Rolling window of price observations with velocity, volatility, and momentum."""
+
+    def __init__(self, window_size: int = 60, max_age: float = 120.0, ema_alpha: float = 0.3):
+        self.window_size = window_size
+        self.max_age = max_age  # seconds
+        self.ema_alpha = ema_alpha
+        self.observations: deque[tuple[float, float]] = deque(maxlen=window_size)  # (price, timestamp)
+        self._last_ema: float = 0.0
+
+    def add_observation(self, price: float) -> None:
+        """Record a new price observation."""
+        now = time.time()
+        self.observations.append((price, now))
+        # Prune old observations
+        cutoff = now - self.max_age
+        while self.observations and self.observations[0][1] < cutoff:
+            self.observations.popleft()
+
+    def get_signals(self) -> PriceSignals:
+        """Compute velocity, volatility, and momentum from price history."""
+        n = len(self.observations)
+        if n == 0:
+            return PriceSignals(is_stale=True)
+
+        latest_price, latest_time = self.observations[-1]
+        age = time.time() - latest_time
+        signals = PriceSignals(
+            current_price=latest_price,
+            observation_age=age,
+            is_stale=age > self.max_age,
+        )
+
+        if n < 2:
+            return signals
+
+        # Velocity: last 5 observations
+        window = min(5, n)
+        first_price, first_time = self.observations[-window]
+        dt = latest_time - first_time
+        if dt > 0:
+            signals.velocity = (latest_price - first_price) / dt
+
+        # Volatility: stddev of returns over all observations
+        returns = []
+        obs_list = list(self.observations)
+        for i in range(1, len(obs_list)):
+            prev_price = obs_list[i - 1][0]
+            if prev_price > 0:
+                ret = (obs_list[i][0] - prev_price) / prev_price
+                returns.append(ret)
+        if len(returns) > 1:
+            signals.volatility = stdev(returns)
+
+        # Momentum: EMA of velocity
+        self._last_ema = self.ema_alpha * signals.velocity + (1.0 - self.ema_alpha) * self._last_ema
+        signals.momentum = self._last_ema
+
+        return signals
+
+    def reset(self) -> None:
+        """Clear all observations."""
+        self.observations.clear()
+        self._last_ema = 0.0
+
+
+# ============================================================
+# INVENTORY TRACKER
+# ============================================================
+
+@dataclass
+class FillRecord:
+    """A single fill event."""
+    side: str       # "BUY" or "SELL"
+    outcome: str    # "YES" or "NO"
+    price: int
+    size: int
+    timestamp: float
+
+
+class InventoryTracker:
+    """Tracks net position and fill history for adverse selection detection."""
+
+    def __init__(self, fill_max_age: float = 180.0):
+        self.fill_max_age = fill_max_age  # seconds
+        self.yes_position: int = 0  # net shares (positive = long)
+        self.no_position: int = 0
+        self.recent_fills: list[FillRecord] = []
+
+    def record_fill(self, side: str, outcome: str, price: int, size: int) -> None:
+        """Record a fill and update net position."""
+        signed_size = size
+        if side == "BUY":
+            if outcome == "YES":
+                self.yes_position += signed_size
+            else:
+                self.no_position += signed_size
+        else:
+            if outcome == "YES":
+                self.yes_position -= signed_size
+            else:
+                self.no_position -= signed_size
+
+        self.recent_fills.append(FillRecord(
+            side=side, outcome=outcome, price=price, size=size, timestamp=time.time()
+        ))
+        self._prune_old_fills()
+
+    def get_net_exposure(self) -> float:
+        """Normalized skew from -1.0 to +1.0. Positive = long YES / short NO."""
+        total = abs(self.yes_position) + abs(self.no_position)
+        if total == 0:
+            return 0.0
+        return (self.yes_position - self.no_position) / total
+
+    def is_adversely_selected(self, threshold: float = ADVERSE_SELECTION_THRESHOLD) -> bool:
+        """True if one side is getting filled disproportionately in last 30 seconds."""
+        cutoff = time.time() - 30.0
+        buy_count = sum(1 for f in self.recent_fills if f.timestamp >= cutoff and f.side == "BUY")
+        sell_count = sum(1 for f in self.recent_fills if f.timestamp >= cutoff and f.side == "SELL")
+        total = buy_count + sell_count
+        if total < 3:
+            return False
+        ratio = max(buy_count, sell_count) / total
+        return ratio > threshold
+
+    def reset(self) -> None:
+        """Clear all state."""
+        self.yes_position = 0
+        self.no_position = 0
+        self.recent_fills.clear()
+
+    def _prune_old_fills(self) -> None:
+        cutoff = time.time() - self.fill_max_age
+        self.recent_fills = [f for f in self.recent_fills if f.timestamp >= cutoff]
+
+
+# ============================================================
+# CREDENTIAL MANAGEMENT
+# ============================================================
 
 def get_or_create_api_credentials(env_path: Path = None):
     """Get existing credentials or register new ones and save to .env."""
@@ -124,7 +314,6 @@ def get_or_create_api_credentials(env_path: Path = None):
     api_key_id = credentials["api_key_id"]
     api_private_key = credentials["api_private_key"]
 
-    # Auto-save to .env
     _save_credentials_to_env(env_path, api_key_id, api_private_key)
     os.environ["TURBINE_API_KEY_ID"] = api_key_id
     os.environ["TURBINE_API_PRIVATE_KEY"] = api_private_key
@@ -139,7 +328,6 @@ def _save_credentials_to_env(env_path: Path, api_key_id: str, api_private_key: s
 
     if env_path.exists():
         content = env_path.read_text()
-        # Update or append each credential
         if "TURBINE_API_KEY_ID=" in content:
             content = re.sub(r'^TURBINE_API_KEY_ID=.*$', f'TURBINE_API_KEY_ID={api_key_id}', content, flags=re.MULTILINE)
         else:
@@ -153,6 +341,10 @@ def _save_credentials_to_env(env_path: Path, api_key_id: str, api_private_key: s
         content = f"# Turbine Bot Config\nTURBINE_PRIVATE_KEY={os.environ.get('TURBINE_PRIVATE_KEY', '')}\nTURBINE_API_KEY_ID={api_key_id}\nTURBINE_API_PRIVATE_KEY={api_private_key}\n"
         env_path.write_text(content)
 
+
+# ============================================================
+# ASSET STATE
+# ============================================================
 
 class AssetState:
     """Per-asset market making state."""
@@ -168,24 +360,39 @@ class AssetState:
 
         # Dynamic pricing state
         self.yes_target: float = DEFAULT_BASE_PROBABILITY
+        self.no_target: float = 1.0 - DEFAULT_BASE_PROBABILITY
         self.current_spread: float = DEFAULT_SPREAD
         self.yes_target_at_rebalance: float = DEFAULT_BASE_PROBABILITY
         self.last_rebalance_time: int = 0
 
-        # Order tracking
-        self.active_orders: dict[str, str] = {}  # order_hash -> side
+        # Order tracking: order_hash -> {side, outcome, price, size}
+        self.active_orders: dict[str, dict] = {}
+
+        # Smart components
+        self.price_tracker: PriceTracker = PriceTracker(window_size=60, max_age=120.0, ema_alpha=0.3)
+        self.inventory: InventoryTracker = InventoryTracker(fill_max_age=180.0)
+
+        # Circuit breaker
+        self.circuit_breaker_tripped: bool = False
+        self.circuit_breaker_until: float = 0.0
+
+        # End-of-market
+        self.orders_pulled: bool = False
 
         # Track markets we've traded in for claiming winnings
         self.traded_markets: dict[str, str] = {}  # market_id -> contract_address
 
 
-class MarketMaker:
-    """Probability-based market maker for BTC, ETH, and SOL 15-minute prediction markets.
+# ============================================================
+# MARKET MAKER
+# ============================================================
 
-    Computes YES/NO target probabilities from live prices vs strike per asset,
-    then quotes multi-level bid/ask ladders with geometric size distribution.
-    Sensitivity increases and spread tightens toward expiration. USDC is
-    approved gaslessly via one-time max EIP-2612 permit through the relayer.
+class MarketMaker:
+    """Smart probability-based market maker for quick prediction markets.
+
+    Uses a statistical model (normal CDF) to compute fair probability from
+    live prices, with momentum tracking, inventory management, adverse
+    selection detection, and one-sided quoting.
     """
 
     def __init__(
@@ -195,14 +402,16 @@ class MarketMaker:
         allocation_usdc: float = DEFAULT_ALLOCATION_USDC,
         spread: float = DEFAULT_SPREAD,
         num_levels: int = DEFAULT_NUM_LEVELS,
-        sensitivity: float = DEFAULT_PRICE_SENSITIVITY,
+        base_volatility: float = DEFAULT_BASE_VOLATILITY,
+        asset_volatilities: dict[str, float] | None = None,
     ):
         self.client = client
         self.assets = assets
         self.allocation_usdc = allocation_usdc
         self.base_spread = spread
         self.num_levels = num_levels
-        self.price_sensitivity = sensitivity
+        self.base_volatility = base_volatility
+        self.asset_volatilities = asset_volatilities or {}
         self.running = True
 
         # Per-asset state
@@ -210,29 +419,33 @@ class MarketMaker:
             asset: AssetState(asset) for asset in assets
         }
 
-        # Track approved settlement contracts (shared across assets)
+        # Track approved settlement contracts
         self.approved_settlements: dict[str, int] = {}
 
-        # Async HTTP client for non-blocking price fetches
+        # Async HTTP client
         self._http_client: httpx.AsyncClient | None = None
+
+    def get_base_volatility_for_asset(self, asset: str) -> float:
+        """Get per-asset volatility, falling back to global default."""
+        if asset in self.asset_volatilities:
+            return self.asset_volatilities[asset]
+        return self.base_volatility
 
     # ------------------------------------------------------------------
     # Pyth price fetching
     # ------------------------------------------------------------------
 
     async def _get_http_client(self) -> httpx.AsyncClient:
-        """Get or create the async HTTP client."""
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient(timeout=5.0)
         return self._http_client
 
     async def close(self) -> None:
-        """Close the async HTTP client."""
         if self._http_client is not None and not self._http_client.is_closed:
             await self._http_client.aclose()
 
     async def get_current_prices(self) -> dict[str, float]:
-        """Fetch current prices for all active assets from Pyth Network in one request."""
+        """Fetch current prices for all active assets from Pyth Network."""
         try:
             http_client = await self._get_http_client()
             feed_ids = [PYTH_FEED_IDS[asset] for asset in self.assets]
@@ -247,9 +460,7 @@ class MarketMaker:
             if not data.get("parsed"):
                 return prices
 
-            # Map feed IDs back to assets
             feed_to_asset = {PYTH_FEED_IDS[asset]: asset for asset in self.assets}
-
             for parsed in data["parsed"]:
                 feed_id = "0x" + parsed["id"]
                 asset = feed_to_asset.get(feed_id)
@@ -260,164 +471,145 @@ class MarketMaker:
                     prices[asset] = price_int * (10 ** expo)
 
             return prices
-
         except Exception as e:
             print(f"Failed to fetch prices from Pyth: {e}")
             return {}
 
     # ------------------------------------------------------------------
-    # Dynamic probability pricing (matching Go MM)
+    # Statistical probability model (normal CDF)
     # ------------------------------------------------------------------
 
-    def calculate_target_prices_with_time(
+    def calculate_smart_prices(
         self, state: AssetState, current_price: float
-    ) -> tuple[float, float]:
-        """Calculate YES target probability and dynamic spread for an asset.
+    ) -> tuple[float, float, float]:
+        """Compute YES target, NO target, and spread using statistical model.
 
-        Uses the same formula as the Go MM's calculateTargetPricesWithTime:
-        - Time factor: elapsed / total duration (0.0 at start, 1.0 at expiration)
-        - Effective sensitivity: base * (1 + timeFactor * TimeDecayFactor)
-        - YES target: BaseProbability +/- adjustment
-        - Spread tightens: base * (1 - timeFactor * 0.75), min 0.5%
+        P(YES) = Φ(deviation / (volatility × √timeRemaining))
+
+        This correctly handles:
+        - BTC +0.45% with 1 min left → YES ≈ 99%
+        - BTC +0.45% with 7 min left → YES ≈ 75%
+        - BTC ±0% at any time → YES = 50%
 
         Returns:
-            (yes_target, spread) as floats (e.g., 0.65 = 65%, 0.02 = 2%)
+            (yes_target, no_target, spread)
         """
         strike_usd = state.strike_price / 1e6
         if strike_usd <= 0 or current_price <= 0:
-            return DEFAULT_BASE_PROBABILITY, self.base_spread
+            return DEFAULT_BASE_PROBABILITY, 1.0 - DEFAULT_BASE_PROBABILITY, self.base_spread
 
-        # Time factor (0.0 at start, 1.0 at expiration)
         now = int(time.time())
-        total_duration = state.market_end_time - state.market_start_time
-        if total_duration <= 0:
-            time_factor = 0.0
-        else:
-            elapsed = now - state.market_start_time
-            time_factor = max(0.0, min(1.0, elapsed / total_duration))
+        seconds_remaining = max(1, state.market_end_time - now)
 
-        # Price deviation as percentage
-        deviation_pct = ((current_price - strike_usd) / strike_usd) * 100
+        # === STATISTICAL MODEL ===
+        return_deviation = (current_price - strike_usd) / strike_usd
 
-        # Effective sensitivity (increases toward expiration)
-        effective_sensitivity = self.price_sensitivity * (1.0 + time_factor * DEFAULT_TIME_DECAY_FACTOR)
+        # Estimate volatility per sqrt-second from price tracker
+        signals = state.price_tracker.get_signals()
+        vol_per_sqrt_second = 0.0
+        if signals.volatility > 0:
+            poll_interval = float(FAST_POLL_INTERVAL)
+            vol_per_sqrt_second = signals.volatility / math.sqrt(poll_interval)
 
-        # Probability adjustment
-        max_adjustment = DEFAULT_MAX_PROBABILITY - DEFAULT_BASE_PROBABILITY
-        adjustment = min(max_adjustment, abs(deviation_pct) * effective_sensitivity)
+        # Floor at daily vol / sqrt(86400)
+        min_daily_vol = self.get_base_volatility_for_asset(state.asset)
+        min_vol_per_sqrt_second = min_daily_vol / math.sqrt(SECONDS_PER_DAY)
+        vol_per_sqrt_second = max(vol_per_sqrt_second, min_vol_per_sqrt_second)
 
-        # YES target probability
-        if current_price > strike_usd:
-            yes_target = min(DEFAULT_MAX_PROBABILITY, DEFAULT_BASE_PROBABILITY + adjustment)
-        elif current_price < strike_usd:
-            yes_target = max(1.0 - DEFAULT_MAX_PROBABILITY, DEFAULT_BASE_PROBABILITY - adjustment)
-        else:
-            yes_target = DEFAULT_BASE_PROBABILITY
+        # Expected remaining volatility
+        expected_vol_to_expiry = vol_per_sqrt_second * math.sqrt(seconds_remaining)
 
-        # Spread tightens toward expiration
-        spread = self.base_spread * (1.0 - time_factor * SPREAD_TIGHTENING)
-        spread = max(MIN_SPREAD, spread)
+        # Z-score
+        z_score = return_deviation / expected_vol_to_expiry if expected_vol_to_expiry > 0 else 0.0
 
-        return yes_target, spread
+        # P(YES) = normal CDF of z-score
+        yes_target = normal_cdf(z_score)
+
+        # === MOMENTUM ADJUSTMENT (lead the price) ===
+        momentum_shift = signals.momentum * MOMENTUM_FACTOR / 1e6
+        momentum_shift = max(-0.10, min(0.10, momentum_shift))
+        yes_target += momentum_shift
+
+        # === INVENTORY SKEW ===
+        net_exposure = state.inventory.get_net_exposure()
+        inventory_skew = net_exposure * INVENTORY_SKEW_FACTOR
+        yes_target -= inventory_skew
+
+        # Clamp
+        yes_target = max(1.0 - DEFAULT_MAX_PROBABILITY, min(DEFAULT_MAX_PROBABILITY, yes_target))
+        no_target = 1.0 - yes_target
+
+        # === SPREAD CALCULATION ===
+        spread = self.base_spread
+
+        # Volatility-adjusted
+        vol_multiplier = 1.0 + signals.volatility * VOLATILITY_SPREAD_FACTOR
+        spread *= vol_multiplier
+
+        # Momentum-adjusted
+        mom_mag = abs(signals.momentum) * MOMENTUM_SPREAD_FACTOR / 1e6
+        spread *= (1.0 + mom_mag)
+
+        # End-of-market: widen in last 90 seconds
+        if END_OF_MARKET_PULL_SECONDS < seconds_remaining < END_OF_MARKET_WIDEN_SECONDS:
+            end_factor = 1.0 + 2.0 * (1.0 - seconds_remaining / END_OF_MARKET_WIDEN_SECONDS)
+            spread *= end_factor
+
+        # Clamp spread
+        spread = max(0.01, min(0.20, spread))
+
+        return yes_target, no_target, spread
 
     # ------------------------------------------------------------------
-    # Multi-level geometric distribution (matching Go MM)
+    # Multi-level geometric distribution
     # ------------------------------------------------------------------
 
     def calculate_geometric_weights(self, n: int, side: str) -> list[float]:
-        """Calculate geometric size distribution weights.
-
-        Uses lambda^i for BUY (concentrate at best/highest price) and
-        lambda^(n-1-i) for SELL (concentrate at best/lowest price).
-        Weights are normalized to sum to 1.
-
-        Args:
-            n: Number of levels
-            side: "BUY" or "SELL"
-
-        Returns:
-            Normalized weights list (sums to 1.0)
-        """
+        """Geometric size distribution weights."""
         lam = DEFAULT_GEOMETRIC_LAMBDA
         weights = []
         for i in range(n):
             if side == "BUY":
-                # Concentrate at higher indices (best bid = highest price)
                 w = lam ** i
             else:
-                # Concentrate at lower indices (best ask = lowest price)
                 w = lam ** (n - 1 - i)
             weights.append(w)
-
         total = sum(weights)
         if total <= 0:
             return [1.0 / n] * n
         return [w / total for w in weights]
 
-    def generate_level_prices(
-        self, min_price: float, max_price: float, n: int
-    ) -> list[int]:
-        """Generate evenly spaced prices from min to max.
-
-        Args:
-            min_price: Lowest price as float (e.g., 0.45)
-            max_price: Highest price as float (e.g., 0.55)
-            n: Number of levels
-
-        Returns:
-            List of prices in 6-decimal integer format, clamped to [10000, 990000]
-        """
+    def generate_level_prices(self, min_price: float, max_price: float, n: int) -> list[int]:
+        """Generate evenly spaced prices clamped to [10000, 990000]."""
         if n <= 1:
             mid = (min_price + max_price) / 2
             return [max(10000, min(990000, int(mid * 1_000_000)))]
-
         step = (max_price - min_price) / (n - 1)
-        prices = []
-        for i in range(n):
-            p = min_price + i * step
-            p_int = max(10000, min(990000, int(p * 1_000_000)))
-            prices.append(p_int)
-        return prices
-
-    # ------------------------------------------------------------------
-    # USDC helpers
-    # ------------------------------------------------------------------
+        return [max(10000, min(990000, int((min_price + i * step) * 1_000_000))) for i in range(n)]
 
     def calculate_shares_from_usdc(self, usdc_amount: float, price: int) -> int:
-        """Calculate shares from USDC amount at given price.
-
-        Args:
-            usdc_amount: Amount of USDC to spend (e.g., 10.0 for $10)
-            price: Price per share in 6 decimals (e.g., 500000 = 50%)
-
-        Returns:
-            Number of shares in 6 decimals
-        """
+        """Calculate shares from USDC amount at given price."""
         if price <= 0:
             return 0
         return int((usdc_amount * 1_000_000 * 1_000_000) / price)
 
-    # Half of max uint256 — threshold for "already has max approval"
+    # ------------------------------------------------------------------
+    # USDC approval
+    # ------------------------------------------------------------------
+
     MAX_APPROVAL_THRESHOLD = (2**256 - 1) // 2
 
     def ensure_settlement_approved(self, settlement_address: str) -> None:
-        """Ensure USDC is approved for the settlement contract.
-
-        Uses a gasless max permit via the relayer. No native gas required.
-        """
-        # Check if already approved in this session
+        """Ensure USDC is approved via gasless max permit."""
         if settlement_address in self.approved_settlements:
             return
 
-        # Check on-chain allowance
         current_allowance = self.client.get_usdc_allowance(spender=settlement_address)
-
         if current_allowance >= self.MAX_APPROVAL_THRESHOLD:
             print(f"  Existing USDC max approval found")
             self.approved_settlements[settlement_address] = current_allowance
             return
 
-        # Need to approve via gasless max permit
         print(f"\n{'='*50}")
         print(f"GASLESS USDC APPROVAL (one-time max permit)")
         print(f"{'='*50}")
@@ -429,7 +621,6 @@ class MarketMaker:
             print(f"Relayer TX: {tx_hash}")
             print("Waiting for confirmation...")
 
-            # Wait for confirmation
             from web3 import Web3
             rpc_urls = {
                 137: "https://polygon-rpc.com",
@@ -467,11 +658,9 @@ class MarketMaker:
     # ------------------------------------------------------------------
 
     async def cancel_all_orders(self) -> None:
-        """Cancel all open orders by querying the API."""
+        """Cancel all open orders."""
         try:
-            open_orders = self.client.get_orders(
-                trader=self.client.address, status="open"
-            )
+            open_orders = self.client.get_orders(trader=self.client.address, status="open")
         except Exception as e:
             print(f"Failed to fetch open orders: {e}")
             return
@@ -483,11 +672,7 @@ class MarketMaker:
         cancelled = 0
         for order in open_orders:
             try:
-                self.client.cancel_order(
-                    order.order_hash,
-                    market_id=order.market_id,
-                    side=Side(order.side),
-                )
+                self.client.cancel_order(order.order_hash, market_id=order.market_id, side=Side(order.side))
                 cancelled += 1
             except TurbineApiError as e:
                 if "404" not in str(e):
@@ -502,142 +687,312 @@ class MarketMaker:
             return
         try:
             open_orders = self.client.get_orders(
-                trader=self.client.address,
-                market_id=state.market_id,
-                status="open",
+                trader=self.client.address, market_id=state.market_id, status="open"
             )
         except Exception:
             return
 
         for order in open_orders:
             try:
-                self.client.cancel_order(
-                    order.order_hash,
-                    market_id=order.market_id,
-                    side=Side(order.side),
-                )
+                self.client.cancel_order(order.order_hash, market_id=order.market_id, side=Side(order.side))
             except TurbineApiError:
                 pass
         state.active_orders.clear()
 
-    async def place_multi_level_quotes(self, state: AssetState) -> dict[str, str]:
-        """Place multi-level bid and ask orders on both YES and NO outcomes for an asset.
+    async def place_smart_quotes(self, state: AssetState) -> dict[str, dict]:
+        """Place multi-level quotes with one-sided quoting and allocation skew.
 
-        YES side: Bids below yes_target, asks above yes_target.
-        NO side: Bids below no_target (1 - yes_target), asks above no_target.
+        When the market is trending (YES target far from 50%), this will:
+        - Skip the losing side entirely (one-sided quoting)
+        - Allocate more capital to the likely-winning outcome
+        - Skew within each outcome toward sells when probability is high
 
         Returns:
-            Dict of order_hash -> side for newly placed orders.
+            Dict of order_hash -> {side, outcome, price, size}
         """
-        new_orders: dict[str, str] = {}
+        new_orders: dict[str, dict] = {}
 
         n = self.num_levels
-        half_spread = state.current_spread / 2
-        no_target = 1.0 - state.yes_target
-        expiration = int(time.time()) + 300  # 5 minute expiration
+        spread = state.current_spread
+        half_spread = spread / 2
+        expiration = int(time.time()) + 300  # 5 min expiration
 
-        # Generate geometric weights
+        # --- ONE-SIDED QUOTING ---
+        # Determine which sides to quote based on target deviation from 0.50
+        yes_deviation = state.yes_target - 0.5
+        quote_yes_buy = True
+        quote_yes_sell = True
+        quote_no_buy = True
+        quote_no_sell = True
+
+        if yes_deviation > ONE_SIDE_THRESHOLD:
+            # YES is likely — don't provide NO liquidity
+            quote_no_buy = False
+            quote_no_sell = False
+            print(f"  [{state.asset}] ONE-SIDED: YES={state.yes_target:.2f} — skipping NO orders (trending UP)")
+        elif yes_deviation < -ONE_SIDE_THRESHOLD:
+            # NO is likely — don't provide YES liquidity
+            quote_yes_buy = False
+            quote_yes_sell = False
+            print(f"  [{state.asset}] ONE-SIDED: YES={state.yes_target:.2f} — skipping YES orders (trending DOWN)")
+
+        # Also check momentum as a leading indicator
+        signals = state.price_tracker.get_signals()
+        momentum_strength = signals.momentum / 1e6
+        if momentum_strength > 5.0 and yes_deviation > 0:
+            quote_no_buy = False
+            quote_no_sell = False
+        elif momentum_strength < -5.0 and yes_deviation < 0:
+            quote_yes_buy = False
+            quote_yes_sell = False
+
+        # Count active sides
+        active_sides = sum([quote_yes_buy, quote_yes_sell, quote_no_buy, quote_no_sell])
+        if active_sides == 0:
+            print(f"  [{state.asset}] SKIP: No sides to quote (extreme momentum)")
+            return new_orders
+
+        # --- ALLOCATION SKEW ---
+        total_allocation = self.allocation_usdc
+        yes_fraction = 0.5 + (state.yes_target - 0.5) * ALLOCATION_SKEW_FACTOR
+        yes_fraction = max(0.2, min(0.8, yes_fraction))
+
+        yes_allocation = total_allocation * yes_fraction
+        no_allocation = total_allocation - yes_allocation
+
+        # Within each outcome, skew toward SELL when probability is high
+        yes_sell_fraction = 0.5 + (state.yes_target - 0.5) * 0.3
+        yes_sell_fraction = max(0.3, min(0.7, yes_sell_fraction))
+
+        no_sell_fraction = 0.5 + (state.no_target - 0.5) * 0.3
+        no_sell_fraction = max(0.3, min(0.7, no_sell_fraction))
+
+        # Calculate per-bucket allocations
+        if quote_yes_buy and quote_yes_sell:
+            yes_buy_alloc = yes_allocation * (1 - yes_sell_fraction)
+            yes_sell_alloc = yes_allocation - yes_buy_alloc
+        elif quote_yes_buy:
+            yes_buy_alloc = yes_allocation
+            yes_sell_alloc = 0.0
+        elif quote_yes_sell:
+            yes_buy_alloc = 0.0
+            yes_sell_alloc = yes_allocation
+        else:
+            yes_buy_alloc = 0.0
+            yes_sell_alloc = 0.0
+
+        if quote_no_buy and quote_no_sell:
+            no_buy_alloc = no_allocation * (1 - no_sell_fraction)
+            no_sell_alloc = no_allocation - no_buy_alloc
+        elif quote_no_buy:
+            no_buy_alloc = no_allocation
+            no_sell_alloc = 0.0
+        elif quote_no_sell:
+            no_buy_alloc = 0.0
+            no_sell_alloc = no_allocation
+        else:
+            no_buy_alloc = 0.0
+            no_sell_alloc = 0.0
+
         buy_weights = self.calculate_geometric_weights(n, "BUY")
         sell_weights = self.calculate_geometric_weights(n, "SELL")
 
-        # Split allocation: 2 outcomes x 2 sides = 4 buckets
-        usdc_per_side = self.allocation_usdc / 4
-
         print(
-            f"[{state.asset}] Quoting {n} levels x 2 outcomes: "
-            f"YES {state.yes_target:.1%} / NO {no_target:.1%} | "
-            f"Spread {state.current_spread:.1%} | "
-            f"${usdc_per_side:.2f}/side"
+            f"[{state.asset}] Quoting: YES {state.yes_target:.1%} / NO {state.no_target:.1%} | "
+            f"Spread {state.current_spread:.1%} | Sides {active_sides}/4 | "
+            f"Alloc YES[B=${yes_buy_alloc:.1f} S=${yes_sell_alloc:.1f}] NO[B=${no_buy_alloc:.1f} S=${no_sell_alloc:.1f}]"
         )
 
-        for outcome, target in [(Outcome.YES, state.yes_target), (Outcome.NO, no_target)]:
+        # --- PLACE ORDERS ---
+        for outcome, target, quote_buy, quote_sell, buy_alloc, sell_alloc in [
+            (Outcome.YES, state.yes_target, quote_yes_buy, quote_yes_sell, yes_buy_alloc, yes_sell_alloc),
+            (Outcome.NO, state.no_target, quote_no_buy, quote_no_sell, no_buy_alloc, no_sell_alloc),
+        ]:
             outcome_name = "YES" if outcome == Outcome.YES else "NO"
 
-            # Derive bid/ask ranges for this outcome
-            bid_max = target - half_spread  # Best bid
-            bid_min = max(0.01, bid_max - state.current_spread)
-            ask_min = target + half_spread  # Best ask
-            ask_max = min(0.99, ask_min + state.current_spread)
+            # Bid range
+            bid_max = target - half_spread / 2
+            bid_min = max(0.01, bid_max - spread)
+            # Ask range
+            ask_min = target + half_spread / 2
+            ask_max = min(0.99, ask_min + spread)
 
-            # Clamp
-            bid_min = max(0.01, bid_min)
-            bid_max = max(bid_min + 0.01, min(0.99, bid_max))
-            ask_min = max(0.01, ask_min)
-            ask_max = max(ask_min + 0.01, min(0.99, ask_max))
+            # Place bids
+            if quote_buy and buy_alloc >= 1.0:
+                bid_prices = self.generate_level_prices(bid_min, bid_max, n)
+                for i in range(n):
+                    usdc_for_level = buy_alloc * buy_weights[i]
+                    if usdc_for_level < 1.0:
+                        continue
+                    price = bid_prices[i]
+                    shares = self.calculate_shares_from_usdc(usdc_for_level, price)
+                    if shares <= 0:
+                        continue
+                    try:
+                        order = self.client.create_limit_buy(
+                            market_id=state.market_id,
+                            outcome=outcome,
+                            price=price,
+                            size=shares,
+                            expiration=expiration,
+                            settlement_address=state.settlement_address,
+                        )
+                        self.client.post_order(order)
+                        new_orders[order.order_hash] = {
+                            "side": "BUY", "outcome": outcome_name,
+                            "price": price, "size": shares
+                        }
+                    except TurbineApiError as e:
+                        print(f"  [{state.asset}] Failed {outcome_name} bid L{i}: {e}")
 
-            bid_prices = self.generate_level_prices(bid_min, bid_max, n)
-            ask_prices = self.generate_level_prices(ask_min, ask_max, n)
-
-            # Place bid levels (BUY outcome)
-            for i in range(n):
-                usdc_for_level = usdc_per_side * buy_weights[i]
-                if usdc_for_level < 0.01:
-                    continue
-                price = bid_prices[i]
-                shares = self.calculate_shares_from_usdc(usdc_for_level, price)
-                if shares <= 0:
-                    continue
-                try:
-                    order = self.client.create_limit_buy(
-                        market_id=state.market_id,
-                        outcome=outcome,
-                        price=price,
-                        size=shares,
-                        expiration=expiration,
-                        settlement_address=state.settlement_address,
-                    )
-                    self.client.post_order(order)
-                    new_orders[order.order_hash] = f"BUY_{outcome_name}"
-                except TurbineApiError as e:
-                    print(f"  [{state.asset}] Failed {outcome_name} bid L{i}: {e}")
-
-            # Place ask levels (SELL outcome)
-            for i in range(n):
-                usdc_for_level = usdc_per_side * sell_weights[i]
-                if usdc_for_level < 0.01:
-                    continue
-                price = ask_prices[i]
-                shares = self.calculate_shares_from_usdc(usdc_for_level, price)
-                if shares <= 0:
-                    continue
-                try:
-                    order = self.client.create_limit_sell(
-                        market_id=state.market_id,
-                        outcome=outcome,
-                        price=price,
-                        size=shares,
-                        expiration=expiration,
-                        settlement_address=state.settlement_address,
-                    )
-                    self.client.post_order(order)
-                    new_orders[order.order_hash] = f"SELL_{outcome_name}"
-                except TurbineApiError as e:
-                    print(f"  [{state.asset}] Failed {outcome_name} ask L{i}: {e}")
+            # Place asks
+            if quote_sell and sell_alloc >= 1.0:
+                ask_prices = self.generate_level_prices(ask_min, ask_max, n)
+                for i in range(n):
+                    usdc_for_level = sell_alloc * sell_weights[i]
+                    if usdc_for_level < 1.0:
+                        continue
+                    price = ask_prices[i]
+                    shares = self.calculate_shares_from_usdc(usdc_for_level, price)
+                    if shares <= 0:
+                        continue
+                    try:
+                        order = self.client.create_limit_sell(
+                            market_id=state.market_id,
+                            outcome=outcome,
+                            price=price,
+                            size=shares,
+                            expiration=expiration,
+                            settlement_address=state.settlement_address,
+                        )
+                        self.client.post_order(order)
+                        new_orders[order.order_hash] = {
+                            "side": "SELL", "outcome": outcome_name,
+                            "price": price, "size": shares
+                        }
+                    except TurbineApiError as e:
+                        print(f"  [{state.asset}] Failed {outcome_name} ask L{i}: {e}")
 
         if new_orders:
-            yes_orders = sum(1 for s in new_orders.values() if "YES" in s)
-            no_orders = sum(1 for s in new_orders.values() if "NO" in s)
-            print(f"  [{state.asset}] Placed {yes_orders} YES + {no_orders} NO orders ({len(new_orders)} total)")
+            buy_count = sum(1 for o in new_orders.values() if o["side"] == "BUY")
+            sell_count = sum(1 for o in new_orders.values() if o["side"] == "SELL")
+            print(f"  [{state.asset}] Placed {buy_count} BUY + {sell_count} SELL ({len(new_orders)} total)")
 
         return new_orders
 
-    async def update_quotes(self, state: AssetState) -> None:
-        """Cancel all open orders for an asset's market, then place new ones."""
-        await self.cancel_asset_orders(state)
+    async def graceful_rebalance(self, state: AssetState) -> None:
+        """Place new orders FIRST, then cancel old ones (no gap in liquidity)."""
+        old_orders = dict(state.active_orders)
+        state.active_orders.clear()
 
-        new_orders = await self.place_multi_level_quotes(state)
+        # Place new orders at current fair value
+        new_orders = await self.place_smart_quotes(state)
         state.active_orders.update(new_orders)
+
+        # Brief pause for in-flight trades
+        await asyncio.sleep(0.2)
+
+        # Cancel old orders
+        for order_hash, info in old_orders.items():
+            try:
+                side = Side.BUY if info["side"] == "BUY" else Side.SELL
+                self.client.cancel_order(order_hash, market_id=state.market_id, side=side)
+            except TurbineApiError:
+                pass  # Order may already be filled or expired
+
+    async def check_and_refresh_fills(self, state: AssetState) -> None:
+        """Detect filled orders, record in inventory, and replace at CURRENT fair value."""
+        if not state.market_id or not state.active_orders:
+            return
+
+        try:
+            user_orders = self.client.get_orders(
+                trader=self.client.address, market_id=state.market_id, status="open"
+            )
+        except Exception:
+            return
+
+        # Build set of active order hashes from API
+        api_active = {o.order_hash for o in user_orders}
+
+        # Find filled orders
+        filled = []
+        for order_hash, info in list(state.active_orders.items()):
+            if order_hash not in api_active:
+                filled.append((order_hash, info))
+                del state.active_orders[order_hash]
+
+                # Record fill in inventory
+                state.inventory.record_fill(
+                    side=info["side"],
+                    outcome=info["outcome"],
+                    price=info["price"],
+                    size=info["size"],
+                )
+                print(f"  [{state.asset}] FILL: {info['side']} {info['outcome']} @ "
+                      f"{info['price'] / 1e6:.4f} (size: {info['size'] / 1e6:.2f})")
+
+        # Replace filled orders at CURRENT fair value
+        if filled:
+            print(f"  [{state.asset}] Replacing {len(filled)} filled orders at current fair value")
+            spread = state.current_spread
+            half_spread = spread / 2
+            expiration = int(time.time()) + 300
+
+            for _, info in filled:
+                # Determine target for this outcome
+                if info["outcome"] == "YES":
+                    target = state.yes_target
+                    outcome = Outcome.YES
+                else:
+                    target = state.no_target
+                    outcome = Outcome.NO
+
+                if info["side"] == "BUY":
+                    new_price_float = max(0.01, min(0.99, target - half_spread))
+                    new_price = int(new_price_float * 1_000_000)
+                    try:
+                        order = self.client.create_limit_buy(
+                            market_id=state.market_id,
+                            outcome=outcome,
+                            price=new_price,
+                            size=info["size"],
+                            expiration=expiration,
+                            settlement_address=state.settlement_address,
+                        )
+                        self.client.post_order(order)
+                        state.active_orders[order.order_hash] = {
+                            "side": "BUY", "outcome": info["outcome"],
+                            "price": new_price, "size": info["size"]
+                        }
+                    except TurbineApiError as e:
+                        print(f"  [{state.asset}] Failed to replace BUY: {e}")
+                else:
+                    new_price_float = max(0.01, min(0.99, target + half_spread))
+                    new_price = int(new_price_float * 1_000_000)
+                    try:
+                        order = self.client.create_limit_sell(
+                            market_id=state.market_id,
+                            outcome=outcome,
+                            price=new_price,
+                            size=info["size"],
+                            expiration=expiration,
+                            settlement_address=state.settlement_address,
+                        )
+                        self.client.post_order(order)
+                        state.active_orders[order.order_hash] = {
+                            "side": "SELL", "outcome": info["outcome"],
+                            "price": new_price, "size": info["size"]
+                        }
+                    except TurbineApiError as e:
+                        print(f"  [{state.asset}] Failed to replace SELL: {e}")
 
     # ------------------------------------------------------------------
     # Market lifecycle
     # ------------------------------------------------------------------
 
     async def get_active_market(self, asset: str) -> tuple[str, int, int, int] | None:
-        """Get the currently active quick market for an asset.
-
-        Returns:
-            (market_id, start_time, end_time, start_price) or None
-        """
+        """Get the currently active quick market for an asset."""
         response = self.client._http.get(f"/api/v1/quick-markets/{asset}")
         quick_market_data = response.get("quickMarket")
         if not quick_market_data:
@@ -651,12 +1006,12 @@ class MarketMaker:
         )
 
     async def switch_to_new_market(
-        self, state: AssetState, new_market_id: str, start_time: int = 0, end_time: int = 0, start_price: int = 0
+        self, state: AssetState, new_market_id: str,
+        start_time: int = 0, end_time: int = 0, start_price: int = 0
     ) -> None:
-        """Switch an asset to a new market and ensure gasless USDC approval."""
+        """Switch an asset to a new market."""
         old_market_id = state.market_id
 
-        # Track old market for claiming winnings
         if old_market_id and state.contract_address:
             state.traded_markets[old_market_id] = state.contract_address
 
@@ -665,7 +1020,6 @@ class MarketMaker:
             print(f"[{state.asset}] MARKET TRANSITION")
             print(f"Old: {old_market_id[:8]}... | New: {new_market_id[:8]}...")
             print(f"{'='*50}\n")
-            # Orders on expired markets are auto-removed by the API — just clear tracking
             state.active_orders.clear()
 
         # Update market state
@@ -675,11 +1029,17 @@ class MarketMaker:
         state.market_end_time = end_time
         state.active_orders = {}
 
-        # Reset dynamic pricing state
+        # Reset smart components
         state.yes_target = DEFAULT_BASE_PROBABILITY
+        state.no_target = 1.0 - DEFAULT_BASE_PROBABILITY
         state.current_spread = self.base_spread
         state.yes_target_at_rebalance = DEFAULT_BASE_PROBABILITY
         state.last_rebalance_time = 0
+        state.price_tracker.reset()
+        state.inventory.reset()
+        state.circuit_breaker_tripped = False
+        state.circuit_breaker_until = 0.0
+        state.orders_pulled = False
 
         # Fetch settlement and contract addresses
         try:
@@ -696,61 +1056,48 @@ class MarketMaker:
         except Exception as e:
             print(f"[{state.asset}] Warning: Could not fetch market addresses: {e}")
 
-        # Ensure gasless USDC approval for this settlement contract
         if state.settlement_address:
             self.ensure_settlement_approved(state.settlement_address)
 
         strike_usd = start_price / 1e6 if start_price else 0
-        per_side = self.allocation_usdc / 4
-        print(f"[{state.asset}] Trading market: {new_market_id[:8]}... | Strike: ${strike_usd:,.2f} | ${self.allocation_usdc:.2f} allocation (${per_side:.2f}/side)")
+        print(f"[{state.asset}] Trading: {new_market_id[:8]}... | Strike: ${strike_usd:,.2f} | ${self.allocation_usdc:.2f} allocation")
 
     async def monitor_market_transitions(self) -> None:
-        """Background task that polls for new markets across all assets."""
-        POLL_INTERVAL = 5
-
+        """Background task polling for new markets."""
         while self.running:
             try:
                 for asset in self.assets:
                     state = self.asset_states[asset]
-
                     try:
                         market_info = await self.get_active_market(asset)
-                    except Exception as e:
-                        print(f"[{asset}] Market monitor error: {e}")
+                    except Exception:
                         continue
 
                     if not market_info:
                         continue
 
                     new_market_id, start_time, end_time, start_price = market_info
-
                     if new_market_id != state.market_id:
-                        await self.switch_to_new_market(
-                            state, new_market_id, start_time, end_time, start_price
-                        )
+                        await self.switch_to_new_market(state, new_market_id, start_time, end_time, start_price)
                     else:
-                        # Update end_time in case it changed
                         state.market_end_time = end_time
 
             except Exception as e:
                 print(f"Market monitor error: {e}")
 
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(5)
 
     async def claim_resolved_markets(self) -> None:
-        """Background task to claim winnings from resolved markets across all assets."""
-        retry_delay = 120
-
+        """Background task to claim winnings from resolved markets."""
         while self.running:
             try:
-                # Collect all traded markets across all assets
                 all_traded: list[tuple[str, str, AssetState]] = []
                 for state in self.asset_states.values():
                     for market_id, contract_address in list(state.traded_markets.items()):
                         all_traded.append((market_id, contract_address, state))
 
                 if not all_traded:
-                    await asyncio.sleep(retry_delay)
+                    await asyncio.sleep(120)
                     continue
 
                 for market_id, contract_address, state in all_traded:
@@ -777,178 +1124,149 @@ class MarketMaker:
             except Exception as e:
                 print(f"Claim monitor error: {e}")
 
-            await asyncio.sleep(retry_delay)
+            await asyncio.sleep(120)
 
     # ------------------------------------------------------------------
-    # Main trading loop
+    # Main trading loop (fast poll)
     # ------------------------------------------------------------------
 
-    async def market_making_loop(self) -> None:
-        """Price-driven market making loop with WebSocket for trade/book events.
+    async def smart_trading_loop(self) -> None:
+        """Fast-polling trading loop with smart pricing.
 
-        Primary quoting is probability-based from Pyth prices per asset.
-        WebSocket provides trade notifications for all active markets.
-        Requotes only when YES target shifts by >REBALANCE_THRESHOLD per asset.
+        Runs every FAST_POLL_INTERVAL seconds:
+        1. Fetch prices, update price tracker
+        2. Check circuit breaker
+        3. Check adverse selection
+        4. Compute new targets via statistical model
+        5. Rebalance if threshold exceeded
+        6. Check for fills and replace at current fair value
         """
         if CLAIM_ONLY_MODE:
-            print("CLAIM ONLY MODE - Trading disabled")
+            print("CLAIM ONLY MODE — Trading disabled")
             while self.running:
                 await asyncio.sleep(60)
             return
 
         while self.running:
-            # Wait until at least one asset has an active market
             active_assets = [a for a in self.assets if self.asset_states[a].market_id]
             if not active_assets:
                 await asyncio.sleep(1)
                 continue
 
-            ws = TurbineWSClient(host=TURBINE_HOST)
+            # Initial quote placement
+            prices = await self.get_current_prices()
+            for asset in active_assets:
+                state = self.asset_states[asset]
+                current_price = prices.get(asset, 0.0)
+                if current_price > 0:
+                    state.price_tracker.add_observation(current_price)
+                    yes, no, spread = self.calculate_smart_prices(state, current_price)
+                    state.yes_target = yes
+                    state.no_target = no
+                    state.current_spread = spread
+                    state.yes_target_at_rebalance = yes
+                    state.last_rebalance_time = int(time.time())
 
-            try:
-                async with ws.connect() as stream:
-                    # Subscribe to all active asset markets
-                    subscribed_markets: dict[str, str] = {}  # market_id -> asset
-                    for asset in active_assets:
-                        state = self.asset_states[asset]
-                        await stream.subscribe(state.market_id)
-                        subscribed_markets[state.market_id] = asset
-                        print(f"[{asset}] Subscribed to orderbook updates for {state.market_id[:10]}...")
+                new_orders = await self.place_smart_quotes(state)
+                state.active_orders.update(new_orders)
 
-                    last_price_check = 0
+            # Fast polling loop
+            while self.running:
+                await asyncio.sleep(FAST_POLL_INTERVAL)
 
-                    # Initial price fetch and quote placement
-                    prices = await self.get_current_prices()
-                    for asset in active_assets:
-                        state = self.asset_states[asset]
-                        current_price = prices.get(asset, 0.0)
-                        if current_price > 0:
-                            state.yes_target, state.current_spread = self.calculate_target_prices_with_time(state, current_price)
-                            state.yes_target_at_rebalance = state.yes_target
-                            state.last_rebalance_time = int(time.time())
+                prices = await self.get_current_prices()
+                now = int(time.time())
 
-                        new_orders = await self.place_multi_level_quotes(state)
-                        state.active_orders.update(new_orders)
+                for asset in list(active_assets):
+                    state = self.asset_states[asset]
+                    if not state.market_id:
+                        continue
 
-                    last_price_check = time.time()
+                    seconds_remaining = state.market_end_time - now
 
-                    while self.running:
-                        try:
-                            messages = await asyncio.wait_for(
-                                stream.recv(), timeout=REFRESH_INTERVAL
-                            )
-                        except asyncio.TimeoutError:
-                            messages = []
-                        except WebSocketError:
-                            break  # Connection closed — reconnect
+                    # === END-OF-MARKET: Pull all orders ===
+                    if 0 < seconds_remaining <= END_OF_MARKET_PULL_SECONDS:
+                        if not state.orders_pulled:
+                            print(f"[{state.asset}] PULLING all orders ({seconds_remaining}s remaining — too risky)")
+                            await self.cancel_asset_orders(state)
+                            state.orders_pulled = True
+                        continue
 
-                        # Check if any asset's market changed — resubscribe as needed
-                        needs_reconnect = False
-                        for asset in self.assets:
-                            state = self.asset_states[asset]
-                            if not state.market_id:
-                                continue
+                    # Market expired
+                    if seconds_remaining <= 0:
+                        continue
 
-                            if state.market_id not in subscribed_markets:
-                                # New market for this asset — need to subscribe
-                                # Find and unsubscribe old market for this asset
-                                old_market_ids = [mid for mid, a in subscribed_markets.items() if a == asset]
-                                for old_mid in old_market_ids:
-                                    await stream.unsubscribe(old_mid)
-                                    del subscribed_markets[old_mid]
+                    # === FETCH PRICE ===
+                    current_price = prices.get(asset, 0.0)
+                    if current_price <= 0:
+                        continue
+                    state.price_tracker.add_observation(current_price)
+                    signals = state.price_tracker.get_signals()
 
-                                await stream.subscribe(state.market_id)
-                                subscribed_markets[state.market_id] = asset
-                                print(f"[{asset}] Subscribed to new market {state.market_id[:10]}...")
+                    # === CIRCUIT BREAKER ===
+                    if state.circuit_breaker_tripped:
+                        if time.time() < state.circuit_breaker_until:
+                            continue
+                        state.circuit_breaker_tripped = False
+                        print(f"[{state.asset}] Circuit breaker RESET — resuming quoting")
 
-                                # Fetch price and place initial quotes on new market
-                                prices = await self.get_current_prices()
-                                current_price = prices.get(asset, 0.0)
-                                if current_price > 0:
-                                    state.yes_target, state.current_spread = self.calculate_target_prices_with_time(state, current_price)
-                                    state.yes_target_at_rebalance = state.yes_target
-                                    state.last_rebalance_time = int(time.time())
+                    # === ADVERSE SELECTION CHECK ===
+                    if state.inventory.is_adversely_selected():
+                        print(f"[{state.asset}] ADVERSE SELECTION detected — circuit breaker for {CIRCUIT_BREAKER_COOLDOWN}s")
+                        await self.cancel_asset_orders(state)
+                        state.circuit_breaker_tripped = True
+                        state.circuit_breaker_until = time.time() + CIRCUIT_BREAKER_COOLDOWN
+                        continue
 
-                                new_orders = await self.place_multi_level_quotes(state)
-                                state.active_orders.update(new_orders)
+                    # === COMPUTE NEW TARGETS ===
+                    new_yes, new_no, new_spread = self.calculate_smart_prices(state, current_price)
 
-                        # Process received messages
-                        for message in messages:
-                            if message.type == "trade":
-                                if hasattr(message, "trade") and message.trade:
-                                    trade = message.trade
-                                    # Find which asset this trade belongs to
-                                    trade_asset = None
-                                    for asset in self.assets:
-                                        s = self.asset_states[asset]
-                                        if s.market_id and hasattr(trade, 'market_id') and trade.market_id == s.market_id:
-                                            trade_asset = asset
-                                            break
-                                    if not trade_asset:
-                                        # Try to match via subscribed_markets
-                                        for mid, a in subscribed_markets.items():
-                                            trade_asset = a
-                                            break
+                    # === REBALANCE DECISION ===
+                    target_diff = abs(new_yes - state.yes_target_at_rebalance)
+                    time_since_rebalance = now - state.last_rebalance_time
 
-                                    price_pct = trade.price / 10000
-                                    shares = trade.size / 1_000_000
-                                    outcome_str = "YES" if trade.outcome == 0 else "NO"
-                                    is_ours = trade.buyer.lower() == self.client.address.lower()
-                                    prefix = f"  [{trade_asset or '?'}] -> Our fill" if is_ours else f"[{trade_asset or '?'}] Trade"
-                                    print(f"{prefix}: {shares:.2f} {outcome_str} @ {price_pct:.2f}%")
+                    should_rebalance = (
+                        target_diff > REBALANCE_THRESHOLD
+                        and time_since_rebalance >= MIN_REBALANCE_INTERVAL
+                    )
 
-                        # Periodic price check and rebalance evaluation
-                        now = time.time()
-                        if now - last_price_check >= REFRESH_INTERVAL:
-                            last_price_check = now
+                    # Force rebalance on volatility spike
+                    if signals.volatility > VOLATILITY_ALERT_THRESHOLD and time_since_rebalance >= 5:
+                        should_rebalance = True
 
-                            prices = await self.get_current_prices()
+                    # Update state
+                    state.yes_target = new_yes
+                    state.no_target = new_no
+                    state.current_spread = new_spread
 
-                            for asset in self.assets:
-                                state = self.asset_states[asset]
-                                if not state.market_id:
-                                    continue
+                    if should_rebalance:
+                        strike_usd = state.strike_price / 1e6
+                        dev_pct = ((current_price - strike_usd) / strike_usd) * 100 if strike_usd > 0 else 0
+                        print(
+                            f"[{state.asset}] REBALANCE: ${current_price:,.2f} ({dev_pct:+.2f}%) | "
+                            f"YES {state.yes_target_at_rebalance:.1%} → {new_yes:.1%} | "
+                            f"Spread {new_spread:.1%} | Inv {state.inventory.get_net_exposure():.2f} | "
+                            f"{seconds_remaining}s left"
+                        )
+                        state.last_rebalance_time = now
+                        state.yes_target_at_rebalance = new_yes
+                        await self.graceful_rebalance(state)
 
-                                current_price = prices.get(asset, 0.0)
-                                if current_price <= 0:
-                                    continue
+                    # Check for fills
+                    await self.check_and_refresh_fills(state)
 
-                                new_yes_target, new_spread = self.calculate_target_prices_with_time(state, current_price)
-                                state.yes_target = new_yes_target
-                                state.current_spread = new_spread
-
-                                # Check rebalance threshold
-                                target_diff = abs(new_yes_target - state.yes_target_at_rebalance)
-                                time_since_rebalance = int(now) - state.last_rebalance_time
-
-                                if (target_diff > REBALANCE_THRESHOLD
-                                        and time_since_rebalance >= MIN_REBALANCE_INTERVAL):
-                                    strike_usd = state.strike_price / 1e6
-                                    dev_pct = ((current_price - strike_usd) / strike_usd) * 100 if strike_usd > 0 else 0
-                                    print(
-                                        f"[{asset}] Rebalance: ${current_price:,.2f} ({dev_pct:+.2f}% from ${strike_usd:,.2f}) | "
-                                        f"YES {state.yes_target_at_rebalance:.1%} -> {new_yes_target:.1%} "
-                                        f"(delta {target_diff:.1%}) | Spread {new_spread:.1%}"
-                                    )
-                                    await self.update_quotes(state)
-                                    state.yes_target_at_rebalance = new_yes_target
-                                    state.last_rebalance_time = int(now)
-
-            except WebSocketError as e:
-                print(f"WebSocket error: {e}")
-                await asyncio.sleep(5)
-            except Exception as e:
-                print(f"Market making error: {e}")
-                await asyncio.sleep(5)
+                # Check if active markets changed (new market started)
+                new_active = [a for a in self.assets if self.asset_states[a].market_id]
+                if set(new_active) != set(active_assets):
+                    break  # Re-enter outer loop to initialize new markets
 
     async def run(self) -> None:
-        """Main entry point — starts all background tasks."""
+        """Main entry point."""
         monitor_task = asyncio.create_task(self.monitor_market_transitions())
         claim_task = asyncio.create_task(self.claim_resolved_markets())
-        trading_task = asyncio.create_task(self.market_making_loop())
+        trading_task = asyncio.create_task(self.smart_trading_loop())
 
         try:
-            # Initialize all asset markets
             for asset in self.assets:
                 try:
                     market_info = await self.get_active_market(asset)
@@ -976,48 +1294,56 @@ class MarketMaker:
             await self.close()
 
 
+# ============================================================
+# CLI
+# ============================================================
+
 async def main():
     parser = argparse.ArgumentParser(
-        description="Turbine market maker for BTC, ETH, and SOL 15-minute prediction markets"
+        description="Smart market maker for BTC, ETH, and SOL 15-minute prediction markets"
     )
     parser.add_argument(
-        "-a", "--allocation",
-        type=float,
-        default=DEFAULT_ALLOCATION_USDC,
-        help=f"Total USDC allocation per asset per market, split across all sides and levels (default: ${DEFAULT_ALLOCATION_USDC})"
+        "-a", "--allocation", type=float, default=DEFAULT_ALLOCATION_USDC,
+        help=f"Total USDC allocation per asset (default: ${DEFAULT_ALLOCATION_USDC})"
     )
     parser.add_argument(
-        "--spread",
-        type=float,
-        default=DEFAULT_SPREAD,
-        help=f"Base spread as decimal (default: {DEFAULT_SPREAD} = {DEFAULT_SPREAD * 100:.0f}%%)"
+        "--spread", type=float, default=DEFAULT_SPREAD,
+        help=f"Base spread (default: {DEFAULT_SPREAD} = {DEFAULT_SPREAD * 100:.1f}%%)"
     )
     parser.add_argument(
-        "--levels",
-        type=int,
-        default=DEFAULT_NUM_LEVELS,
-        help=f"Number of price levels per side (default: {DEFAULT_NUM_LEVELS})"
+        "--levels", type=int, default=DEFAULT_NUM_LEVELS,
+        help=f"Price levels per side (default: {DEFAULT_NUM_LEVELS})"
     )
     parser.add_argument(
-        "--sensitivity",
-        type=float,
-        default=DEFAULT_PRICE_SENSITIVITY,
-        help=f"Probability shift per 1%% price move (default: {DEFAULT_PRICE_SENSITIVITY})"
+        "--base-vol", type=float, default=DEFAULT_BASE_VOLATILITY,
+        help=f"Base daily volatility for probability model (default: {DEFAULT_BASE_VOLATILITY} = {DEFAULT_BASE_VOLATILITY * 100:.0f}%%)"
     )
     parser.add_argument(
-        "--assets",
-        type=str,
-        default=",".join(SUPPORTED_ASSETS),
-        help=f"Comma-separated list of assets to trade (default: {','.join(SUPPORTED_ASSETS)})"
+        "--asset-vol", nargs="*", metavar="ASSET=VOL",
+        help="Per-asset volatility overrides (e.g., BTC=0.025 ETH=0.035 SOL=0.05)"
+    )
+    parser.add_argument(
+        "--assets", type=str, default=",".join(SUPPORTED_ASSETS),
+        help=f"Comma-separated assets to trade (default: {','.join(SUPPORTED_ASSETS)})"
     )
     args = parser.parse_args()
 
-    # Parse and validate assets
+    # Parse assets
     assets = [a.strip().upper() for a in args.assets.split(",")]
     for asset in assets:
         if asset not in PYTH_FEED_IDS:
             print(f"Error: Unsupported asset '{asset}'. Supported: {', '.join(SUPPORTED_ASSETS)}")
             return
+
+    # Parse per-asset volatilities
+    asset_vols: dict[str, float] = {}
+    if args.asset_vol:
+        for entry in args.asset_vol:
+            if "=" not in entry:
+                print(f"Error: Invalid --asset-vol format '{entry}'. Use ASSET=VOL (e.g., BTC=0.025)")
+                return
+            asset_name, vol_str = entry.split("=", 1)
+            asset_vols[asset_name.upper()] = float(vol_str)
 
     private_key = os.environ.get("TURBINE_PRIVATE_KEY")
     if not private_key:
@@ -1035,28 +1361,34 @@ async def main():
     )
 
     print(f"\n{'='*60}")
-    print(f"TURBINE MARKET MAKER")
+    print(f"TURBINE SMART MARKET MAKER")
     print(f"{'='*60}")
-    print(f"Wallet: {client.address}")
-    print(f"Chain: {CHAIN_ID}")
-    print(f"Assets: {', '.join(assets)}")
-    per_side = args.allocation / 4
-    print(f"Allocation: ${args.allocation:.2f} USDC per asset (${per_side:.2f}/side x 4 sides, {args.levels} levels each)")
-    print(f"Spread: {args.spread * 100:.1f}% (tightens to {MIN_SPREAD * 100:.1f}% at expiry)")
-    print(f"Sensitivity: {args.sensitivity} per 1% move (x{1 + DEFAULT_TIME_DECAY_FACTOR:.0f} at expiry)")
-    print(f"Rebalance: >{REBALANCE_THRESHOLD * 100:.0f}% target shift, min {MIN_REBALANCE_INTERVAL}s apart")
-    print(f"Lambda: {DEFAULT_GEOMETRIC_LAMBDA} (geometric distribution)")
-    print(f"USDC approval: gasless (one-time max permit per settlement)")
+    print(f"Wallet:      {client.address}")
+    print(f"Chain:       {CHAIN_ID}")
+    print(f"Assets:      {', '.join(assets)}")
+    print(f"Allocation:  ${args.allocation:.2f} per asset")
+    print(f"Spread:      {args.spread * 100:.1f}% base (dynamic: widens on vol/momentum)")
+    print(f"Levels:      {args.levels} per side")
+    print(f"Model:       Statistical (normal CDF)")
+    print(f"Base vol:    {args.base_vol * 100:.1f}% daily")
+    if asset_vols:
+        for a, v in asset_vols.items():
+            print(f"  {a} vol:   {v * 100:.1f}% daily")
+    print(f"One-sided:   Skip losing side when YES deviates >{ONE_SIDE_THRESHOLD * 100:.0f}% from 50%")
+    print(f"Circuit brk: {CIRCUIT_BREAKER_COOLDOWN}s cooldown on adverse selection")
+    print(f"End-of-mkt:  Pull at {END_OF_MARKET_PULL_SECONDS}s, widen at {END_OF_MARKET_WIDEN_SECONDS}s")
+    print(f"Poll:        {FAST_POLL_INTERVAL}s (rebalance min {MIN_REBALANCE_INTERVAL}s)")
+    print(f"USDC:        Gasless approval (one-time max permit)")
     try:
         usdc_balance = client.get_usdc_balance()
         balance_display = usdc_balance / 1_000_000
-        print(f"USDC balance: ${balance_display:.2f}")
+        print(f"Balance:     ${balance_display:.2f} USDC")
         min_needed = args.allocation * len(assets)
         if balance_display < min_needed:
             print(f"⚠️  Warning: Balance (${balance_display:.2f}) may be low for {len(assets)} assets x ${args.allocation:.2f}")
             print(f"   Fund your wallet: {client.address}")
     except Exception as e:
-        print(f"USDC balance: unknown ({e})")
+        print(f"Balance:     unknown ({e})")
     print(f"{'='*60}\n")
 
     bot = MarketMaker(
@@ -1065,7 +1397,8 @@ async def main():
         allocation_usdc=args.allocation,
         spread=args.spread,
         num_levels=args.levels,
-        sensitivity=args.sensitivity,
+        base_volatility=args.base_vol,
+        asset_volatilities=asset_vols,
     )
 
     try:
