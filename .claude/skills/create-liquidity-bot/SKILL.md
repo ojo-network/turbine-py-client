@@ -92,7 +92,7 @@ Before jumping into configuration, make sure the user understands what a market 
 >
 > **The bonus — Maker Rebates:** Turbine rewards liquidity providers through a **maker rebate program**. When your resting orders get filled, you earn rebates from a pool funded by virtual taker fees. The rebate formula is `fee_rate = 0.25 × (p × (1 - p))²` where `p` is the fill price — rebates peak at 50¢ (1.56% fee rate) and drop at extremes. Rebates are distributed daily based on your share of total maker volume. This means you earn from spread **plus** rebates.
 >
-> **The risk:** If BTC moves sharply in one direction, you might accumulate a large one-sided position (lots of YES shares, not enough NO shares). This is called **inventory risk**. Your bot manages this with position limits and probability-based pricing.
+> **The risk:** If BTC moves sharply in one direction, you might accumulate a large one-sided position (lots of YES shares, not enough NO shares). This is called **inventory risk**. Your bot manages this automatically with inventory tracking and quote skewing.
 
 **Do not proceed until they confirm they understand.** Use `AskUserQuestion`:
 - **"Does this make sense? Ready to configure your market maker?"**
@@ -102,24 +102,24 @@ If they want more info, answer their questions. Reference the maker rebates docs
 
 ### For users who know the basics:
 
-> We're building a probability-based market maker for Turbine's 15-min BTC binary markets. It quotes multi-level bid/ask ladders on both YES and NO outcomes using Pyth price feeds, with dynamic spread and time-decay sensitivity. Plus you earn maker rebates — up to 1.56% fee rate on fills near 50¢. Let's configure it.
+> We're building a smart market maker for Turbine's 15-min BTC/ETH/SOL binary markets. It uses a statistical probability model (normal CDF) with Pyth price feeds — correctly handles time decay, momentum, and volatility. Built-in inventory tracking, adverse selection detection, one-sided quoting, and circuit breaker. Plus maker rebates — up to 1.56% fee rate on fills near 50¢. Let's configure it.
 
 ### For experienced market makers:
 
-> Turbine MM bot — probability-based pricing from Pyth BTC/USD, geometric multi-level ladders, time-decay sensitivity, rebalance-on-threshold. Maker rebate program: `fee_rate = 0.25 × (p(1-p))²`, daily distribution pro-rata by maker volume. Let's set your parameters.
+> Turbine MM bot — P(YES) = Φ(deviation / (vol × √timeRemaining)) from Pyth feeds. Rolling price tracker with velocity/volatility/momentum signals. Inventory skew, adverse selection circuit breaker, one-sided quoting when target deviates >15% from 50%. Graceful rebalance (place-before-cancel). Maker rebate: `fee_rate = 0.25 × (p(1-p))²`, daily pro-rata. Let's set parameters.
 
 ---
 
 ## Step 2: Choose a Market Making Style
 
-If the user passed an argument (e.g., `/create-liquidity-bot inventory-aware`), use `$ARGUMENTS` to skip directly to that style.
+If the user passed an argument (e.g., `/create-liquidity-bot simple`), use `$ARGUMENTS` to skip directly to that style.
 
 Otherwise, ask what they're looking for. Use `AskUserQuestion`:
 
 **"What kind of market making approach interests you?"**
 
 Options:
-- "Recommend the best approach" → Probability-Based (see below)
+- "Recommend the best approach" → Smart MM (see below)
 - "I want something simple to start" → Simple Spread
 - "Show me all the options" → Present the table below
 
@@ -129,15 +129,14 @@ All styles place orders on both sides of the book. They differ in how they price
 
 | # | Style | How It Prices | Risk Management | Best For | Complexity |
 |---|-------|--------------|-----------------|----------|------------|
-| 1 | **Probability-Based** (recommended) | Uses Pyth BTC price vs strike to compute target probability. Spread tightens and sensitivity increases toward expiration. | Position limits, time-decay, rebalance threshold | Most users. Aligns pricing with market resolution. | Medium |
+| 1 | **Smart MM** (recommended) | Statistical model: P(YES) = Φ(deviation / (vol × √time)). Uses Pyth price vs strike with momentum and volatility signals. | Inventory tracking, adverse selection circuit breaker, one-sided quoting, end-of-market order pulling | Most users. State-of-the-art pricing aligned with market resolution. | Medium |
 | 2 | **Simple Spread** | Fixed spread around orderbook mid-price. No external price feed. | Position limits only | Learning MM basics. Quick start. | Low |
-| 3 | **Inventory-Aware** | Like Probability-Based, but skews quotes to reduce accumulated position. Widens on the side where you're overexposed. | Active inventory management + position limits | Extended running, lower risk | Higher |
 
-**Why Probability-Based is recommended:** It uses the same Pyth BTC oracle that Turbine uses for resolution — so your pricing is directly aligned with the market's ground truth. It dynamically adjusts as BTC price moves and as expiration approaches, giving you tighter quotes (more fills, more rebates) when the market outcome becomes clearer.
+**Why Smart MM is recommended:** It uses a proper statistical model to compute probabilities — the same Pyth oracle Turbine uses for resolution, run through a normal CDF that correctly handles how time remaining affects certainty. A +0.5% BTC move with 1 minute left is near-certain YES; the same move with 7 minutes left is only mildly bullish. The bot also tracks momentum (leads price moves), manages inventory (skews quotes to reduce exposure), detects adverse selection (trips a circuit breaker if getting picked off), and automatically kills the losing side when the market is trending strongly. All of this is built into the reference implementation.
 
-> **For beginners:** Recommend Probability-Based and explain: "This is the standard approach — your bot watches the real BTC price and uses it to decide where to place orders. It's smarter than a fixed spread because it adapts as BTC moves." Only show the full table if they ask.
+> **For beginners:** Recommend Smart MM and explain: "This is the battle-tested approach — your bot watches BTC price, computes the statistical probability of the outcome, and adapts its spread and quoting based on market conditions. It handles risk management automatically." Only show the full table if they ask.
 
-> **For experienced MMs:** They may want to customize heavily. Probability-Based is the best starting point — they can add inventory skew, custom sensitivity curves, or their own pricing model on top.
+> **For experienced MMs:** They may want to customize heavily. Smart MM is the best starting point — all the microstructure features are there to build on.
 
 Use `AskUserQuestion` to confirm their choice.
 
@@ -147,43 +146,44 @@ Use `AskUserQuestion` to confirm their choice.
 
 Walk the user through the key parameters for their chosen style. These directly control risk and profitability.
 
-### Universal MM Parameters
+### Smart MM Parameters (Style 1, recommended)
 
 **IMPORTANT — use these defaults. They're conservative on purpose:**
 
-- `--allocation` — **$10.00** total USDC split across all sides and levels ($2.50 per side: YES-bid, YES-ask, NO-bid, NO-ask)
-- `--spread` — **0.02** (2% base spread around target probability)
-- `--levels` — **6** price levels per side (geometric distribution concentrates at best price)
+| Flag | Default | What It Does |
+|------|---------|-------------|
+| `--allocation` | **$60** | Total USDC per asset, split across all sides and levels. With one-sided quoting, allocation concentrates on the active side. |
+| `--spread` | **0.012** (1.2%) | Base spread around target probability. Dynamically widens on high volatility or strong momentum. |
+| `--levels` | **6** | Price levels per side (geometric distribution concentrates at best price). |
+| `--base-vol` | **0.03** (3%) | Base daily volatility for the probability model. Higher = slower probability movement. |
+| `--asset-vol` | *(optional)* | Per-asset volatility overrides, e.g. `--asset-vol BTC=0.025 ETH=0.035 SOL=0.05` |
+| `--assets` | **BTC,ETH,SOL** | Which assets to trade. Can specify a subset. |
 
-Tell the user: "I've set conservative defaults — $10 total allocation with a 2% spread. This is real USDC. Start by watching how it behaves, then adjust once you're comfortable."
+Tell the user: "I've set proven defaults — $60 allocation with a 1.2% base spread. This is real USDC. Start by watching how it behaves, then adjust once you're comfortable."
 
 > **For beginners**, explain what each parameter means:
-> - "**Allocation** is the total USDC your bot splits across all its orders. With $10, each of the 4 sides (YES-bid, YES-ask, NO-bid, NO-ask) gets $2.50."
-> - "**Spread** is the gap between your buy and sell prices. A 2% spread means if the fair price is 50¢, you bid at 49¢ and ask at 51¢. Wider spread = safer but fewer fills. Tighter = more fills and rebates but more risk."
-> - "**Levels** is how many price points you quote per side. 6 levels means 6 different prices on the bid side and 6 on the ask side, with most size concentrated at the best price."
+> - "**Allocation** is the total USDC your bot uses per asset. The bot intelligently allocates more capital to the likely-winning side."
+> - "**Spread** is the base gap between your buy and sell prices. It automatically widens when the market is volatile or momentum is strong, and widens further in the last 90 seconds of each market."
+> - "**Base volatility** controls how quickly the probability model reacts. BTC with 3% daily vol means a 0.1% move in 15 minutes shifts probability moderately. Lower vol = more responsive. Higher vol = more stable."
+> - "**Levels** is how many price points you quote per side. 6 levels with geometric distribution means most of your capital is at the best price."
 
-### Probability-Based Parameters (Style 1, recommended)
+#### Built-in Smart Features (no configuration needed)
 
-- `--sensitivity` — **1.5** probability shift per 1% BTC price deviation from strike
-  - Higher = more aggressive price movement, follows BTC more closely
-  - Lower = more conservative, stays closer to 50/50
-- Rebalance threshold: **2%** — only refreshes quotes when target probability shifts by >2%
-- Time decay: sensitivity multiplies by **2.5x** at expiration, spread tightens to **0.5%** minimum
-  - "As expiration approaches, your bot gets more confident and quotes tighter — more fills, more rebates."
+These are automatic — explain them so users understand what the bot is doing:
+
+- **One-sided quoting:** When YES probability deviates >15% from 50%, the bot stops quoting the losing side entirely. Avoids getting picked off in directional moves.
+- **Inventory tracking:** After fills, the bot skews quotes to reduce net exposure. Long YES → widen YES bids, tighten YES asks.
+- **Adverse selection circuit breaker:** If one side gets filled disproportionately in 30 seconds, the bot pulls all orders and pauses for 10 seconds.
+- **End-of-market safety:** Orders pulled entirely in the last 30 seconds (too risky). Spread widens in the last 90 seconds.
+- **Smart fill replacement:** When orders get filled, replacements go in at the CURRENT fair value — not the old fill price.
+- **Graceful rebalance:** New orders placed BEFORE old ones are cancelled, so there's no gap in liquidity.
+- **Momentum tracking:** EMA-smoothed velocity signal shifts probability in the direction of price movement.
 
 ### Simple Spread Parameters (Style 2)
 
 - `--spread` — **0.04** (4% for simple spread — wider because no price intelligence)
-- No sensitivity or time decay — fixed spread around orderbook mid-price
-
-### Inventory-Aware Parameters (Style 3)
-
-- All Probability-Based parameters, PLUS:
-- `--skew-factor` — **0.01** per share of inventory imbalance
-  - "If you've accumulated 100 YES shares, the bot widens your YES bid by 1¢ and tightens your YES ask by 1¢ — discouraging more YES buying and encouraging selling."
-- `--max-position` — **$5.00** maximum position in any single outcome before the bot stops quoting that side
-
-> **For non-technical users:** Don't overwhelm with all parameters. Set sensible defaults and say: "I've configured everything with safe defaults. You can tweak these later once you see how the bot performs."
+- `--allocation` — **$10** (conservative for a simpler strategy)
+- No volatility model or smart features — fixed spread around orderbook mid-price
 
 ---
 
@@ -191,29 +191,20 @@ Tell the user: "I've set conservative defaults — $10 total allocation with a 2
 
 ### Reference implementation
 
-**`examples/market_maker.py`** is the reference for ALL market making styles. It's a complete, production-ready bot that handles:
-- Probability-based dynamic pricing from Pyth BTC price
-- Multi-level quoting with geometric size distribution
-- Time-decay sensitivity and spread tightening toward expiration
-- Cancel-then-place order refresh to avoid self-trade issues
-- Gasless USDC approval (one-time max permit per settlement)
-- Automatic market transition when 15-minute markets rotate
-- Automatic claiming of winnings from resolved markets
-- WebSocket for real-time trade notifications
+**`examples/market_maker.py`** is the reference for ALL market making styles. It's a complete, production-ready smart market maker that handles everything described above.
 
 **CRITICAL: Always read `examples/market_maker.py` before generating.** Do not use inline code snippets from this skill as the basis for generated code. The reference file contains tested, battle-hardened patterns.
 
 ### What changes between styles
 
-1. **Simple Spread (Style 2):** Simplify `calculate_target_prices_with_time()` to just use orderbook mid-price instead of Pyth. Remove Pyth price fetching. Keep everything else identical.
+1. **Smart MM (Style 1, recommended):** The reference IS the Smart MM. Copy it with the user's chosen parameters. Adjust defaults at the top of the file to match their choices.
 
-2. **Probability-Based (Style 1):** The reference IS a probability-based MM. Copy it with the user's chosen parameters.
-
-3. **Inventory-Aware (Style 3):** Start from the reference, then add:
-   - Position tracking via `client.get_user_positions(address)` in the main loop
-   - Quote skew in `place_multi_level_quotes()`: adjust bid/ask prices based on current inventory
-   - Position limit check: stop quoting one side if max position exceeded
-   - Add `--skew-factor` and `--max-position` CLI parameters
+2. **Simple Spread (Style 2):** Significantly simplify the reference:
+   - Remove `PriceTracker`, `InventoryTracker`, and the statistical model
+   - Replace `calculate_smart_prices()` with a simple midpoint + fixed spread
+   - Remove Pyth price fetching — use orderbook midpoint instead
+   - Remove circuit breaker, one-sided quoting, and momentum logic
+   - Keep: multi-level geometric distribution, market transitions, gasless approval, claiming
 
 ### Generation approach
 
@@ -226,9 +217,8 @@ Tell the user: "I've set conservative defaults — $10 total allocation with a 2
 ### File naming and location
 
 Save the generated bot in the **repo root** with a descriptive name:
-- `liquidity_bot.py` (probability-based)
+- `market_maker_bot.py` (smart MM)
 - `simple_spread_bot.py` (simple spread)
-- `inventory_mm_bot.py` (inventory-aware)
 
 Tell the user where you saved it.
 
@@ -251,7 +241,7 @@ After generating the bot, highlight the maker rebate program — this is a key i
 >
 > These fees fund a daily rebate pool distributed to makers proportional to their share of total maker fill volume. **The closer your fills are to 50¢, the more rebates you earn.**
 >
-> This is why market making on Turbine is attractive — you earn from spread AND rebates. Your bot's probability-based pricing naturally places orders near fair value, which tends to be near 50¢ early in each market.
+> This is why market making on Turbine is attractive — you earn from spread AND rebates. The smart MM's statistical pricing naturally places orders near fair value, which tends to be near 50¢ early in each market.
 >
 > Track the leaderboard at https://beta.turbinefi.com/leaderboard and learn more about rebates at https://beta.turbinefi.com/docs/maker-rebates.
 
@@ -270,12 +260,17 @@ source .venv/bin/activate    # If not already active
 python <bot_filename>.py
 ```
 
+With custom parameters:
+```bash
+python market_maker_bot.py --allocation 50 --spread 0.012 --assets BTC,ETH --asset-vol BTC=0.025 ETH=0.035
+```
+
 > **For non-technical users:** Be explicit:
 > - "Open a new terminal window (separate from this one). Navigate to the project folder:"
 >   ```
 >   cd [path to repo]
 >   source .venv/bin/activate
->   python liquidity_bot.py
+>   python market_maker_bot.py
 >   ```
 > - "You'll see text scrolling — that's your bot quoting prices and tracking fills."
 > - "To stop the bot, press `Ctrl+C`. The bot cancels all open orders on shutdown."
@@ -283,17 +278,22 @@ python <bot_filename>.py
 Explain what will happen on first run:
 1. **API credentials auto-register** — signs a message, gets API keys, saves to `.env`
 2. **USDC approval** — gasless max permit for the settlement contract (one-time)
-3. **Market connection** — fetches the current BTC market and its strike price
-4. **Initial quotes** — places multi-level bid/ask orders on both YES and NO outcomes
-5. **Price monitoring** — checks BTC price every 10 seconds, rebalances if target shifts >2%
-6. **Market rotation** — every 15 minutes, cancels old orders and quotes the new market
-7. **Claiming** — automatically claims winnings from resolved markets
+3. **Market connection** — fetches the current markets for each asset and their strike prices
+4. **Initial quotes** — places multi-level bid/ask orders with smart allocation
+5. **Fast price polling** — checks prices every 2 seconds via Pyth, updates probability model
+6. **Smart rebalance** — when target probability shifts >2%, gracefully replaces orders (new first, then cancel old)
+7. **Fill detection** — detects fills, records inventory, replaces at current fair value
+8. **Market rotation** — every 15 minutes, resets state and quotes the new market
+9. **Claiming** — automatically claims winnings from resolved markets
 
 > **What the output means:**
-> - `Quoting 6 levels x 2 outcomes: YES 62.0% / NO 38.0% | Spread 1.8% | $2.50/side` — your bot placed orders
-> - `Rebalance: BTC $97,450 (+0.15% from $97,300) | YES 55% -> 62%` — BTC moved, bot is re-quoting
-> - `-> Our fill: 10.00 YES @ 61.00%` — someone traded against your resting order (you earned spread + rebates!)
-> - `Claimed winnings from abc123... TX: 0x...` — won on a resolved market
+> - `[BTC] Quoting: YES 62% / NO 38% | Spread 1.5% | Sides 4/4 | Alloc YES[B=$12 S=$18] NO[B=$18 S=$12]` — smart allocation based on probability
+> - `[BTC] REBALANCE: $97,450 (+0.15%) | YES 55% → 62% | Spread 1.5% | Inv 0.12 | 420s left` — probability shifted, graceful requote
+> - `[BTC] ONE-SIDED: YES=0.72 — skipping NO orders (trending UP)` — strong trend, killing losing side
+> - `[BTC] FILL: BUY YES @ 0.5800 (size: 10.00)` — order filled, inventory updated
+> - `[BTC] ADVERSE SELECTION detected — circuit breaker for 10s` — protective pause
+> - `[BTC] PULLING all orders (25s remaining — too risky)` — end-of-market safety
+> - `[BTC] 💰 Claimed winnings from abc123... TX: 0x...` — won on a resolved market
 
 ---
 
@@ -302,22 +302,26 @@ Explain what will happen on first run:
 After the bot is running, suggest next steps based on the user's goals:
 
 **For competition/leaderboard users:**
-> Market makers can climb the leaderboard through consistent volume and PnL. Check https://beta.turbinefi.com/leaderboard. Tighter spreads = more fills = more rebates, but watch your inventory risk.
+> Market makers can climb the leaderboard through consistent volume and PnL. Check https://beta.turbinefi.com/leaderboard. The smart MM's statistical model gives you an edge — experiment with tighter spreads and per-asset volatility tuning.
 
 **For hackathon users:**
-> You've got a working MM bot! Consider adding inventory management, custom pricing curves, or multi-market support. Deploy to Railway with `/railway-deploy` so it runs 24/7.
+> You've got a production-grade MM bot! Consider customizing the volatility parameters for each asset, adjusting the one-side threshold, or adding your own signal on top of the statistical model. Deploy to Railway with `/railway-deploy` so it runs 24/7.
 
 **For explorers:**
-> Watch the logs to see how your bot prices and rebalances. Try adjusting the spread (tighter = more fills, riskier) or sensitivity (higher = more reactive to BTC moves). Each parameter change is a new experiment.
+> Watch the logs to see how the bot adapts. Key things to experiment with:
+> - `--spread` — tighter = more fills + rebates, but more risk
+> - `--base-vol` — lower = more reactive to price moves, higher = more stable
+> - `--asset-vol` — tune per asset (SOL is more volatile than BTC)
+> - Watch the one-sided quoting and circuit breaker in action during volatile periods
 
 **For everyone:**
 > - **Deploy 24/7** — run `/railway-deploy` to keep your bot running in the cloud
-> - **Try a directional bot** — run `/create-bot` to build a strategy that bets on outcomes instead of providing liquidity
-> - **Read the code** — `examples/market_maker.py` shows exactly what your bot does under the hood
-> - **Check your rebates** — visit https://beta.turbinefi.com/docs/maker-rebates for details on the daily rebate distribution
-> - **Explore liquidity rewards** — https://beta.turbinefi.com/docs/liquidity-rewards for additional incentive programs
+> - **Try a directional bot** — run `/create-bot` to build a strategy that bets on outcomes
+> - **Read the code** — `examples/market_maker.py` shows all the smart features
+> - **Check your rebates** — visit https://beta.turbinefi.com/docs/maker-rebates
+> - **Explore liquidity rewards** — https://beta.turbinefi.com/docs/liquidity-rewards
 
-**Update `user-context.md`** with a note about which bot was created (MM style, filename, parameters) under a `## Bots Created` section.
+**Update `user-context.md`** with a note about which bot was created (style, filename, parameters) under a `## Bots Created` section.
 
 ---
 
@@ -327,18 +331,22 @@ After the bot is running, suggest next steps based on the user's goals:
 
 1. **Gasless USDC approval:** One-time max EIP-2612 permit per settlement contract. Check allowance first, skip if already approved. Never do per-order approvals.
 
-2. **Cancel-then-place:** Always cancel existing orders before placing new ones. This avoids self-trade issues where your own bid and ask would fill against each other.
+2. **Graceful rebalance:** Place new orders FIRST, brief pause, then cancel old ones. This ensures continuous liquidity — no gap where traders can't trade. This is critical and different from cancel-then-place.
 
-3. **Market transitions:** Poll every 5 seconds for new markets. On transition: clear order tracking (expired orders are auto-removed by API), reset pricing state, approve USDC for new settlement if needed, place initial quotes.
+3. **Market transitions:** Poll every 5 seconds for new markets. On transition: clear order tracking (expired orders auto-removed by API), reset all smart state (price tracker, inventory, circuit breaker), approve USDC for new settlement if needed, place initial quotes.
 
-4. **Rebalance threshold:** Only refresh quotes when the YES target probability shifts by >2%. This avoids excessive order churn and API rate limits. Minimum 5 seconds between rebalances.
+4. **Rebalance threshold:** Only refresh quotes when YES target probability shifts by >2%. Minimum 2 seconds between rebalances. Force rebalance on volatility spikes.
 
-5. **Geometric distribution:** Concentrate liquidity at the best price (tightest level). Use `lambda^i` for bids and `lambda^(n-1-i)` for asks. This ensures most of your capital is at the most competitive price.
+5. **Geometric distribution:** Concentrate liquidity at the best price (tightest level). Use `lambda^i` for bids and `lambda^(n-1-i)` for asks. This ensures most capital is at the most competitive price.
 
-6. **Claiming:** Background task checks for resolved markets every 120 seconds. 15-second delay between individual claim calls (API rate limit).
+6. **Claiming:** Background task checks resolved markets every 120 seconds. 15-second delay between claims.
 
-7. **WebSocket + polling hybrid:** WebSocket provides real-time trade notifications. Periodic price polling (every 10s) from Pyth drives requoting decisions. Don't rely solely on either.
+7. **Fast polling:** 2-second price checks drive the statistical model. Price tracker maintains a rolling window with velocity, volatility, and momentum. This is what makes the model accurate.
 
-8. **Order expiration:** Set 5-minute expiration on all orders. This provides a safety net — if the bot crashes, orders auto-expire rather than sitting stale.
+8. **Order expiration:** 5-minute expiration on all orders — safety net if the bot crashes.
+
+9. **End-of-market:** Pull ALL orders in last 30 seconds. Widen spread in last 90 seconds. These prevent losses from resolution-time volatility.
+
+10. **Smart fill replacement:** Replace filled orders at CURRENT fair value, not the old fill price. This is the single most important edge vs naive market makers.
 
 These patterns are battle-tested. When in doubt, copy exactly from `examples/market_maker.py`.
