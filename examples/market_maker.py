@@ -1391,6 +1391,23 @@ async def main():
         print(f"Balance:     unknown ({e})")
     print(f"{'='*60}\n")
 
+    # Ensure USDC and CTF token approvals are in place before trading.
+    # USDC: checked against threshold, approved via gasless permit if low.
+    # CTF: setApprovalForAll is idempotent, so we call it unconditionally.
+    USDC_APPROVAL_THRESHOLD = 1_000_000_000  # 1000 USDC (6 decimals)
+    try:
+        allowance = client.get_usdc_allowance()
+        if allowance < USDC_APPROVAL_THRESHOLD:
+            print("USDC allowance low — approving via gasless permit...")
+            client.approve_usdc_for_settlement()
+            print("USDC approved ✓")
+        else:
+            print("USDC allowance sufficient ✓")
+        client.approve_ctf_for_settlement()
+        print("CTF (ERC1155) approved ✓")
+    except Exception as e:
+        print(f"Warning: Could not check/approve token allowances: {e}")
+
     bot = MarketMaker(
         client,
         assets=assets,
