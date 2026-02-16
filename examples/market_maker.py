@@ -1391,6 +1391,20 @@ async def main():
         print(f"Balance:     unknown ({e})")
     print(f"{'='*60}\n")
 
+    # Ensure USDC is approved for the settlement contract upfront.
+    # This prevents silent order failures when the trading loop starts.
+    USDC_APPROVAL_THRESHOLD = 1_000_000_000  # 1000 USDC (6 decimals)
+    try:
+        allowance = client.get_usdc_allowance()
+        if allowance < USDC_APPROVAL_THRESHOLD:
+            print("USDC allowance low — approving via gasless permit...")
+            client.approve_usdc_for_settlement()
+            print("USDC approved ✓")
+        else:
+            print("USDC allowance sufficient ✓")
+    except Exception as e:
+        print(f"Warning: Could not check/approve USDC allowance: {e}")
+
     bot = MarketMaker(
         client,
         assets=assets,
