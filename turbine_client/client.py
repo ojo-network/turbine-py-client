@@ -11,6 +11,12 @@ from turbine_client.exceptions import AuthenticationError, TurbineApiError
 from turbine_client.http import HttpClient
 from turbine_client.order_builder import OrderBuilder
 from turbine_client.signer import Signer, create_signer
+from turbine_client.discovery import (
+    DiscoveryResult,
+    MergeablePosition,
+    RPC_URLS as DISCOVERY_RPC_URLS,
+    discover_positions as _discover_positions,
+)
 from turbine_client.types import (
     AssetPrice,
     ClaimablePosition,
@@ -788,35 +794,6 @@ class TurbineClient:
             "count": response.get("count", 0),
             "totalPayout": response.get("totalPayout", "0.00"),
         }
-
-    def claim_all_winnings(self) -> Dict[str, Any]:
-        """Discover and claim all winnings in one call.
-
-        Uses the /claimable endpoint for fast discovery (DB-only, no RPC),
-        then batch claims all found markets.
-
-        Returns:
-            The relayer response with txHash on success.
-
-        Raises:
-            ValueError: If no claimable positions found.
-            AuthenticationError: If no signer is configured.
-        """
-        self._require_signer()
-        self._require_auth()
-
-        result = self.get_claimable_positions(verify=True)
-        positions = result["claimable"]
-
-        if not positions:
-            raise ValueError("No claimable positions found")
-
-        print(f"Found {len(positions)} claimable market(s) — total payout: ${result['totalPayout']}")
-        for p in positions:
-            print(f"  {p.contract_address}: {p.outcome_label} won, ${p.payout}")
-
-        market_addresses = [p.contract_address for p in positions]
-        return self.batch_claim_winnings(market_addresses)
 
     # =========================================================================
     # Relayer Endpoints (Gasless Operations)
@@ -1892,6 +1869,112 @@ class TurbineClient:
 
         print(f"Submitting batch redemption for {len(redemptions)} markets...")
         return self.request_batch_ctf_redemption(redemptions)
+
+    # =========================================================================
+    # Multicall3 Position Discovery
+    # =========================================================================
+
+    def discover_positions(
+        self,
+        address: Optional[str] = None,
+    ) -> DiscoveryResult:
+        """Discover all claimable and mergeable positions using Multicall3 batched on-chain reads.
+
+        This scans all quick markets (BTC, ETH, SOL) via the paginated API and all static
+        markets via Settlement.getMarket(), then uses Multicall3 to batch-read market data
+        and token balances. Much more reliable and faster than the /claimable DB endpoint.
+
+        Args:
+            address: Wallet address to check. Defaults to the signer's address.
+
+        Returns:
+            DiscoveryResult with claimable positions, mergeable positions, and totals.
+
+        Raises:
+            AuthenticationError: If no signer configured and no address provided.
+            ValueError: If no RPC URL available for the chain.
+        """
+        if address is None:
+            self._require_signer()
+            address = self._signer.address
+
+        from web3 import Web3
+
+        rpc_urls = {
+            137: "https://rpc.ankr.com/polygon/556256e69e5e244c3438d6a51748e56aefa65ae94a583bcde0d2c8f98571c652",
+            43114: "https://api.avax.network/ext/bc/C/rpc",
+            84532: "https://sepolia.base.org",
+        }
+        rpc_url = rpc_urls.get(self._chain_id)
+        if not rpc_url:
+            raise ValueError(f"No RPC URL for chain {self._chain_id}")
+
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+        return _discover_positions(
+            w3=w3,
+            wallet_address=address,
+            ctf_address=self._chain_config.ctf_address,
+            settlement_address=self._chain_config.settlement_address,
+            api_base_url=self._host,
+            http_client=self._http,
+        )
+
+    def claim_all_winnings(self) -> Dict[str, Any]:
+        """Discover and claim all winnings using Multicall3 discovery + gasless relayer.
+
+        Uses on-chain Multicall3 batched reads for reliable position discovery
+        (scanning all quick markets and static markets), then batch claims all
+        found positions via the gasless relayer.
+
+        Also reports any mergeable positions (paired YES+NO tokens).
+
+        Returns:
+            The relayer response with txHash on success.
+
+        Raises:
+            ValueError: If no claimable positions found.
+            AuthenticationError: If no signer is configured.
+        """
+        self._require_signer()
+        self._require_auth()
+
+        result = self.discover_positions()
+
+        if result.mergeable:
+            print(f"\nFound {len(result.mergeable)} mergeable position(s) — ${result.total_mergeable_usdc:.2f} recoverable:")
+            for m in result.mergeable:
+                print(f"  {m.contract_address} [{m.source}]: {m.mergeable_amount / 1_000_000:.2f} paired tokens")
+
+        if not result.claimable:
+            if result.mergeable:
+                print(f"\nNo claimable positions, but {len(result.mergeable)} mergeable positions found.")
+                print("Use discover_positions() to get details, or merge_positions() when supported.")
+            raise ValueError(
+                f"No claimable positions found (scanned {result.markets_scanned} markets)"
+            )
+
+        print(f"\nFound {len(result.claimable)} claimable market(s) — total payout: ${result.total_claimable_usdc:.2f}")
+        for p in result.claimable:
+            print(f"  {p.contract_address} [{p.source}]: {p.outcome_label} won, ${p.payout_usdc:.2f}")
+
+        market_addresses = [p.contract_address for p in result.claimable]
+        return self.batch_claim_winnings(market_addresses)
+
+    def get_mergeable_positions(
+        self,
+        address: Optional[str] = None,
+    ) -> List[MergeablePosition]:
+        """Get all mergeable positions (paired YES+NO tokens that can be merged to USDC).
+
+        Args:
+            address: Wallet address to check. Defaults to the signer's address.
+
+        Returns:
+            List of MergeablePosition with merge amounts.
+        """
+        result = self.discover_positions(address=address)
+        return result.mergeable
 
     # =========================================================================
     # API Key Registration (Self-Service Credentials)

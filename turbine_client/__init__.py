@@ -5,6 +5,11 @@ A Python client for market makers to interact with the Turbine CLOB prediction m
 """
 
 from turbine_client.client import TurbineClient
+from turbine_client.discovery import (
+    ClaimablePosition as DiscoveredClaimable,
+    DiscoveryResult,
+    MergeablePosition,
+)
 from turbine_client.types import (
     AssetPrice,
     ChainStats,
@@ -71,6 +76,10 @@ __all__ = [
     "SignedOrder",
     "Trade",
     "UserStats",
+    # Discovery types
+    "DiscoveryResult",
+    "DiscoveredClaimable",
+    "MergeablePosition",
     # Exceptions
     "TurbineError",
     "TurbineApiError",
