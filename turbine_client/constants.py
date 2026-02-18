@@ -43,6 +43,7 @@ ENDPOINTS = {
     "quick_market": "/api/v1/quick-markets/{asset}",
     "quick_market_history": "/api/v1/quick-markets/{asset}/history",
     "quick_market_price": "/api/v1/quick-markets/{asset}/price",
+    "quick_market_all": "/api/v1/quick-markets/{asset}/all",
     "quick_market_price_history": "/api/v1/quick-markets/{asset}/price-history",
 
     # Authenticated endpoints (bearer token)
