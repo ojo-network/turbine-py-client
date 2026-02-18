@@ -600,58 +600,68 @@ class MarketMaker:
     MAX_APPROVAL_THRESHOLD = (2**256 - 1) // 2
 
     def ensure_settlement_approved(self, settlement_address: str) -> None:
-        """Ensure USDC is approved via gasless max permit."""
+        """Ensure both USDC and CTF (ERC1155) are approved for a settlement contract.
+
+        Called dynamically when entering a new market — uses the actual per-market
+        settlement address from the API, not a hardcoded chain default.
+        """
         if settlement_address in self.approved_settlements:
             return
 
+        # --- USDC approval (EIP-2612 gasless permit) ---
         current_allowance = self.client.get_usdc_allowance(spender=settlement_address)
         if current_allowance >= self.MAX_APPROVAL_THRESHOLD:
-            print(f"  Existing USDC max approval found")
-            self.approved_settlements[settlement_address] = current_allowance
-            return
+            print(f"  USDC approval OK for {settlement_address[:10]}...")
+        else:
+            print(f"\n{'='*50}")
+            print(f"GASLESS USDC APPROVAL (one-time max permit)")
+            print(f"{'='*50}")
+            print(f"Settlement: {settlement_address}")
 
-        print(f"\n{'='*50}")
-        print(f"GASLESS USDC APPROVAL (one-time max permit)")
-        print(f"{'='*50}")
-        print(f"Settlement: {settlement_address}")
+            try:
+                result = self.client.approve_usdc_for_settlement(settlement_address)
+                tx_hash = result.get("tx_hash", "unknown")
+                print(f"Relayer TX: {tx_hash}")
+                print("Waiting for confirmation...")
 
+                from web3 import Web3
+                rpc_urls = {
+                    137: "https://polygon-rpc.com",
+                    43114: "https://api.avax.network/ext/bc/C/rpc",
+                    84532: "https://sepolia.base.org",
+                }
+                rpc_url = rpc_urls.get(self.client.chain_id)
+                w3 = Web3(Web3.HTTPProvider(rpc_url))
+
+                for _ in range(30):
+                    try:
+                        receipt = w3.eth.get_transaction_receipt(tx_hash)
+                        if receipt:
+                            if receipt["status"] == 1:
+                                print(f"Max USDC approval confirmed (gasless)")
+                            else:
+                                print(f"Transaction failed!")
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                else:
+                    print(f"Transaction pending (may still confirm)")
+
+            except Exception as e:
+                print(f"Gasless USDC approval failed: {e}")
+                raise
+
+            print(f"{'='*50}\n")
+
+        # --- CTF (ERC1155) approval (setApprovalForAll via relayer) ---
         try:
-            result = self.client.approve_usdc_for_settlement(settlement_address)
-            tx_hash = result.get("tx_hash", "unknown")
-            print(f"Relayer TX: {tx_hash}")
-            print("Waiting for confirmation...")
-
-            from web3 import Web3
-            rpc_urls = {
-                137: "https://polygon-rpc.com",
-                43114: "https://api.avax.network/ext/bc/C/rpc",
-                84532: "https://sepolia.base.org",
-            }
-            rpc_url = rpc_urls.get(self.client.chain_id)
-            w3 = Web3(Web3.HTTPProvider(rpc_url))
-
-            for _ in range(30):
-                try:
-                    receipt = w3.eth.get_transaction_receipt(tx_hash)
-                    if receipt:
-                        if receipt["status"] == 1:
-                            print(f"Max USDC approval confirmed (gasless)")
-                            self.approved_settlements[settlement_address] = 2**256 - 1
-                        else:
-                            print(f"Transaction failed!")
-                        break
-                except Exception:
-                    pass
-                time.sleep(1)
-            else:
-                print(f"Transaction pending (may still confirm)")
-                self.approved_settlements[settlement_address] = 2**256 - 1
-
+            self.client.approve_ctf_for_settlement(settlement_address=settlement_address)
+            print(f"  CTF (ERC1155) approved for {settlement_address[:10]}... ✓")
         except Exception as e:
-            print(f"Gasless approval failed: {e}")
-            raise
+            print(f"  CTF approval warning: {e}")
 
-        print(f"{'='*50}\n")
+        self.approved_settlements[settlement_address] = 2**256 - 1
 
     # ------------------------------------------------------------------
     # Order management
@@ -1386,22 +1396,9 @@ async def main():
         print(f"Balance:     unknown ({e})")
     print(f"{'='*60}\n")
 
-    # Ensure USDC and CTF token approvals are in place before trading.
-    # USDC: checked against threshold, approved via gasless permit if low.
-    # CTF: setApprovalForAll is idempotent, so we call it unconditionally.
-    USDC_APPROVAL_THRESHOLD = 1_000_000_000  # 1000 USDC (6 decimals)
-    try:
-        allowance = client.get_usdc_allowance()
-        if allowance < USDC_APPROVAL_THRESHOLD:
-            print("USDC allowance low — approving via gasless permit...")
-            client.approve_usdc_for_settlement()
-            print("USDC approved ✓")
-        else:
-            print("USDC allowance sufficient ✓")
-        client.approve_ctf_for_settlement()
-        print("CTF (ERC1155) approved ✓")
-    except Exception as e:
-        print(f"Warning: Could not check/approve token allowances: {e}")
+    # USDC and CTF approvals are now handled dynamically per settlement contract
+    # in ensure_settlement_approved() when entering each new market. This ensures
+    # the correct per-market settlement address is used (not a hardcoded default).
 
     bot = MarketMaker(
         client,

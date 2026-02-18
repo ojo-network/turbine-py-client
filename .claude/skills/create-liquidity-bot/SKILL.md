@@ -329,7 +329,7 @@ After the bot is running, suggest next steps based on the user's goals:
 
 **DO NOT modify these when generating bots.** They exist in `examples/market_maker.py` for a reason and must be preserved exactly:
 
-1. **Gasless USDC approval:** One-time max EIP-2612 permit per settlement contract. Check allowance first, skip if already approved. Never do per-order approvals.
+1. **Gasless USDC + CTF approval:** Dynamic per-market settlement address from the API (not hardcoded). One-time max EIP-2612 permit for USDC + setApprovalForAll for CTF per settlement contract. Handled in `ensure_settlement_approved()` when entering each market. Never do per-order approvals or use chain config defaults.
 
 2. **Graceful rebalance:** Place new orders FIRST, brief pause, then cancel old ones. This ensures continuous liquidity — no gap where traders can't trade. This is critical and different from cancel-then-place.
 
