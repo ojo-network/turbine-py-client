@@ -28,7 +28,7 @@ Features:
   - Allocation skew: more capital on the likely-winning side
   - Auto-approves USDC gaslessly when entering a new market
   - Automatic market transition when 15-minute markets rotate
-  - Automatic claiming of winnings from resolved markets
+  - Automatic claiming of winnings via Multicall3 on-chain discovery (every 5 min)
 
 Usage:
     TURBINE_PRIVATE_KEY=0x... python examples/market_maker.py
@@ -1088,43 +1088,38 @@ class MarketMaker:
             await asyncio.sleep(5)
 
     async def claim_resolved_markets(self) -> None:
-        """Background task to claim winnings from resolved markets."""
+        """Background task to periodically discover and claim all winnings.
+
+        Uses Multicall3-based on-chain discovery (claim_all_winnings) to find
+        and claim ALL resolved positions — not just markets traded in this session.
+        This ensures the MM recycles liquidity from any prior session or wallet activity.
+        """
+        # Wait for initial market setup before first claim attempt
+        await asyncio.sleep(60)
+
         while self.running:
             try:
-                all_traded: list[tuple[str, str, AssetState]] = []
+                print("[CLAIM] Scanning for claimable positions (Multicall3 discovery)...")
+                result = self.client.claim_all_winnings()
+                tx_hash = result.get("txHash", result.get("tx_hash", "unknown"))
+                print(f"[CLAIM] 💰 Claimed winnings! TX: {tx_hash}")
+
+                # Clear tracked markets that were just claimed
                 for state in self.asset_states.values():
-                    for market_id, contract_address in list(state.traded_markets.items()):
-                        all_traded.append((market_id, contract_address, state))
+                    state.traded_markets.clear()
 
-                if not all_traded:
-                    await asyncio.sleep(120)
-                    continue
-
-                for market_id, contract_address, state in all_traded:
-                    try:
-                        resolution = self.client.get_resolution(market_id)
-                        if not (resolution and resolution.resolved):
-                            continue
-                    except Exception:
-                        continue
-
-                    try:
-                        result = self.client.claim_winnings(contract_address)
-                        tx_hash = result.get("txHash", result.get("tx_hash", "unknown"))
-                        print(f"[{state.asset}] 💰 Claimed winnings from {market_id[:8]}... TX: {tx_hash}")
-                        del state.traded_markets[market_id]
-                    except ValueError as e:
-                        if "no winning tokens" in str(e).lower():
-                            del state.traded_markets[market_id]
-                    except Exception as e:
-                        print(f"[{state.asset}] Claim error: {e}")
-
-                    await asyncio.sleep(15)
-
+            except ValueError as e:
+                # "No claimable positions found" — normal, nothing to claim
+                if "no claimable" in str(e).lower():
+                    print(f"[CLAIM] No claimable positions found — all clear")
+                else:
+                    print(f"[CLAIM] Error: {e}")
             except Exception as e:
-                print(f"Claim monitor error: {e}")
+                print(f"[CLAIM] Discovery/claim error: {e}")
 
-            await asyncio.sleep(120)
+            # Run every 5 minutes — frequent enough to recycle liquidity promptly
+            # after 15-min markets resolve, without hammering the RPC
+            await asyncio.sleep(300)
 
     # ------------------------------------------------------------------
     # Main trading loop (fast poll)
