@@ -1091,7 +1091,7 @@ class TurbineClient:
 
         # Get RPC URL based on chain
         rpc_urls = {
-            137: "https://polygon-rpc.com",
+            137: "https://polygon-bor-rpc.publicnode.com",
             43114: "https://api.avax.network/ext/bc/C/rpc",
             84532: "https://sepolia.base.org",
         }
@@ -1189,7 +1189,7 @@ class TurbineClient:
 
         # Get RPC URL
         rpc_urls = {
-            137: "https://polygon-rpc.com",
+            137: "https://polygon-bor-rpc.publicnode.com",
             43114: "https://api.avax.network/ext/bc/C/rpc",
             84532: "https://sepolia.base.org",
         }
@@ -1251,7 +1251,7 @@ class TurbineClient:
 
         # Get RPC URL
         rpc_urls = {
-            137: "https://polygon-rpc.com",
+            137: "https://polygon-bor-rpc.publicnode.com",
             43114: "https://api.avax.network/ext/bc/C/rpc",
             84532: "https://sepolia.base.org",
         }
@@ -1295,7 +1295,7 @@ class TurbineClient:
 
         # Get RPC URL
         rpc_urls = {
-            137: "https://polygon-rpc.com",
+            137: "https://polygon-bor-rpc.publicnode.com",
             43114: "https://api.avax.network/ext/bc/C/rpc",
             84532: "https://sepolia.base.org",
         }
