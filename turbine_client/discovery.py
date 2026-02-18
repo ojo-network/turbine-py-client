@@ -16,19 +16,6 @@ logger = logging.getLogger(__name__)
 # Contract addresses (Polygon)
 MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
-# Static market IDs (Polygon)
-STATIC_MARKET_IDS = [
-    "0x9ef68d1cf6450b35846d786cebd636e3ceb2107d070873fb5780ea2d333520e0",
-    "0xe88d501bc0f3fdd3b0f1a74b6757d034208f3b99d2f94b47aeb70376e7608161",
-    "0xc6e9afe44c6c2fc0c56a06af3e8f53d8f66ec27ac31ddee3a8b67e30bcb6543e",
-    "0xc5d907faab0877c21ae8a10350f7ba687f3daf16369bdaf71e6c161960456dbd",
-    "0xfb685d9ad03dc23bcb41ac0df6226d07db0c6fb7e51830654d6a5a68947b32c6",
-    "0xa1cf90a2f2f3931da7056206707cccc2249e073fc88e6b7f9f69d64f062a054c",
-    "0x556e706daaeecbddf9b438b477ba01e2894b3eaabe616566fd76f2df242b3834",
-    "0x15012b370083695ef90c07c2f66a93799220036830d6ddff7f208c12347786f9",
-    "0x053632bd94ab326e0b3537eb202cf8763cb2eb479d0bc149241732e5f32f4fd8",
-]
-
 # Quick market assets to scan
 QUICK_MARKET_ASSETS = ["BTC", "ETH", "SOL"]
 
@@ -44,7 +31,6 @@ RPC_URLS = {
 
 # Function selectors
 SELECTORS = {
-    "getMarket": "0xeb86e42a",          # getMarket(bytes32)
     "conditionId": "0x2ddc7de7",        # conditionId()
     "yesTokenId": "0x76cd28a2",         # yesTokenId()
     "noTokenId": "0x8c2557a8",          # noTokenId()
@@ -211,53 +197,6 @@ def _fetch_all_quick_markets(
     return candidates
 
 
-def _resolve_static_markets(
-    w3: Web3,
-    settlement_address: str,
-) -> List[MarketCandidate]:
-    """Resolve static market contract addresses via Settlement.getMarket() using Multicall3.
-
-    Args:
-        w3: Web3 instance.
-        settlement_address: The settlement contract address.
-
-    Returns:
-        List of MarketCandidate for static markets.
-    """
-    if not STATIC_MARKET_IDS:
-        return []
-
-    calls = []
-    for market_id in STATIC_MARKET_IDS:
-        # getMarket(bytes32) - pack manually
-        market_id_bytes = bytes.fromhex(market_id[2:]) if market_id.startswith("0x") else bytes.fromhex(market_id)
-        calldata = bytes.fromhex(SELECTORS["getMarket"][2:]) + market_id_bytes.ljust(32, b'\x00')
-        calls.append((settlement_address, calldata))
-
-    try:
-        results = _do_multicall(w3, calls)
-    except Exception as e:
-        logger.warning("Failed to resolve static markets: %s", e)
-        return []
-
-    candidates = []
-    for i, result in enumerate(results):
-        if len(result) < 32:
-            continue
-        # Address is in the last 20 bytes of the 32-byte return
-        addr = "0x" + result[12:32].hex()
-        if addr == "0x" + "00" * 20:
-            continue
-        candidates.append(MarketCandidate(
-            market_id=STATIC_MARKET_IDS[i],
-            contract_address=Web3.to_checksum_address(addr),
-            source="static",
-        ))
-
-    logger.info("Resolved %d/%d static markets", len(candidates), len(STATIC_MARKET_IDS))
-    return candidates
-
-
 def _batch_read_market_data(
     w3: Web3,
     candidates: List[MarketCandidate],
@@ -393,17 +332,16 @@ def discover_positions(
     """Discover all claimable and mergeable positions using Multicall3.
 
     This is the main entry point for position discovery. It:
-    1. Fetches all quick markets from the paginated API
-    2. Resolves static market contract addresses via Settlement.getMarket()
-    3. Batch reads market data (conditionId, tokenIds, resolution status)
-    4. Batch reads CTF balances and payout denominators
-    5. Identifies claimable (resolved, winning tokens) and mergeable (paired YES+NO) positions
+    1. Fetches all quick markets (BTC, ETH, SOL) from the paginated API
+    2. Batch reads market data (conditionId, tokenIds, resolution status)
+    3. Batch reads CTF balances and payout denominators
+    4. Identifies claimable (resolved, winning tokens) and mergeable (paired YES+NO) positions
 
     Args:
         w3: Web3 instance connected to the chain RPC.
         wallet_address: The wallet address to check.
         ctf_address: The CTF contract address.
-        settlement_address: The settlement contract address.
+        settlement_address: Unused (kept for API compatibility).
         api_base_url: The API base URL.
         http_client: HTTP client for API calls.
 
@@ -413,11 +351,10 @@ def discover_positions(
     wallet_address = Web3.to_checksum_address(wallet_address)
     result = DiscoveryResult()
 
-    # Step 1: Collect all market candidates
-    logger.info("Collecting market candidates...")
+    # Step 1: Collect all quick market candidates
+    logger.info("Collecting quick market candidates...")
 
-    candidates = _resolve_static_markets(w3, settlement_address)
-    candidates.extend(_fetch_all_quick_markets(api_base_url, http_client))
+    candidates = _fetch_all_quick_markets(api_base_url, http_client)
 
     if not candidates:
         logger.info("No market candidates found")
