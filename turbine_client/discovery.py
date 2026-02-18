@@ -325,7 +325,6 @@ def discover_positions(
     w3: Web3,
     wallet_address: str,
     ctf_address: str,
-    settlement_address: str,
     api_base_url: str,
     http_client: Any,
 ) -> DiscoveryResult:
@@ -341,7 +340,6 @@ def discover_positions(
         w3: Web3 instance connected to the chain RPC.
         wallet_address: The wallet address to check.
         ctf_address: The CTF contract address.
-        settlement_address: Unused (kept for API compatibility).
         api_base_url: The API base URL.
         http_client: HTTP client for API calls.
 

@@ -1915,7 +1915,6 @@ class TurbineClient:
             w3=w3,
             wallet_address=address,
             ctf_address=self._chain_config.ctf_address,
-            settlement_address=self._chain_config.settlement_address,
             api_base_url=self._host,
             http_client=self._http,
         )
