@@ -14,7 +14,6 @@ from turbine_client.signer import Signer, create_signer
 from turbine_client.discovery import (
     DiscoveryResult,
     MergeablePosition,
-    RPC_URLS as DISCOVERY_RPC_URLS,
     discover_positions as _discover_positions,
 )
 from turbine_client.types import (
@@ -1086,30 +1085,17 @@ class TurbineClient:
         return self._get_contract_nonce(owner, ctf_address)
 
     def _get_contract_nonce(self, owner: str, contract_address: str) -> int:
-        """Get the current nonce for an owner from a contract's nonces() function."""
-        from web3 import Web3
+        """Get the current nonce for an owner from a contract's nonces() function.
 
-        # Get RPC URL based on chain
-        rpc_urls = {
-            137: "https://polygon-bor-rpc.publicnode.com",
-            43114: "https://api.avax.network/ext/bc/C/rpc",
-            84532: "https://sepolia.base.org",
-        }
-        rpc_url = rpc_urls.get(self._chain_id)
-        if not rpc_url:
-            print(f"Warning: No RPC URL for chain {self._chain_id}, using nonce 0")
-            return 0
-
+        Routes through the Turbine API to avoid direct RPC calls.
+        """
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc_url))
-            # nonces(address) -> uint256
-            nonce_data = w3.eth.call({
-                "to": contract_address,
-                "data": "0x7ecebe00" + owner[2:].lower().zfill(64),  # nonces(address)
-            })
-            return int(nonce_data.hex(), 16)
+            endpoint = f"/api/v1/contracts/nonce/{contract_address}/{owner}"
+            params = {"chain_id": str(self._chain_id)}
+            response = self._http.get(endpoint, params=params)
+            return int(response.get("nonce", 0))
         except Exception as e:
-            print(f"Warning: Failed to get nonce from {contract_address}: {e}, using 0")
+            print(f"Warning: Failed to get nonce from API for {contract_address}: {e}, using 0")
             return 0
 
     def _get_and_increment_permit_nonce(self, owner: str, contract_address: str) -> int:
@@ -1139,7 +1125,7 @@ class TurbineClient:
         return nonce
 
     def sync_permit_nonce(self, contract_address: Optional[str] = None) -> int:
-        """Sync the local permit nonce with the blockchain.
+        """Sync the local permit nonce with the on-chain state via the API.
 
         Use this after transactions have settled to ensure local tracking
         matches on-chain state, or after a permit failure to resync.
@@ -1164,67 +1150,96 @@ class TurbineClient:
         self,
         amount: int,
         spender: Optional[str] = None,
-    ) -> str:
-        """Approve USDC spending for the settlement contract (on-chain transaction).
+    ) -> Dict[str, Any]:
+        """Approve USDC spending for the settlement contract via gasless permit.
 
-        This is an alternative to permit-based approval. Use this for high-frequency
-        trading scenarios where permit nonce management becomes a bottleneck.
+        This uses the relayer's gasless permit flow instead of sending an on-chain
+        transaction directly. No native gas is required.
+
+        For max approval, use approve_usdc_for_settlement() instead.
 
         Args:
             amount: The amount to approve (with 6 decimals for USDC).
             spender: The spender address. Defaults to settlement contract.
 
         Returns:
-            The transaction hash.
+            The relayer response with tx_hash on success.
 
         Raises:
             AuthenticationError: If no signer is configured.
         """
         self._require_signer()
+        self._require_auth()
 
-        from web3 import Web3
+        import time
+        from eth_account import Account
 
+        MAX_UINT256 = 2**256 - 1
+
+        owner = self._signer.address
         spender = spender or self._chain_config.settlement_address
         usdc_address = self._chain_config.usdc_address
 
-        # Get RPC URL
-        rpc_urls = {
-            137: "https://polygon-bor-rpc.publicnode.com",
-            43114: "https://api.avax.network/ext/bc/C/rpc",
-            84532: "https://sepolia.base.org",
+        # Get nonce from API
+        nonce = self._get_contract_nonce(owner, usdc_address)
+
+        # USDC EIP-712 domain varies by network
+        is_testnet = self._chain_id in [84532]
+        token_name = "Mock USDC" if is_testnet else "USD Coin"
+        token_version = "1" if is_testnet else "2"
+
+        deadline = int(time.time()) + 3600
+
+        typed_data = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "Permit": [
+                    {"name": "owner", "type": "address"},
+                    {"name": "spender", "type": "address"},
+                    {"name": "value", "type": "uint256"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "deadline", "type": "uint256"},
+                ],
+            },
+            "primaryType": "Permit",
+            "domain": {
+                "name": token_name,
+                "version": token_version,
+                "chainId": self._chain_id,
+                "verifyingContract": usdc_address,
+            },
+            "message": {
+                "owner": owner,
+                "spender": spender,
+                "value": amount,
+                "nonce": nonce,
+                "deadline": deadline,
+            },
         }
-        rpc_url = rpc_urls.get(self._chain_id)
-        if not rpc_url:
-            raise ValueError(f"No RPC URL for chain {self._chain_id}")
 
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-
-        # ERC20 approve function signature: approve(address,uint256)
-        approve_selector = "0x095ea7b3"
-        approve_data = (
-            approve_selector
-            + spender[2:].lower().zfill(64)
-            + hex(amount)[2:].zfill(64)
+        signed = Account.sign_typed_data(
+            self._signer._account.key,
+            full_message=typed_data,
         )
 
-        # Build transaction
-        nonce = w3.eth.get_transaction_count(self._signer.address)
-        gas_price = w3.eth.gas_price
+        v = signed.v
+        r = "0x" + hex(signed.r)[2:].zfill(64)
+        s = "0x" + hex(signed.s)[2:].zfill(64)
 
-        tx = {
-            "to": usdc_address,
-            "data": approve_data,
-            "gas": 100000,
-            "gasPrice": gas_price,
-            "nonce": nonce,
-            "chainId": self._chain_id,
-        }
-
-        # Sign and send
-        signed_tx = w3.eth.account.sign_transaction(tx, self._signer._account.key)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-
-        return tx_hash.hex()
+        return self.request_usdc_permit(
+            owner=owner,
+            spender=spender,
+            value=amount,
+            deadline=deadline,
+            v=v,
+            r=r,
+            s=s,
+        )
 
     def get_usdc_allowance(
         self,
@@ -1233,6 +1248,8 @@ class TurbineClient:
     ) -> int:
         """Get the current USDC allowance for a spender.
 
+        Routes through the Turbine API to avoid direct RPC calls.
+
         Args:
             owner: The token owner. Defaults to signer address.
             spender: The spender address. Defaults to settlement contract.
@@ -1240,44 +1257,21 @@ class TurbineClient:
         Returns:
             The current allowance (with 6 decimals).
         """
-        from web3 import Web3
-
         owner = owner or (self._signer.address if self._signer else None)
         if not owner:
             raise ValueError("Owner address required (no signer configured)")
 
         spender = spender or self._chain_config.settlement_address
-        usdc_address = self._chain_config.usdc_address
 
-        # Get RPC URL
-        rpc_urls = {
-            137: "https://polygon-bor-rpc.publicnode.com",
-            43114: "https://api.avax.network/ext/bc/C/rpc",
-            84532: "https://sepolia.base.org",
-        }
-        rpc_url = rpc_urls.get(self._chain_id)
-        if not rpc_url:
-            raise ValueError(f"No RPC URL for chain {self._chain_id}")
-
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-
-        # allowance(address,address) -> uint256
-        allowance_selector = "0xdd62ed3e"
-        allowance_data = (
-            allowance_selector
-            + owner[2:].lower().zfill(64)
-            + spender[2:].lower().zfill(64)
-        )
-
-        result = w3.eth.call({
-            "to": usdc_address,
-            "data": allowance_data,
-        })
-
-        return int(result.hex(), 16)
+        endpoint = f"/api/v1/users/{owner}/balances"
+        params = {"chain_id": str(self._chain_id), "spender": spender}
+        response = self._http.get(endpoint, params=params)
+        return int(response.get("allowance", "0"))
 
     def get_usdc_balance(self, owner: Optional[str] = None) -> int:
         """Get the USDC balance for an address.
+
+        Routes through the Turbine API to avoid direct RPC calls.
 
         Args:
             owner: The address to check. Defaults to signer address.
@@ -1285,36 +1279,14 @@ class TurbineClient:
         Returns:
             The USDC balance (raw, 6 decimals).
         """
-        from web3 import Web3
-
         owner = owner or (self._signer.address if self._signer else None)
         if not owner:
             raise ValueError("Owner address required (no signer configured)")
 
-        usdc_address = self._chain_config.usdc_address
-
-        # Get RPC URL
-        rpc_urls = {
-            137: "https://polygon-bor-rpc.publicnode.com",
-            43114: "https://api.avax.network/ext/bc/C/rpc",
-            84532: "https://sepolia.base.org",
-        }
-        rpc_url = rpc_urls.get(self._chain_id)
-        if not rpc_url:
-            raise ValueError(f"No RPC URL for chain {self._chain_id}")
-
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-
-        # balanceOf(address) -> uint256
-        balance_selector = "0x70a08231"
-        balance_data = balance_selector + owner[2:].lower().zfill(64)
-
-        result = w3.eth.call({
-            "to": usdc_address,
-            "data": balance_data,
-        })
-
-        return int(result.hex(), 16)
+        endpoint = f"/api/v1/users/{owner}/balances"
+        params = {"chain_id": str(self._chain_id)}
+        response = self._http.get(endpoint, params=params)
+        return int(response.get("balance", "0"))
 
     def sign_usdc_permit(
         self,
@@ -1465,8 +1437,8 @@ class TurbineClient:
     ) -> Dict[str, Any]:
         """Claim winnings from a resolved market using gasless permit.
 
-        This queries the market contract for resolution status and condition data,
-        signs an EIP-712 permit, and submits to the relayer for gasless execution.
+        Queries market data via the Turbine API (no direct RPC), signs an
+        EIP-712 permit, and submits to the relayer for gasless execution.
 
         Args:
             market_contract_address: The market's contract address.
@@ -1483,120 +1455,47 @@ class TurbineClient:
 
         import time
         from eth_account import Account
-        from web3 import Web3
 
         owner = self._signer.address
 
-        # Get RPC URL
-        rpc_urls = {
-            137: "https://polygon-bor-rpc.publicnode.com",
-            43114: "https://avalanche-c-chain-rpc.publicnode.com",
-            84532: "https://base-sepolia-rpc.publicnode.com",
+        # Fetch all claim data from the API (no RPC needed)
+        endpoint = f"/api/v1/users/{owner}/claim-data"
+        params = {
+            "chain_id": str(self._chain_id),
+            "markets": market_contract_address,
         }
-        rpc_url = rpc_urls.get(self._chain_id)
-        if not rpc_url:
-            raise ValueError(f"No RPC URL for chain {self._chain_id}")
+        response = self._http.get(endpoint, params=params)
+        markets = response.get("markets", [])
 
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-        print(f"Connected to RPC: {rpc_url}")
+        if not markets:
+            raise ValueError(f"No claim data available for market {market_contract_address}")
 
-        # Ensure address is checksummed
-        market_contract_address = Web3.to_checksum_address(market_contract_address)
-        print(f"Market address: {market_contract_address}")
+        m = markets[0]
 
-        # Query individual getters from market contract
-        # ctf() -> address
-        print("Querying ctf()...")
-        ctf_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": "0x22a9339f",  # ctf()
-        })
-        ctf_address = Web3.to_checksum_address("0x" + ctf_data[12:32].hex())
-        print(f"CTF address: {ctf_address}")
-
-        # collateralToken() -> address
-        collateral_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": "0xb2016bd4",  # collateralToken()
-        })
-        collateral_token = Web3.to_checksum_address("0x" + collateral_data[12:32].hex())
-
-        # conditionId() -> bytes32
-        condition_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": "0x2ddc7de7",  # conditionId()
-        })
-        condition_id = "0x" + condition_data.hex()
-
-        # yesTokenId() -> uint256
-        yes_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": "0x76cd28a2",  # yesTokenId()
-        })
-        yes_token_id = int(yes_data.hex(), 16)
-
-        # noTokenId() -> uint256
-        no_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": "0x8c2557a8",  # noTokenId()
-        })
-        no_token_id = int(no_data.hex(), 16)
-
-        print(f"Market data:")
-        print(f"  CTF: {ctf_address}")
-        print(f"  Collateral: {collateral_token}")
-        print(f"  Condition ID: {condition_id}")
-
-        # Query getResolutionStatus() from market contract
-        # Returns: (expired, resolved, assertionId, winningOutcome, canPropose, canSettle)
-        resolution_selector = "0x13b63fce"  # getResolutionStatus()
-        resolution_data = w3.eth.call({
-            "to": market_contract_address,
-            "data": resolution_selector,
-        })
-
-        # Decode: bool, bool, bytes32, uint8, bool, bool
-        # Each value is padded to 32 bytes:
-        # expired: bytes 0-32 (value at byte 31)
-        # resolved: bytes 32-64 (value at byte 63)
-        # assertionId: bytes 64-96
-        # winningOutcome: bytes 96-128 (uint8 padded)
-        resolved = bool(resolution_data[63])
-        winning_outcome = int(resolution_data[96:128].hex(), 16)
-
-        if not resolved:
+        if not m["resolved"]:
             raise ValueError("Market is not resolved yet")
 
-        print(f"  Resolved: {resolved}")
-        print(f"  Winning outcome: {'YES' if winning_outcome == 0 else 'NO'}")
-
-        # Check user's winning token balance
-        winning_token_id = yes_token_id if winning_outcome == 0 else no_token_id
-
-        # balanceOf(address, uint256) -> uint256
-        balance_selector = "0x00fdd58e"  # balanceOf(address,uint256)
-        balance_call = balance_selector + owner[2:].lower().zfill(64) + hex(winning_token_id)[2:].zfill(64)
-        balance_data = w3.eth.call({
-            "to": ctf_address,
-            "data": balance_call,
-        })
-        balance = int(balance_data.hex(), 16)
-
+        balance = int(m["winning_balance"])
         if balance == 0:
             raise ValueError("No winning tokens to redeem")
 
+        ctf_address = m["ctf_address"]
+        collateral_token = m["collateral_token"]
+        condition_id = m["condition_id"]
+        winning_outcome = m["winning_outcome"]
+        nonce = int(m["ctf_nonce"])
+
+        print(f"Market data (via API):")
+        print(f"  CTF: {ctf_address}")
+        print(f"  Collateral: {collateral_token}")
+        print(f"  Condition ID: {condition_id}")
+        print(f"  Resolved: True")
+        print(f"  Winning outcome: {'YES' if winning_outcome == 0 else 'NO'}")
         print(f"  Winning token balance: {balance / 1_000_000:.2f}")
 
-        # Get nonce from CTF contract
-        nonce = self._get_contract_nonce(owner, ctf_address)
-
-        # Set deadline
         deadline = int(time.time()) + 3600
-
-        # indexSets: [1] for YES, [2] for NO
         index_sets = [1 if winning_outcome == 0 else 2]
 
-        # Build EIP-712 typed data for RedeemPositions
         typed_data = {
             "types": {
                 "EIP712Domain": [
@@ -1633,7 +1532,6 @@ class TurbineClient:
             },
         }
 
-        # Sign the typed data
         signed = Account.sign_typed_data(
             self._signer._account.key,
             full_message=typed_data,
@@ -1700,8 +1598,8 @@ class TurbineClient:
     ) -> Dict[str, Any]:
         """Claim winnings from multiple resolved markets using gasless permits.
 
-        This queries each market contract for resolution status and condition data,
-        signs EIP-712 permits for each, and submits a batch to the relayer.
+        Queries all market data via the Turbine API (no direct RPC), signs
+        EIP-712 permits for each, and submits a batch to the relayer.
 
         Args:
             market_contract_addresses: List of market contract addresses to claim from.
@@ -1710,7 +1608,7 @@ class TurbineClient:
             The relayer response with txHash on success.
 
         Raises:
-            ValueError: If any market is not resolved or user has no winnings.
+            ValueError: If no markets have winning tokens to redeem.
             AuthenticationError: If no signer is configured.
         """
         self._require_signer()
@@ -1718,89 +1616,44 @@ class TurbineClient:
 
         import time
         from eth_account import Account
-        from web3 import Web3
 
         owner = self._signer.address
 
-        # Get RPC URL
-        rpc_urls = {
-            137: "https://polygon-bor-rpc.publicnode.com",
-            43114: "https://avalanche-c-chain-rpc.publicnode.com",
-            84532: "https://base-sepolia-rpc.publicnode.com",
+        # Fetch all claim data from the API in one call
+        endpoint = f"/api/v1/users/{owner}/claim-data"
+        params = {
+            "chain_id": str(self._chain_id),
+            "markets": ",".join(market_contract_addresses),
         }
-        rpc_url = rpc_urls.get(self._chain_id)
-        if not rpc_url:
-            raise ValueError(f"No RPC URL for chain {self._chain_id}")
+        response = self._http.get(endpoint, params=params)
+        markets_data = response.get("markets", [])
 
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
         redemptions = []
-        nonce_tracker = {}  # {ctf_address: next_nonce} — incremented locally per redemption
+        nonce_tracker = {}  # {ctf_address: next_nonce}
 
-        for market_address in market_contract_addresses:
-            market_address = Web3.to_checksum_address(market_address)
+        for m in markets_data:
+            market_address = m["market_address"]
 
-            # Query market contract data
-            ctf_data = w3.eth.call({
-                "to": market_address,
-                "data": "0x22a9339f",  # ctf()
-            })
-            ctf_address = Web3.to_checksum_address("0x" + ctf_data[12:32].hex())
-
-            collateral_data = w3.eth.call({
-                "to": market_address,
-                "data": "0xb2016bd4",  # collateralToken()
-            })
-            collateral_token = Web3.to_checksum_address("0x" + collateral_data[12:32].hex())
-
-            condition_data = w3.eth.call({
-                "to": market_address,
-                "data": "0x2ddc7de7",  # conditionId()
-            })
-            condition_id = "0x" + condition_data.hex()
-
-            yes_data = w3.eth.call({
-                "to": market_address,
-                "data": "0x76cd28a2",  # yesTokenId()
-            })
-            yes_token_id = int(yes_data.hex(), 16)
-
-            no_data = w3.eth.call({
-                "to": market_address,
-                "data": "0x8c2557a8",  # noTokenId()
-            })
-            no_token_id = int(no_data.hex(), 16)
-
-            # Check resolution status
-            resolution_data = w3.eth.call({
-                "to": market_address,
-                "data": "0x13b63fce",  # getResolutionStatus()
-            })
-            resolved = bool(resolution_data[63])
-            winning_outcome = int(resolution_data[96:128].hex(), 16)
-
-            if not resolved:
+            if not m["resolved"]:
                 print(f"Skipping {market_address}: not resolved")
                 continue
 
-            # Check balance
-            winning_token_id = yes_token_id if winning_outcome == 0 else no_token_id
-            balance_call = "0x00fdd58e" + owner[2:].lower().zfill(64) + hex(winning_token_id)[2:].zfill(64)
-            balance_data = w3.eth.call({
-                "to": ctf_address,
-                "data": balance_call,
-            })
-            balance = int(balance_data.hex(), 16)
-
+            balance = int(m["winning_balance"])
             if balance == 0:
                 print(f"Skipping {market_address}: no winning tokens")
                 continue
 
-            # Get nonce and sign — track per-CTF nonces locally to avoid
-            # stale nonce when batching multiple redemptions through the same CTF
+            ctf_address = m["ctf_address"]
+            collateral_token = m["collateral_token"]
+            condition_id = m["condition_id"]
+            winning_outcome = m["winning_outcome"]
+
+            # Track per-CTF nonces locally to avoid stale nonce in batch
             if ctf_address not in nonce_tracker:
-                nonce_tracker[ctf_address] = self._get_contract_nonce(owner, ctf_address)
+                nonce_tracker[ctf_address] = int(m["ctf_nonce"])
             nonce = nonce_tracker[ctf_address]
             nonce_tracker[ctf_address] = nonce + 1
+
             deadline = int(time.time()) + 3600
             index_sets = [1 if winning_outcome == 0 else 2]
 
@@ -1878,11 +1731,10 @@ class TurbineClient:
         self,
         address: Optional[str] = None,
     ) -> DiscoveryResult:
-        """Discover all claimable and mergeable positions using Multicall3 batched on-chain reads.
+        """Discover all claimable and mergeable positions via the Turbine API.
 
-        This scans all quick markets (BTC, ETH, SOL) via the paginated API and all static
-        markets via Settlement.getMarket(), then uses Multicall3 to batch-read market data
-        and token balances. Much more reliable and faster than the /claimable DB endpoint.
+        Uses the /users/:address/claimable API endpoint for position discovery.
+        No direct RPC connection is required.
 
         Args:
             address: Wallet address to check. Defaults to the signer's address.
@@ -1892,31 +1744,16 @@ class TurbineClient:
 
         Raises:
             AuthenticationError: If no signer configured and no address provided.
-            ValueError: If no RPC URL available for the chain.
         """
         if address is None:
             self._require_signer()
             address = self._signer.address
 
-        from web3 import Web3
-
-        rpc_urls = {
-            137: "https://rpc.ankr.com/polygon/556256e69e5e244c3438d6a51748e56aefa65ae94a583bcde0d2c8f98571c652",
-            43114: "https://api.avax.network/ext/bc/C/rpc",
-            84532: "https://sepolia.base.org",
-        }
-        rpc_url = rpc_urls.get(self._chain_id)
-        if not rpc_url:
-            raise ValueError(f"No RPC URL for chain {self._chain_id}")
-
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-
         return _discover_positions(
-            w3=w3,
             wallet_address=address,
-            ctf_address=self._chain_config.ctf_address,
             api_base_url=self._host,
             http_client=self._http,
+            chain_id=self._chain_id,
         )
 
     def claim_all_winnings(self) -> Dict[str, Any]:
