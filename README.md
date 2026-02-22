@@ -37,6 +37,9 @@ This client provides a clean, typed interface for:
 - Submitting orders to the Turbine orderbook
 - Managing positions and tracking fills
 - Subscribing to real-time orderbook updates via WebSocket
+- Gasless USDC approvals and claiming winnings via API relayer
+
+**Fully API-routed** — no RPC URL, web3 dependency, or blockchain node access required. Everything goes through `api.turbinefi.com`.
 
 ## Table of Contents
 
@@ -79,6 +82,8 @@ To trade on Turbine, you need:
 1. **Wallet Private Key** - Your Ethereum wallet's private key for signing orders
 2. **API Key ID** - Identifier for your API key
 3. **API Private Key** - Ed25519 private key for authenticating API requests
+
+No RPC URL or native gas tokens are required. The SDK routes all operations through the Turbine API.
 
 ### Self-Service Registration
 
@@ -385,7 +390,7 @@ print(f"Current BTC: ${price.price}")
 
 ## Claiming Winnings
 
-After a market resolves, you can claim your winnings using gasless permits (no gas required).
+After a market resolves, you can claim your winnings via the API's gasless relayer (no RPC or gas tokens required).
 
 ### Single Market
 

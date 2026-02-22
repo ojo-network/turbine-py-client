@@ -364,7 +364,7 @@ After the bot is running, suggest next steps based on the user's goals (from `us
 
 1. **Order verification chain:** After `post_order()`, sleep 2 seconds, then check failed trades → pending trades → recent trades → open orders. This sequence ensures the bot knows the true state of its order. Skipping steps causes phantom orders or missed fills.
 
-2. **Gasless USDC approval:** One-time max EIP-2612 permit per settlement contract. Check allowance first, skip if already approved. Never do per-order approvals.
+2. **Gasless USDC approval:** One-time gasless permit via API per settlement contract. `approve_usdc()` returns a dict with `tx_hash` key (not a raw tx hash string). Check allowance first via API, skip if already approved. Never do per-order approvals. No web3 or RPC needed.
 
 3. **Market transitions:** Poll every 5 seconds for new markets. On transition: cancel all orders on the old market, reset state (pending orders, processed trade IDs, expiration flag), approve USDC for the new settlement if needed, then resume trading.
 
