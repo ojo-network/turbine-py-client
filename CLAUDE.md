@@ -47,6 +47,8 @@ This matters because it dramatically lowers the barrier to entry. A new user doe
 
 Turbine runs an off-chain orderbook (CLOB) with on-chain settlement. Orders are signed off-chain using EIP-712, matched by Turbine's API, then settled on-chain via modified Gnosis CTF smart contracts. Market resolution is handled by the UMA Optimistic Oracle — after 15 minutes, the oracle checks BTC's price against the strike and declares a winner. The 1% flat fee per trade is the only cost.
 
+**From the SDK's perspective**, everything goes through the Turbine API — there are no direct RPC or on-chain calls. USDC approvals use gasless permits via `/relayer/usdc-permit`, balance/allowance checks go through `/users/:address/balances`, claims go through `/users/:address/claim-data` + the relayer, and contract nonces come from `/contracts/nonce/:contract/:owner`.
+
 ### Competitions and Hackathons
 
 Turbine is actively growing its user base through two channels:
@@ -60,6 +62,8 @@ Turbine is actively growing its user base through two channels:
 ## What This Repo Is
 
 This is the official Python SDK for Turbine's API, bundled with example trading bots and Claude Code skills for bot generation. It exists to get people trading on Turbine as fast as possible.
+
+**The SDK is fully API-routed** — all operations go through `api.turbinefi.com`. There is no RPC URL, no web3 dependency, and no direct blockchain node access required. Users only need a private key, chain ID, and the API host.
 
 **Why it exists:** Turbine is a prediction markets platform, but a platform without traders is empty. This repo is the primary onboarding funnel — it's how new users go from "curious" to "actively trading." The easier it is to clone this repo, build a bot, and start competing, the more traders Turbine gets.
 
@@ -213,7 +217,7 @@ When a user wants to create or modify a bot:
 
 4. **Preserve critical infrastructure patterns.** These exist in every working bot and must not be removed or altered:
    - **Order verification chain:** After submitting an order, wait 2 seconds, then check failed trades → pending trades → recent trades → open orders. This sequence ensures the bot knows the true state of its order.
-   - **Gasless USDC approval:** One-time max EIP-2612 permit per settlement contract. Check allowance first, skip if already approved.
+   - **Gasless USDC approval:** One-time gasless permit via API per settlement contract. `approve_usdc()` returns a dict with `tx_hash` (not a raw tx hash string). Check allowance first via API, skip if already approved.
    - **Market transitions:** Poll for new markets every 5 seconds. When a new market appears, cancel all orders on the old market, reset state, and start trading the new one.
    - **Claiming:** Background task that checks for resolved markets and claims winnings via the gasless relayer. Enforce a 15-second delay between claims (API rate limit).
    - **Market expiration:** Stop placing new orders when less than 60 seconds remain in a market. The `market_expiring` flag prevents the bot from getting stuck with orders on an expired market.
@@ -255,7 +259,7 @@ client.get_user_positions(address)       # Current positions
 client.get_orders(trader)                # Open orders
 
 # Gasless relayer operations
-client.approve_usdc_for_settlement(addr) # One-time max USDC permit (gasless)
+client.approve_usdc_for_settlement(addr) # One-time gasless permit via API (returns dict with tx_hash)
 client.claim_winnings(contract_addr)     # Claim from a resolved market (gasless)
 client.batch_claim_winnings(addrs)       # Claim from multiple markets at once
 ```
@@ -275,8 +279,8 @@ For a deeper explanation aimed at newcomers, see `docs/prediction-markets.md`.
 - **Strike price:** The BTC price threshold set when the market opens. If BTC ends above it, YES wins. Below, NO wins. This is the anchor that every trading decision revolves around.
 - **Settlement address:** The on-chain contract that holds USDC collateral and executes trades. There's one per chain, shared across all markets. Requires a one-time gasless approval before the bot can trade.
 - **Contract address:** A per-market contract for outcome tokens (ERC1155). Only needed when claiming winnings after a market resolves — not during trading.
-- **Gasless:** Turbine's relayer pays all gas fees. Users sign messages with their private key (free, off-chain), and the relayer handles on-chain submission. This is why users only need USDC — no ETH, MATIC, or AVAX.
-- **USDC approval:** A one-time max EIP-2612 permit per settlement contract. Once approved, all future orders on that chain reuse the allowance. No per-trade approval overhead.
+- **Gasless:** The SDK is fully API-routed — all operations (approvals, claims, balance checks) go through Turbine's API, which handles on-chain submission via a relayer. Users sign messages with their private key (free, off-chain) and never need RPC access, web3, or native gas tokens (no ETH, MATIC, or AVAX). Only USDC is needed.
+- **USDC approval:** A one-time gasless EIP-2612 permit via the API's `/relayer/usdc-permit` endpoint. Returns a dict with `tx_hash`. Once approved, all future orders on that chain reuse the allowance. No per-trade approval overhead.
 - **UMA Oracle:** The decentralized oracle that resolves markets. After a market expires, UMA checks BTC's price and declares whether YES or NO wins. This is trustless — no single party controls the outcome.
 - **Pyth Network:** Provides real-time BTC price data. This is the same feed Turbine uses for market resolution, which is why the Price Action strategy (which trades based on Pyth data) is recommended — the bot's signal aligns with how winners are determined.
 

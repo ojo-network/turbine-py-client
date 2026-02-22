@@ -65,7 +65,7 @@ TURBINE_HOST=https://api.turbinefi.com
 - `TURBINE_PRIVATE_KEY` — Your wallet's signing key. Used locally to sign transactions.
 - `TURBINE_API_KEY_ID` / `TURBINE_API_PRIVATE_KEY` — Leave blank. The bot auto-registers API credentials on first run and fills these in.
 - `CHAIN_ID=137` — Polygon mainnet, where Turbine's active markets are.
-- `TURBINE_HOST` — Turbine's API endpoint.
+- `TURBINE_HOST` — Turbine's API endpoint. All SDK operations route through this — no RPC URL or web3 needed.
 
 ## 4. Fund Your Wallet
 
@@ -111,7 +111,7 @@ python price_action_bot.py
 ### What happens on first run
 
 1. **API credentials register** — the bot signs a message with your wallet, gets API keys, and saves them to `.env`
-2. **USDC approval** — a one-time gasless permit is signed to allow trading
+2. **USDC approval** — a one-time gasless permit is signed via the API (no RPC or gas tokens needed)
 3. **Trading starts** — the bot fetches the current BTC market, runs its strategy, and places trades
 4. **Market rotation** — every 15 minutes the market expires and a new one opens. The bot switches automatically.
 5. **Claiming** — the bot claims winnings from resolved markets in the background

@@ -228,7 +228,7 @@ TURBINE_HOST=https://api.turbinefi.com
 - `TURBINE_PRIVATE_KEY` — Their wallet's signing key. Never leaves this machine.
 - `TURBINE_API_KEY_ID` / `TURBINE_API_PRIVATE_KEY` — Left blank intentionally. The bot auto-registers API credentials on first run and saves them back to this file.
 - `CHAIN_ID=137` — Polygon mainnet. This is where Turbine's active markets are.
-- `TURBINE_HOST` — Turbine's API endpoint.
+- `TURBINE_HOST` — Turbine's API endpoint. All SDK operations (approvals, claims, balance checks) route through this — no RPC URL or web3 needed.
 
 ---
 
