@@ -146,11 +146,12 @@ class AssetState:
         self.contract_address: str | None = None
         self.strike_price: int = 0  # Price when market created (6 decimals)
         self.position_usdc: dict[str, float] = {}  # market_id -> usdc spent
-        self.active_orders: dict[str, str] = {}  # order_hash -> side
+        self.active_orders: dict[str, str] = {}  # order_hash -> action (BUY_YES/BUY_NO)
         self.processed_trade_ids: set[int] = set()
         self.pending_order_txs: set[str] = set()
         self.traded_markets: dict[str, str] = {}  # market_id -> contract_address
         self.market_expiring = False
+        self.last_signal: str | None = None  # Track signal direction for order cancellation
 
 
 class PriceActionBot:
@@ -396,8 +397,33 @@ class PriceActionBot:
             print(f"[{state.asset}] ${current_price:,.2f} is {price_diff_pct:+.2f}% below strike ${strike_usd:,.2f}")
             return "BUY_NO", confidence
 
+    def confidence_to_price(self, action: str, confidence: float) -> int:
+        """Convert a trading signal + confidence into a limit order price.
+
+        For BUY_YES: confidence 0.6 → price 600000 (60%), confidence 0.9 → 900000 (90%)
+        For BUY_NO:  we buy NO shares, price = confidence (how confident NO wins)
+
+        We offset slightly from fair value to leave room for spread/profit.
+        """
+        # Fair value estimate based on confidence
+        fair_value = int(confidence * 1_000_000)
+
+        # Offset: bid below fair value (we want to buy cheap)
+        offset = int(0.02 * 1_000_000)  # 2% edge
+        price = fair_value - offset
+
+        # Clamp to valid range
+        price = max(10_000, min(price, 990_000))  # 1% to 99%
+        return price
+
     async def execute_signal(self, state: AssetState, action: str, confidence: float) -> None:
-        """Execute the trading signal using gasless max permit (no per-order permits)."""
+        """Execute the trading signal by posting a resting limit order.
+
+        Posts limit orders to the orderbook at a price derived from the confidence
+        signal. If there's already a matching ask at or below our price, the order
+        fills immediately (like a marketable limit). Otherwise it rests on the book
+        for other bots to trade against.
+        """
         if action == "HOLD" or confidence < MIN_CONFIDENCE:
             return
 
@@ -417,18 +443,21 @@ class PriceActionBot:
 
         outcome = Outcome.YES if action == "BUY_YES" else Outcome.NO
 
+        # Calculate our limit price from the signal confidence
+        price = self.confidence_to_price(action, confidence)
+
+        # Check orderbook — if there's a good ask at or below our price, we'll fill immediately
+        # If not, our order rests on the book for others to trade against
         try:
             orderbook = self.client.get_orderbook(state.market_id, outcome=outcome)
+            if orderbook.asks and orderbook.asks[0].price <= price:
+                # There's a fillable ask — bump price slightly above to ensure fill
+                price = min(orderbook.asks[0].price + 5000, 990_000)
+                print(f"[{state.asset}] Taking existing ask at {orderbook.asks[0].price / 10000:.1f}%")
+            else:
+                print(f"[{state.asset}] Posting resting bid at {price / 10000:.1f}% (conf: {confidence:.0%})")
         except Exception as e:
-            print(f"[{state.asset}] Failed to get orderbook: {e}")
-            return
-
-        if not orderbook.asks:
-            print(f"[{state.asset}] No asks available for {outcome.name}")
-            return
-
-        # Pay slightly above best ask to ensure fill
-        price = min(orderbook.asks[0].price + 5000, 999000)
+            print(f"[{state.asset}] Orderbook unavailable, posting blind at {price / 10000:.1f}%: {e}")
 
         # Calculate shares from USDC amount
         shares = self.calculate_shares_from_usdc(self.order_size_usdc, price)
@@ -454,7 +483,7 @@ class PriceActionBot:
                 outcome=outcome,
                 price=price,
                 size=shares,
-                expiration=int(time.time()) + 300,
+                expiration=int(time.time()) + 600,  # 10 min — stays on book most of market life
                 settlement_address=state.settlement_address,
             )
 
@@ -582,14 +611,30 @@ class PriceActionBot:
                         continue
 
                     action, confidence = await self.calculate_signal(state, current_price)
+
                     if action != "HOLD":
-                        await self.execute_signal(state, action, confidence)
+                        # If signal flipped direction, cancel old resting orders
+                        if state.last_signal and state.last_signal != action and state.active_orders:
+                            print(f"[{state.asset}] Signal flipped {state.last_signal} → {action}, cancelling stale orders")
+                            await self.cancel_asset_orders(state)
+
+                        # Only post a new order if we don't already have one resting
+                        if not state.active_orders:
+                            await self.execute_signal(state, action, confidence)
+                            state.last_signal = action
+                        else:
+                            print(f"[{state.asset}] Already have {len(state.active_orders)} resting order(s) - holding")
                     else:
                         strike_usd = state.strike_price / 1e6
                         if strike_usd > 0:
                             diff_pct = ((current_price - strike_usd) / strike_usd) * 100
                             pos = self.get_position_usdc(state, state.market_id)
                             print(f"[{asset}] ${current_price:,.2f} ({diff_pct:+.2f}% from ${strike_usd:,.2f}) | Pos: ${pos:.2f}/${self.max_position_usdc:.2f} - HOLD")
+                        # Signal is HOLD — cancel any resting orders (we're not confident)
+                        if state.active_orders:
+                            print(f"[{state.asset}] Signal went to HOLD, cancelling resting orders")
+                            await self.cancel_asset_orders(state)
+                            state.last_signal = None
 
                 await asyncio.sleep(PRICE_POLL_SECONDS)
             except Exception as e:
