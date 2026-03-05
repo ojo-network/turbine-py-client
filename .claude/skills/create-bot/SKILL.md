@@ -362,17 +362,13 @@ After the bot is running, suggest next steps based on the user's goals (from `us
 
 ### For directional trading bots (price_action_bot.py - algorithms 1, 4, 5, 6):
 
-1. **Order verification chain:** After `post_order()`, sleep 2 seconds, then check failed trades → pending trades → recent trades → open orders. This sequence ensures the bot knows the true state of its order. Skipping steps causes phantom orders or missed fills.
+1. **Order verification chain:** After `post_order()`, fire a background task that sleeps 2 seconds, then checks failed trades → pending trades → recent trades → open orders. This runs via `asyncio.create_task()` so it doesn't block the next order placement. The sequence ensures the bot tracks the true state of its orders without sacrificing trading speed.
 
 2. **Gasless USDC approval:** One-time gasless permit via API per settlement contract. `approve_usdc()` returns a dict with `tx_hash` key (not a raw tx hash string). Check allowance first via API, skip if already approved. Never do per-order approvals. No web3 or RPC needed.
 
-3. **Market transitions:** Poll every 5 seconds for new markets. On transition: cancel all orders on the old market, reset state (pending orders, processed trade IDs, expiration flag), approve USDC for the new settlement if needed, then resume trading.
+3. **Market transitions:** Poll every 5 seconds for new markets. On transition: cancel all orders on the old market, reset state (pending orders, processed trade IDs), approve USDC for the new settlement if needed, then resume trading.
 
 4. **Claiming:** Background task checks for resolved markets every 120 seconds. Enforce 15-second delay between individual claim calls (API rate limit). Remove markets from tracking after successful claim or if no position exists.
-
-5. **Market expiration:** Set `market_expiring = True` when < 60 seconds remain. Stop placing new orders. Reset the flag when switching to the new market.
-
-6. **Pending order tracking:** Track TX hashes of submitted orders. Don't place new orders while any are still pending settlement. Clean up pending orders by checking the API.
 
 ### For market making bots (market_maker.py - algorithms 2, 3):
 

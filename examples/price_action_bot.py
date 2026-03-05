@@ -60,10 +60,10 @@ TURBINE_HOST = os.environ.get("TURBINE_HOST", "http://localhost:8080")
 # Default trading parameters (in USDC terms)
 DEFAULT_ORDER_SIZE_USDC = 1.0  # $1 USDC per order
 DEFAULT_MAX_POSITION_USDC = 10.0  # $10 max position per asset per market
-PRICE_POLL_SECONDS = 10  # How often to check prices
+PRICE_POLL_SECONDS = 5  # How often to check prices
 
 # Price Action parameters
-PRICE_THRESHOLD_BPS = 10  # 0.1% threshold before taking action
+PRICE_THRESHOLD_BPS = 5  # 0.05% threshold before taking action
 MIN_CONFIDENCE = 0.6  # Minimum confidence to place a trade
 MAX_CONFIDENCE = 0.9  # Cap confidence at 90%
 
@@ -150,8 +150,6 @@ class AssetState:
         self.processed_trade_ids: set[int] = set()
         self.pending_order_txs: set[str] = set()
         self.traded_markets: dict[str, str] = {}  # market_id -> contract_address
-        self.market_expiring = False
-        self.last_signal: str | None = None  # Track signal direction for order cancellation
 
 
 class PriceActionBot:
@@ -419,20 +417,11 @@ class PriceActionBot:
     async def execute_signal(self, state: AssetState, action: str, confidence: float) -> None:
         """Execute the trading signal by posting a resting limit order.
 
-        Posts limit orders to the orderbook at a price derived from the confidence
-        signal. If there's already a matching ask at or below our price, the order
-        fills immediately (like a marketable limit). Otherwise it rests on the book
-        for other bots to trade against.
+        Always posts limit orders to the orderbook at a price derived from the
+        confidence signal. Orders rest on the book for other bots to trade against.
+        Verification of order status runs as a background task to avoid blocking.
         """
         if action == "HOLD" or confidence < MIN_CONFIDENCE:
-            return
-
-        if state.pending_order_txs:
-            print(f"[{state.asset}] ⏳ Waiting for {len(state.pending_order_txs)} pending order(s) to settle...")
-            return
-
-        if state.market_expiring:
-            print(f"[{state.asset}] ⏰ Market expiring soon - not placing new orders")
             return
 
         # Check position limits (in USDC)
@@ -445,19 +434,7 @@ class PriceActionBot:
 
         # Calculate our limit price from the signal confidence
         price = self.confidence_to_price(action, confidence)
-
-        # Check orderbook — if there's a good ask at or below our price, we'll fill immediately
-        # If not, our order rests on the book for others to trade against
-        try:
-            orderbook = self.client.get_orderbook(state.market_id, outcome=outcome)
-            if orderbook.asks and orderbook.asks[0].price <= price:
-                # There's a fillable ask — bump price slightly above to ensure fill
-                price = min(orderbook.asks[0].price + 5000, 990_000)
-                print(f"[{state.asset}] Taking existing ask at {orderbook.asks[0].price / 10000:.1f}%")
-            else:
-                print(f"[{state.asset}] Posting resting bid at {price / 10000:.1f}% (conf: {confidence:.0%})")
-        except Exception as e:
-            print(f"[{state.asset}] Orderbook unavailable, posting blind at {price / 10000:.1f}%: {e}")
+        print(f"[{state.asset}] Posting resting bid at {price / 10000:.1f}% (conf: {confidence:.0%})")
 
         # Calculate shares from USDC amount
         shares = self.calculate_shares_from_usdc(self.order_size_usdc, price)
@@ -470,7 +447,7 @@ class PriceActionBot:
             usdc_balance = self.client.get_usdc_balance()
             balance_usdc = usdc_balance / 1_000_000
             if balance_usdc < self.order_size_usdc:
-                print(f"[{state.asset}] ⚠️  Insufficient USDC balance: ${balance_usdc:.2f} < ${self.order_size_usdc:.2f} order size")
+                print(f"[{state.asset}] Insufficient USDC balance: ${balance_usdc:.2f} < ${self.order_size_usdc:.2f} order size")
                 print(f"   Fund wallet: {self.client.address}")
                 return
         except Exception:
@@ -487,8 +464,6 @@ class PriceActionBot:
                 settlement_address=state.settlement_address,
             )
 
-            # No per-trade permit - relying on one-time max permit allowance
-
             result = self.client.post_order(order)
             outcome_str = "YES" if outcome == Outcome.YES else "NO"
 
@@ -496,94 +471,103 @@ class PriceActionBot:
                 status = result.get("status", "unknown")
                 order_hash = result.get("orderHash", order.order_hash)
 
-                print(f"[{state.asset}] → Order submitted: {outcome_str} @ {price / 10000:.1f}% | ${self.order_size_usdc:.2f} = {shares/1_000_000:.4f} shares (status: {status})")
+                print(f"[{state.asset}] -> Order submitted: {outcome_str} @ {price / 10000:.1f}% | ${self.order_size_usdc:.2f} = {shares/1_000_000:.4f} shares (status: {status})")
 
-                await asyncio.sleep(2)
-
-                # Check for failed trades
-                try:
-                    failed_trades = self.client.get_failed_trades()
-                    my_failed = [t for t in failed_trades
-                                 if t.market_id == state.market_id
-                                 and t.buyer_address.lower() == self.client.address.lower()
-                                 and t.fill_size == shares]
-
-                    if my_failed:
-                        failed = my_failed[0]
-                        reason = failed.reason
-                        if "simulation" in reason.lower():
-                            try:
-                                usdc_balance = self.client.get_usdc_balance()
-                                balance_usdc = usdc_balance / 1_000_000
-                                reason += f" (USDC balance: ${balance_usdc:.2f})"
-                            except Exception:
-                                pass
-                        print(f"[{state.asset}] ✗ Order FAILED: {reason}")
-                        return
-                except Exception as e:
-                    print(f"  [{state.asset}] Warning: Could not check failed trades: {e}")
-
-                # Check for pending trades
-                try:
-                    pending_trades = self.client.get_pending_trades()
-                    my_pending = [t for t in pending_trades
-                                  if t.market_id == state.market_id
-                                  and t.buyer_address.lower() == self.client.address.lower()
-                                  and t.fill_size == shares]
-
-                    if my_pending:
-                        pending = my_pending[0]
-                        print(f"[{state.asset}] ⏳ Order PENDING on-chain (TX: {pending.tx_hash[:16]}...)")
-                        state.pending_order_txs.add(pending.tx_hash)
-                        return
-                except Exception as e:
-                    print(f"  [{state.asset}] Warning: Could not check pending trades: {e}")
-
-                # Check if immediately filled
-                try:
-                    trades = self.client.get_trades(market_id=state.market_id, limit=20)
-                    recent_threshold = time.time() - 10
-                    my_trades = [t for t in trades
-                                 if t.buyer.lower() == self.client.address.lower()
-                                 and t.timestamp > recent_threshold
-                                 and t.id not in state.processed_trade_ids]
-
-                    if my_trades:
-                        trade = my_trades[0]
-                        state.processed_trade_ids.add(trade.id)
-
-                        # Track position in USDC
-                        usdc_spent = (trade.size * trade.price) / (1_000_000 * 1_000_000)
-                        state.position_usdc[state.market_id] = self.get_position_usdc(state, state.market_id) + usdc_spent
-
-                        print(f"[{state.asset}] ✓ FILLED: ${usdc_spent:.2f} USDC → {trade.size / 1_000_000:.4f} shares")
-                        return
-                except Exception as e:
-                    print(f"  [{state.asset}] Warning: Could not check trades: {e}")
-
-                # Check if still open on orderbook
-                try:
-                    my_orders = self.client.get_orders(
-                        trader=self.client.address,
-                        market_id=state.market_id,
-                    )
-                    matching = [o for o in my_orders if o.order_hash == order_hash]
-
-                    if matching:
-                        print(f"[{state.asset}] ✓ Order OPEN on orderbook")
-                        state.active_orders[order_hash] = action
-                    else:
-                        print(f"[{state.asset}] ⚠ Order not found - may have been rejected")
-                except Exception as e:
-                    print(f"  [{state.asset}] Warning: Could not check open orders: {e}")
+                # Verify order status in background (don't block next order)
+                asyncio.create_task(self._verify_order(state, order_hash, action, shares))
 
             else:
-                print(f"[{state.asset}] ⚠ Unexpected order response: {result}")
+                print(f"[{state.asset}] Unexpected order response: {result}")
 
         except TurbineApiError as e:
-            print(f"[{state.asset}] ✗ Order failed: {e}")
+            print(f"[{state.asset}] Order failed: {e}")
         except Exception as e:
-            print(f"[{state.asset}] ✗ Unexpected error: {e}")
+            print(f"[{state.asset}] Unexpected error: {e}")
+
+    async def _verify_order(self, state: AssetState, order_hash: str, action: str, shares: int) -> None:
+        """Background task to check order status after submission."""
+        try:
+            await asyncio.sleep(2)
+
+            # Check for failed trades
+            try:
+                failed_trades = self.client.get_failed_trades()
+                my_failed = [t for t in failed_trades
+                             if t.market_id == state.market_id
+                             and t.buyer_address.lower() == self.client.address.lower()
+                             and t.fill_size == shares]
+
+                if my_failed:
+                    failed = my_failed[0]
+                    reason = failed.reason
+                    if "simulation" in reason.lower():
+                        try:
+                            usdc_balance = self.client.get_usdc_balance()
+                            balance_usdc = usdc_balance / 1_000_000
+                            reason += f" (USDC balance: ${balance_usdc:.2f})"
+                        except Exception:
+                            pass
+                    print(f"[{state.asset}] Order FAILED: {reason}")
+                    return
+            except Exception as e:
+                print(f"  [{state.asset}] Warning: Could not check failed trades: {e}")
+
+            # Check for pending trades
+            try:
+                pending_trades = self.client.get_pending_trades()
+                my_pending = [t for t in pending_trades
+                              if t.market_id == state.market_id
+                              and t.buyer_address.lower() == self.client.address.lower()
+                              and t.fill_size == shares]
+
+                if my_pending:
+                    pending = my_pending[0]
+                    print(f"[{state.asset}] Order PENDING on-chain (TX: {pending.tx_hash[:16]}...)")
+                    state.pending_order_txs.add(pending.tx_hash)
+                    return
+            except Exception as e:
+                print(f"  [{state.asset}] Warning: Could not check pending trades: {e}")
+
+            # Check if immediately filled
+            try:
+                trades = self.client.get_trades(market_id=state.market_id, limit=20)
+                recent_threshold = time.time() - 10
+                my_trades = [t for t in trades
+                             if t.buyer.lower() == self.client.address.lower()
+                             and t.timestamp > recent_threshold
+                             and t.id not in state.processed_trade_ids]
+
+                if my_trades:
+                    trade = my_trades[0]
+                    state.processed_trade_ids.add(trade.id)
+
+                    # Track position in USDC
+                    usdc_spent = (trade.size * trade.price) / (1_000_000 * 1_000_000)
+                    state.position_usdc[state.market_id] = self.get_position_usdc(state, state.market_id) + usdc_spent
+
+                    print(f"[{state.asset}] FILLED: ${usdc_spent:.2f} USDC -> {trade.size / 1_000_000:.4f} shares")
+                    return
+            except Exception as e:
+                print(f"  [{state.asset}] Warning: Could not check trades: {e}")
+
+            # Check if still open on orderbook
+            try:
+                my_orders = self.client.get_orders(
+                    trader=self.client.address,
+                    market_id=state.market_id,
+                )
+                matching = [o for o in my_orders if o.order_hash == order_hash]
+
+                if matching:
+                    print(f"[{state.asset}] Order OPEN on orderbook")
+                    state.active_orders[order_hash] = action
+                else:
+                    print(f"[{state.asset}] Order not found - may have been rejected")
+            except Exception as e:
+                print(f"  [{state.asset}] Warning: Could not check open orders: {e}")
+
+        except Exception as e:
+            print(f"  [{state.asset}] Verification error: {e}")
 
     async def price_action_loop(self) -> None:
         """Main loop that monitors prices and executes trades for all assets."""
@@ -613,28 +597,13 @@ class PriceActionBot:
                     action, confidence = await self.calculate_signal(state, current_price)
 
                     if action != "HOLD":
-                        # If signal flipped direction, cancel old resting orders
-                        if state.last_signal and state.last_signal != action and state.active_orders:
-                            print(f"[{state.asset}] Signal flipped {state.last_signal} → {action}, cancelling stale orders")
-                            await self.cancel_asset_orders(state)
-
-                        # Only post a new order if we don't already have one resting
-                        if not state.active_orders:
-                            await self.execute_signal(state, action, confidence)
-                            state.last_signal = action
-                        else:
-                            print(f"[{state.asset}] Already have {len(state.active_orders)} resting order(s) - holding")
+                        await self.execute_signal(state, action, confidence)
                     else:
                         strike_usd = state.strike_price / 1e6
                         if strike_usd > 0:
                             diff_pct = ((current_price - strike_usd) / strike_usd) * 100
                             pos = self.get_position_usdc(state, state.market_id)
                             print(f"[{asset}] ${current_price:,.2f} ({diff_pct:+.2f}% from ${strike_usd:,.2f}) | Pos: ${pos:.2f}/${self.max_position_usdc:.2f} - HOLD")
-                        # Signal is HOLD — cancel any resting orders (we're not confident)
-                        if state.active_orders:
-                            print(f"[{state.asset}] Signal went to HOLD, cancelling resting orders")
-                            await self.cancel_asset_orders(state)
-                            state.last_signal = None
 
                 await asyncio.sleep(PRICE_POLL_SECONDS)
             except Exception as e:
@@ -729,7 +698,6 @@ class PriceActionBot:
         state.active_orders = {}
         state.processed_trade_ids.clear()
         state.pending_order_txs.clear()
-        state.market_expiring = False
 
         # Fetch settlement and contract addresses
         try:
@@ -777,14 +745,6 @@ class PriceActionBot:
 
                     if new_market_id != state.market_id:
                         await self.switch_to_new_market(state, new_market_id, start_price)
-
-                    time_remaining = end_time - int(time.time())
-                    if time_remaining <= 60 and time_remaining > 0:
-                        if not state.market_expiring:
-                            print(f"[{asset}] ⏰ Market expires in {time_remaining}s - stopping trades")
-                            state.market_expiring = True
-                    elif time_remaining > 60:
-                        state.market_expiring = False
 
             except Exception as e:
                 print(f"Market monitor error: {e}")

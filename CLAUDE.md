@@ -53,7 +53,7 @@ Turbine runs an off-chain orderbook (CLOB) with on-chain settlement. Orders are 
 
 Turbine is actively growing its user base through two channels:
 
-**Weekly competitions:** An ongoing $100 prize for the bot with the highest percentage-based PnL each week. Leaderboard at https://beta.turbinefi.com/leaderboard. No limit on how many bots a single user can register — you can run multiple strategies simultaneously.
+**Weekly competitions:** An ongoing $100 prize for the bot with the highest absolute realized PnL each week. Leaderboard at https://beta.turbinefi.com/leaderboard. No limit on how many bots a single user can register — you can run multiple strategies simultaneously.
 
 **Hackathons:** Turbine sponsors and runs hackathon events where participants build trading bots. These are time-boxed events with their own structure and prizes. (TODO: More detail on hackathon format needed from Turbine team.)
 
@@ -216,11 +216,10 @@ When a user wants to create or modify a bot:
    | **Probability-Weighted** | Bets that prices far from 50% will revert toward uncertainty | Medium | Markets with overconfident pricing |
 
 4. **Preserve critical infrastructure patterns.** These exist in every working bot and must not be removed or altered:
-   - **Order verification chain:** After submitting an order, wait 2 seconds, then check failed trades → pending trades → recent trades → open orders. This sequence ensures the bot knows the true state of its order.
+   - **Order verification chain:** After submitting an order, fire a background task (via `asyncio.create_task()`) that sleeps 2 seconds, then checks failed trades → pending trades → recent trades → open orders. This runs without blocking the next order placement.
    - **Gasless USDC approval:** One-time gasless permit via API per settlement contract. `approve_usdc()` returns a dict with `tx_hash` (not a raw tx hash string). Check allowance first via API, skip if already approved.
    - **Market transitions:** Poll for new markets every 5 seconds. When a new market appears, cancel all orders on the old market, reset state, and start trading the new one.
    - **Claiming:** Background task that checks for resolved markets and claims winnings via the gasless relayer. Enforce a 15-second delay between claims (API rate limit).
-   - **Market expiration:** Stop placing new orders when less than 60 seconds remain in a market. The `market_expiring` flag prevents the bot from getting stuck with orders on an expired market.
 
 ## SDK Quick Reference
 
@@ -287,7 +286,6 @@ For a deeper explanation aimed at newcomers, see `docs/prediction-markets.md`.
 ## Files to Never Modify
 
 - Everything in `turbine_client/` — the SDK is maintained by Turbine's team
-- `examples/price_action_bot.py` — canonical reference implementation
 - `tests/conftest.py` — test fixtures (unless adding new ones)
 
 ## Development
