@@ -1,9 +1,10 @@
 """
 Turbine Price Action Bot
 
-Trades BTC, ETH, and SOL 15-minute prediction markets using real-time price
-data from Pyth Network. USDC is approved gaslessly via a one-time max permit
-per settlement contract — no native gas required, no per-order permit overhead.
+Trades BTC, ETH, SOL, and XRP prediction markets across multiple intervals
+(15-minute and 1-hour) using real-time price data from Pyth Network. USDC is
+approved gaslessly via a one-time max permit per settlement contract — no native
+gas required, no per-order permit overhead.
 
 Algorithm: Fetches real-time prices from Pyth Network (same oracle Turbine uses)
            and compares them to each market's strike price to make trading decisions.
@@ -12,10 +13,11 @@ Algorithm: Fetches real-time prices from Pyth Network (same oracle Turbine uses)
            - Confidence scales with distance from strike price
 
 Features:
-- Multi-asset: trades BTC, ETH, and SOL simultaneously (configurable via --assets)
-- Order size and max position configured in USDC terms (per asset)
+- Multi-asset: trades BTC, ETH, SOL, and XRP simultaneously (configurable via --assets)
+- Multi-interval: trades 15-minute and 1-hour markets (configurable via --intervals)
+- Order size and max position configured in USDC terms (per trading unit)
 - Auto-approves USDC gaslessly when entering a new market
-- Automatic market transition when 15-minute markets rotate
+- Automatic market transition when markets rotate
 - Automatic claiming of winnings from resolved markets
 
 Usage:
@@ -26,9 +28,13 @@ Usage:
         --order-size 5 \\
         --max-position 50
 
-    # Trade only BTC and ETH
+    # Trade only BTC and ETH on 15-min intervals
     TURBINE_PRIVATE_KEY=0x... python examples/price_action_bot.py \\
-        --assets BTC,ETH
+        --assets BTC,ETH --intervals 15
+
+    # Trade all assets on both 15-min and 1-hour intervals
+    TURBINE_PRIVATE_KEY=0x... python examples/price_action_bot.py \\
+        --assets BTC,ETH,SOL,XRP --intervals 15,60
 """
 
 import argparse
@@ -75,10 +81,13 @@ PYTH_FEED_IDS = {
     "BTC": "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
     "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
     "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+    "XRP": "0xec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8",
 }
 
 # Supported assets
 SUPPORTED_ASSETS = list(PYTH_FEED_IDS.keys())
+SUPPORTED_INTERVALS = [15, 60]
+DEFAULT_INTERVALS = "15,60"
 
 
 def get_or_create_api_credentials(env_path: Path = None):
@@ -139,46 +148,51 @@ def _save_credentials_to_env(env_path: Path, api_key_id: str, api_private_key: s
 class AssetState:
     """Per-asset trading state."""
 
-    def __init__(self, asset: str):
+    def __init__(self, asset: str, interval: int = 15):
         self.asset = asset
+        self.interval = interval
+        self.key = f"{asset}-{interval}"
         self.market_id: str | None = None
         self.settlement_address: str | None = None
         self.contract_address: str | None = None
-        self.strike_price: int = 0  # Price when market created (6 decimals)
-        self.position_usdc: dict[str, float] = {}  # market_id -> usdc spent
-        self.active_orders: dict[str, str] = {}  # order_hash -> action (BUY_YES/BUY_NO)
+        self.strike_price: int = 0
+        self.position_usdc: dict[str, float] = {}
+        self.active_orders: dict[str, str] = {}
         self.processed_trade_ids: set[int] = set()
         self.pending_order_txs: set[str] = set()
-        self.traded_markets: dict[str, str] = {}  # market_id -> contract_address
+        self.traded_markets: dict[str, str] = {}
 
 
 class PriceActionBot:
-    """Price action trader for BTC, ETH, and SOL 15-minute prediction markets.
+    """Price action trader for BTC, ETH, SOL, and XRP prediction markets across multiple intervals.
 
-    Tracks positions in USDC terms per asset. USDC is approved gaslessly for new
-    markets via one-time max EIP-2612 permit submitted through the relayer.
+    Tracks positions in USDC terms per trading unit (asset + interval). USDC is approved
+    gaslessly for new markets via one-time max EIP-2612 permit submitted through the relayer.
     """
 
     def __init__(
         self,
         client: TurbineClient,
         assets: list[str],
+        intervals: list[int] | None = None,
         order_size_usdc: float = DEFAULT_ORDER_SIZE_USDC,
         max_position_usdc: float = DEFAULT_MAX_POSITION_USDC,
     ):
         self.client = client
         self.assets = assets
+        self.intervals = intervals or [15]
+        self.trading_units = [(asset, interval) for asset in assets for interval in self.intervals]
         self.order_size_usdc = order_size_usdc
         self.max_position_usdc = max_position_usdc
         self.running = True
 
-        # Per-asset state
+        # Per-(asset, interval) state
         self.asset_states: dict[str, AssetState] = {
-            asset: AssetState(asset) for asset in assets
+            f"{asset}-{interval}": AssetState(asset, interval) for asset, interval in self.trading_units
         }
 
         # Track approved settlement contracts (shared across assets)
-        self.approved_settlements: dict[str, int] = {}  # settlement_address -> approved_amount
+        self.approved_settlements: dict[str, int] = {}
 
         # Async HTTP client for non-blocking price fetches
         self._http_client: httpx.AsyncClient | None = None
@@ -283,7 +297,7 @@ class PriceActionBot:
             # Remove any TXs that are no longer pending
             resolved_txs = state.pending_order_txs - pending_txs
             if resolved_txs:
-                print(f"  [{state.asset}] {len(resolved_txs)} order(s) settled")
+                print(f"  [{state.key}] {len(resolved_txs)} order(s) settled")
                 state.pending_order_txs -= resolved_txs
 
                 # Check if they filled by looking at recent trades
@@ -299,10 +313,10 @@ class PriceActionBot:
                     state.position_usdc[state.market_id] = self.get_position_usdc(state, state.market_id) + usdc_spent
 
                     outcome_str = "YES" if trade.outcome == 0 else "NO"
-                    print(f"  [{state.asset}] Filled: ${usdc_spent:.2f} USDC → {trade.size / 1_000_000:.2f} {outcome_str} shares")
+                    print(f"  [{state.key}] Filled: ${usdc_spent:.2f} USDC → {trade.size / 1_000_000:.2f} {outcome_str} shares")
 
         except Exception as e:
-            print(f"  [{state.asset}] Warning: Could not cleanup pending orders: {e}")
+            print(f"  [{state.key}] Warning: Could not cleanup pending orders: {e}")
 
     async def sync_position(self, state: AssetState) -> None:
         """Sync position by checking user positions for current market."""
@@ -322,18 +336,18 @@ class PriceActionBot:
                     estimated_usdc = (total_shares * 0.5) / 1_000_000
 
                     if total_shares > 0:
-                        print(f"[{state.asset}] Position synced: ~${estimated_usdc:.2f} USDC in shares")
+                        print(f"[{state.key}] Position synced: ~${estimated_usdc:.2f} USDC in shares")
                         state.position_usdc[state.market_id] = estimated_usdc
                     else:
-                        print(f"[{state.asset}] Position synced: No existing positions")
+                        print(f"[{state.key}] Position synced: No existing positions")
                         state.position_usdc[state.market_id] = 0.0
                     return
 
             state.position_usdc[state.market_id] = 0.0
-            print(f"[{state.asset}] Position synced: No existing positions")
+            print(f"[{state.key}] Position synced: No existing positions")
 
         except Exception as e:
-            print(f"[{state.asset}] Failed to sync position: {e}")
+            print(f"[{state.key}] Failed to sync position: {e}")
             state.position_usdc[state.market_id] = 0.0
 
     async def get_current_prices(self) -> dict[str, float]:
@@ -389,10 +403,10 @@ class PriceActionBot:
         confidence = max(raw_confidence, MIN_CONFIDENCE) if abs(price_diff_pct) >= threshold_pct else 0.0
 
         if price_diff_pct > 0:
-            print(f"[{state.asset}] ${current_price:,.2f} is {price_diff_pct:+.2f}% above strike ${strike_usd:,.2f}")
+            print(f"[{state.key}] ${current_price:,.2f} is {price_diff_pct:+.2f}% above strike ${strike_usd:,.2f}")
             return "BUY_YES", confidence
         else:
-            print(f"[{state.asset}] ${current_price:,.2f} is {price_diff_pct:+.2f}% below strike ${strike_usd:,.2f}")
+            print(f"[{state.key}] ${current_price:,.2f} is {price_diff_pct:+.2f}% below strike ${strike_usd:,.2f}")
             return "BUY_NO", confidence
 
     def confidence_to_price(self, action: str, confidence: float) -> int:
@@ -427,19 +441,19 @@ class PriceActionBot:
         # Check position limits (in USDC)
         if not self.can_trade(state, self.order_size_usdc):
             current = self.get_position_usdc(state, state.market_id)
-            print(f"[{state.asset}] Position limit reached: ${current:.2f} / ${self.max_position_usdc:.2f}")
+            print(f"[{state.key}] Position limit reached: ${current:.2f} / ${self.max_position_usdc:.2f}")
             return
 
         outcome = Outcome.YES if action == "BUY_YES" else Outcome.NO
 
         # Calculate our limit price from the signal confidence
         price = self.confidence_to_price(action, confidence)
-        print(f"[{state.asset}] Posting resting bid at {price / 10000:.1f}% (conf: {confidence:.0%})")
+        print(f"[{state.key}] Posting resting bid at {price / 10000:.1f}% (conf: {confidence:.0%})")
 
         # Calculate shares from USDC amount
         shares = self.calculate_shares_from_usdc(self.order_size_usdc, price)
         if shares <= 0:
-            print(f"[{state.asset}] Order too small: ${self.order_size_usdc:.2f} at {price/10000:.1f}%")
+            print(f"[{state.key}] Order too small: ${self.order_size_usdc:.2f} at {price/10000:.1f}%")
             return
 
         # Check USDC balance before trading
@@ -447,7 +461,7 @@ class PriceActionBot:
             usdc_balance = self.client.get_usdc_balance()
             balance_usdc = usdc_balance / 1_000_000
             if balance_usdc < self.order_size_usdc:
-                print(f"[{state.asset}] Insufficient USDC balance: ${balance_usdc:.2f} < ${self.order_size_usdc:.2f} order size")
+                print(f"[{state.key}] Insufficient USDC balance: ${balance_usdc:.2f} < ${self.order_size_usdc:.2f} order size")
                 print(f"   Fund wallet: {self.client.address}")
                 return
         except Exception:
@@ -471,18 +485,18 @@ class PriceActionBot:
                 status = result.get("status", "unknown")
                 order_hash = result.get("orderHash", order.order_hash)
 
-                print(f"[{state.asset}] -> Order submitted: {outcome_str} @ {price / 10000:.1f}% | ${self.order_size_usdc:.2f} = {shares/1_000_000:.4f} shares (status: {status})")
+                print(f"[{state.key}] -> Order submitted: {outcome_str} @ {price / 10000:.1f}% | ${self.order_size_usdc:.2f} = {shares/1_000_000:.4f} shares (status: {status})")
 
                 # Verify order status in background (don't block next order)
                 asyncio.create_task(self._verify_order(state, order_hash, action, shares))
 
             else:
-                print(f"[{state.asset}] Unexpected order response: {result}")
+                print(f"[{state.key}] Unexpected order response: {result}")
 
         except TurbineApiError as e:
-            print(f"[{state.asset}] Order failed: {e}")
+            print(f"[{state.key}] Order failed: {e}")
         except Exception as e:
-            print(f"[{state.asset}] Unexpected error: {e}")
+            print(f"[{state.key}] Unexpected error: {e}")
 
     async def _verify_order(self, state: AssetState, order_hash: str, action: str, shares: int) -> None:
         """Background task to check order status after submission."""
@@ -507,10 +521,10 @@ class PriceActionBot:
                             reason += f" (USDC balance: ${balance_usdc:.2f})"
                         except Exception:
                             pass
-                    print(f"[{state.asset}] Order FAILED: {reason}")
+                    print(f"[{state.key}] Order FAILED: {reason}")
                     return
             except Exception as e:
-                print(f"  [{state.asset}] Warning: Could not check failed trades: {e}")
+                print(f"  [{state.key}] Warning: Could not check failed trades: {e}")
 
             # Check for pending trades
             try:
@@ -522,11 +536,11 @@ class PriceActionBot:
 
                 if my_pending:
                     pending = my_pending[0]
-                    print(f"[{state.asset}] Order PENDING on-chain (TX: {pending.tx_hash[:16]}...)")
+                    print(f"[{state.key}] Order PENDING on-chain (TX: {pending.tx_hash[:16]}...)")
                     state.pending_order_txs.add(pending.tx_hash)
                     return
             except Exception as e:
-                print(f"  [{state.asset}] Warning: Could not check pending trades: {e}")
+                print(f"  [{state.key}] Warning: Could not check pending trades: {e}")
 
             # Check if immediately filled
             try:
@@ -545,10 +559,10 @@ class PriceActionBot:
                     usdc_spent = (trade.size * trade.price) / (1_000_000 * 1_000_000)
                     state.position_usdc[state.market_id] = self.get_position_usdc(state, state.market_id) + usdc_spent
 
-                    print(f"[{state.asset}] FILLED: ${usdc_spent:.2f} USDC -> {trade.size / 1_000_000:.4f} shares")
+                    print(f"[{state.key}] FILLED: ${usdc_spent:.2f} USDC -> {trade.size / 1_000_000:.4f} shares")
                     return
             except Exception as e:
-                print(f"  [{state.asset}] Warning: Could not check trades: {e}")
+                print(f"  [{state.key}] Warning: Could not check trades: {e}")
 
             # Check if still open on orderbook
             try:
@@ -559,15 +573,15 @@ class PriceActionBot:
                 matching = [o for o in my_orders if o.order_hash == order_hash]
 
                 if matching:
-                    print(f"[{state.asset}] Order OPEN on orderbook")
+                    print(f"[{state.key}] Order OPEN on orderbook")
                     state.active_orders[order_hash] = action
                 else:
-                    print(f"[{state.asset}] Order not found - may have been rejected")
+                    print(f"[{state.key}] Order not found - may have been rejected")
             except Exception as e:
-                print(f"  [{state.asset}] Warning: Could not check open orders: {e}")
+                print(f"  [{state.key}] Warning: Could not check open orders: {e}")
 
         except Exception as e:
-            print(f"  [{state.asset}] Verification error: {e}")
+            print(f"  [{state.key}] Verification error: {e}")
 
     async def price_action_loop(self) -> None:
         """Main loop that monitors prices and executes trades for all assets."""
@@ -582,8 +596,8 @@ class PriceActionBot:
                 # Fetch all prices in one request
                 prices = await self.get_current_prices()
 
-                for asset in self.assets:
-                    state = self.asset_states[asset]
+                for asset, interval in self.trading_units:
+                    state = self.asset_states[f"{asset}-{interval}"]
                     if not state.market_id:
                         continue
 
@@ -603,16 +617,19 @@ class PriceActionBot:
                         if strike_usd > 0:
                             diff_pct = ((current_price - strike_usd) / strike_usd) * 100
                             pos = self.get_position_usdc(state, state.market_id)
-                            print(f"[{asset}] ${current_price:,.2f} ({diff_pct:+.2f}% from ${strike_usd:,.2f}) | Pos: ${pos:.2f}/${self.max_position_usdc:.2f} - HOLD")
+                            print(f"[{state.key}] ${current_price:,.2f} ({diff_pct:+.2f}% from ${strike_usd:,.2f}) | Pos: ${pos:.2f}/${self.max_position_usdc:.2f} - HOLD")
 
                 await asyncio.sleep(PRICE_POLL_SECONDS)
             except Exception as e:
                 print(f"Price action error: {e}")
                 await asyncio.sleep(PRICE_POLL_SECONDS)
 
-    async def get_active_market(self, asset: str) -> tuple[str, int, int] | None:
+    async def get_active_market(self, asset: str, interval: int = 15) -> tuple[str, int, int] | None:
         """Get the currently active quick market for an asset."""
-        response = self.client._http.get(f"/api/v1/quick-markets/{asset}")
+        response = self.client._http.get(
+            f"/api/v1/quick-markets/{asset}",
+            params={"interval": interval},
+        )
         quick_market_data = response.get("quickMarket")
         if not quick_market_data:
             return None
@@ -658,13 +675,13 @@ class PriceActionBot:
                 status="open",
             )
         except Exception as e:
-            print(f"[{state.asset}] Failed to fetch open orders: {e}")
+            print(f"[{state.key}] Failed to fetch open orders: {e}")
             return
 
         if not open_orders:
             return
 
-        print(f"[{state.asset}] Cancelling {len(open_orders)} orders...")
+        print(f"[{state.key}] Cancelling {len(open_orders)} orders...")
         for order in open_orders:
             try:
                 self.client.cancel_order(
@@ -674,7 +691,7 @@ class PriceActionBot:
                 )
             except TurbineApiError as e:
                 if "404" not in str(e):
-                    print(f"[{state.asset}] Failed to cancel order: {e}")
+                    print(f"[{state.key}] Failed to cancel order: {e}")
         state.active_orders.clear()
 
     async def switch_to_new_market(self, state: AssetState, new_market_id: str, start_price: int = 0) -> None:
@@ -687,7 +704,7 @@ class PriceActionBot:
 
         if old_market_id:
             print(f"\n{'='*50}")
-            print(f"[{state.asset}] MARKET TRANSITION")
+            print(f"[{state.key}] MARKET TRANSITION")
             print(f"Old: {old_market_id[:8]}... | New: {new_market_id[:8]}...")
             print(f"{'='*50}\n")
             await self.cancel_asset_orders(state)
@@ -712,14 +729,14 @@ class PriceActionBot:
                         pass
                     break
         except Exception as e:
-            print(f"[{state.asset}] Warning: Could not fetch market addresses: {e}")
+            print(f"[{state.key}] Warning: Could not fetch market addresses: {e}")
 
         # Ensure gasless USDC approval for this settlement contract
         if state.settlement_address:
             self.ensure_settlement_approved(state.settlement_address)
 
         strike_usd = start_price / 1e6 if start_price else 0
-        print(f"[{state.asset}] Trading market: {new_market_id[:8]}... | Strike: ${strike_usd:,.2f}")
+        print(f"[{state.key}] Trading market: {new_market_id[:8]}... | Strike: ${strike_usd:,.2f}")
 
         await self.sync_position(state)
 
@@ -729,13 +746,13 @@ class PriceActionBot:
 
         while self.running:
             try:
-                for asset in self.assets:
-                    state = self.asset_states[asset]
+                for asset, interval in self.trading_units:
+                    state = self.asset_states[f"{asset}-{interval}"]
 
                     try:
-                        market_info = await self.get_active_market(asset)
+                        market_info = await self.get_active_market(asset, interval)
                     except Exception as e:
-                        print(f"[{asset}] Market monitor error: {e}")
+                        print(f"[{state.key}] Market monitor error: {e}")
                         continue
 
                     if not market_info:
@@ -809,16 +826,16 @@ class PriceActionBot:
 
         try:
             # Initialize all asset markets
-            for asset in self.assets:
+            for asset, interval in self.trading_units:
                 try:
-                    market_info = await self.get_active_market(asset)
+                    market_info = await self.get_active_market(asset, interval)
                     if market_info:
                         market_id, _, start_price = market_info
-                        await self.switch_to_new_market(self.asset_states[asset], market_id, start_price)
+                        await self.switch_to_new_market(self.asset_states[f"{asset}-{interval}"], market_id, start_price)
                     else:
-                        print(f"[{asset}] Waiting for market...")
+                        print(f"[{asset}-{interval}] Waiting for market...")
                 except Exception as e:
-                    print(f"[{asset}] Failed to get initial market: {e}")
+                    print(f"[{asset}-{interval}] Failed to get initial market: {e}")
 
             while self.running:
                 await asyncio.sleep(1)
@@ -837,7 +854,7 @@ class PriceActionBot:
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Turbine price action bot for BTC, ETH, and SOL 15-minute prediction markets"
+        description="Turbine price action bot for BTC, ETH, SOL, and XRP prediction markets (15-min and 1-hour)"
     )
     parser.add_argument(
         "-s", "--order-size",
@@ -857,6 +874,12 @@ async def main():
         default=",".join(SUPPORTED_ASSETS),
         help=f"Comma-separated list of assets to trade (default: {','.join(SUPPORTED_ASSETS)})"
     )
+    parser.add_argument(
+        "-i", "--intervals",
+        type=str,
+        default=DEFAULT_INTERVALS,
+        help=f"Comma-separated intervals in minutes (default: {DEFAULT_INTERVALS})"
+    )
     args = parser.parse_args()
 
     # Parse and validate assets
@@ -864,6 +887,13 @@ async def main():
     for asset in assets:
         if asset not in PYTH_FEED_IDS:
             print(f"Error: Unsupported asset '{asset}'. Supported: {', '.join(SUPPORTED_ASSETS)}")
+            return
+
+    # Parse and validate intervals
+    intervals = [int(i.strip()) for i in args.intervals.split(",")]
+    for interval in intervals:
+        if interval not in SUPPORTED_INTERVALS:
+            print(f"Error: Unsupported interval '{interval}'. Supported: {', '.join(str(i) for i in SUPPORTED_INTERVALS)}")
             return
 
     private_key = os.environ.get("TURBINE_PRIVATE_KEY")
@@ -887,6 +917,8 @@ async def main():
     print(f"Wallet: {client.address}")
     print(f"Chain: {CHAIN_ID}")
     print(f"Assets: {', '.join(assets)}")
+    print(f"Intervals: {', '.join(str(i) + 'm' for i in intervals)}")
+    print(f"Trading units: {len(assets) * len(intervals)} ({len(assets)} assets x {len(intervals)} intervals)")
     print(f"Order size: ${args.order_size:.2f} USDC")
     print(f"Max position: ${args.max_position:.2f} USDC per asset")
     print(f"USDC approval: gasless (one-time max permit per settlement)")
@@ -894,9 +926,9 @@ async def main():
         usdc_balance = client.get_usdc_balance()
         balance_display = usdc_balance / 1_000_000
         print(f"USDC balance: ${balance_display:.2f}")
-        min_needed = args.order_size * len(assets)
+        min_needed = args.order_size * len(assets) * len(intervals)
         if balance_display < min_needed:
-            print(f"⚠️  Warning: Balance (${balance_display:.2f}) may be low for {len(assets)} assets")
+            print(f"⚠️  Warning: Balance (${balance_display:.2f}) may be low for {len(assets) * len(intervals)} trading units")
             print(f"   Fund your wallet: {client.address}")
     except Exception as e:
         print(f"USDC balance: unknown ({e})")
@@ -905,6 +937,7 @@ async def main():
     bot = PriceActionBot(
         client,
         assets=assets,
+        intervals=intervals,
         order_size_usdc=args.order_size,
         max_position_usdc=args.max_position,
     )

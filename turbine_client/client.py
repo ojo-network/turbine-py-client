@@ -274,33 +274,35 @@ class TurbineClient:
         holders = response.get("topHolders", []) if isinstance(response, dict) else response
         return [Holder.from_dict(h) for h in holders]
 
-    def get_quick_market(self, asset: str) -> QuickMarket:
+    def get_quick_market(self, asset: str, interval: int = 15) -> QuickMarket:
         """Get the active quick market for an asset.
 
         Args:
             asset: The asset symbol (e.g., "BTC", "ETH").
+            interval: Market interval in minutes (default: 15). Use 60 for 1-hour markets.
 
         Returns:
             The active quick market.
         """
         endpoint = ENDPOINTS["quick_market"].format(asset=asset)
-        response = self._http.get(endpoint)
+        response = self._http.get(endpoint, params={"interval": interval})
         # API returns {"quickMarket": {...}} nested structure
         quick_market_data = response.get("quickMarket", response)
         return QuickMarket.from_dict(quick_market_data)
 
-    def get_quick_market_history(self, asset: str, limit: int = 100) -> List[QuickMarket]:
+    def get_quick_market_history(self, asset: str, limit: int = 100, interval: int = 15) -> List[QuickMarket]:
         """Get quick market history for an asset.
 
         Args:
             asset: The asset symbol.
             limit: Maximum number of markets to return.
+            interval: Market interval in minutes (default: 15). Use 60 for 1-hour markets.
 
         Returns:
             List of historical quick markets.
         """
         endpoint = ENDPOINTS["quick_market_history"].format(asset=asset)
-        params = {"limit": limit}
+        params = {"limit": limit, "interval": interval}
         response = self._http.get(endpoint, params=params)
         markets = response.get("markets", []) if isinstance(response, dict) else response
         return [QuickMarket.from_dict(m) for m in markets]
@@ -319,19 +321,22 @@ class TurbineClient:
         return AssetPrice.from_dict(response)
 
     def get_quick_market_price_history(
-        self, asset: str, limit: int = 100
+        self, asset: str, limit: int = 100, duration: int | None = None
     ) -> List[AssetPrice]:
         """Get price history for an asset.
 
         Args:
             asset: The asset symbol (e.g., "BTC", "ETH").
             limit: Maximum number of prices to return.
+            duration: Optional duration in minutes. Use 65 for 1-hour market price history.
 
         Returns:
             List of historical prices.
         """
         endpoint = ENDPOINTS["quick_market_price_history"].format(asset=asset)
-        params = {"limit": limit}
+        params: Dict[str, Any] = {"limit": limit}
+        if duration is not None:
+            params["duration"] = duration
         response = self._http.get(endpoint, params=params)
         prices = response if isinstance(response, list) else response.get("prices", [])
         return [AssetPrice.from_dict(p) for p in prices]

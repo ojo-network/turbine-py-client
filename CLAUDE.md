@@ -2,9 +2,9 @@
 
 ## What Turbine Is
 
-Turbine is a trustless prediction markets platform built by Ojo. It lets anyone trade on whether BTC will go up or down in the next 15 minutes.
+Turbine is a trustless prediction markets platform built by Ojo. It lets anyone trade on whether BTC, ETH, SOL, or XRP will go up or down across multiple timeframes (15-minute and 1-hour markets).
 
-Every 15 minutes, a new market opens with a simple question: *"Will BTC be above $97,250 at 3:15 PM?"* Traders buy shares that represent their answer:
+Markets open on a rolling schedule with a simple question: *"Will BTC be above $97,250 at 3:15 PM?"* Traders buy shares that represent their answer:
 
 - **YES shares** pay out if BTC finishes above the strike price
 - **NO shares** pay out if BTC finishes below
@@ -13,7 +13,7 @@ Shares are priced between $0.01 and $0.99, reflecting the market's confidence in
 
 **A concrete example:** You think BTC will stay above the strike. You buy a YES share at $0.60. If BTC ends above the strike, you get $1.00 back — a $0.40 profit. If it drops below, you lose your $0.60. The further the price is from 50/50, the cheaper the bet but the less likely you are to win.
 
-**Currently live:** Only BTC Quick Markets (15-minute). Turbine's architecture supports other assets and timeframes, but BTC 15-min is the only active market right now.
+**Currently live:** BTC, ETH, SOL, and XRP Quick Markets in both 15-minute and 1-hour intervals.
 
 **Platform:** https://beta.turbinefi.com (in beta)
 
@@ -73,7 +73,7 @@ The typical user journey:
 3. Create a crypto wallet (MetaMask), configure `.env` with their private key
 4. Fund the wallet with USDC (~$10 minimum on Polygon mainnet)
 5. Use Claude Code (via the `/market-maker` skill) to generate a trading bot
-6. Run the bot — it trades automatically, switching to new markets every 15 minutes
+6. Run the bot — it trades automatically, switching to new markets as intervals rotate
 7. Compete in weekly PnL competitions or hackathon events
 8. Optionally deploy to Railway for 24/7 operation (`/railway-deploy`)
 
@@ -190,7 +190,7 @@ Alternatively, they can study `examples/price_action_bot.py` directly. This is t
 ```bash
 python my_bot.py
 ```
-Once running, the bot handles everything automatically: connects to the current BTC market, approves USDC (one-time gasless permit), places trades based on its algorithm, switches to new markets every 15 minutes, and claims winnings when markets resolve. The user can walk away.
+Once running, the bot handles everything automatically: connects to the current markets for all configured assets and intervals, approves USDC (one-time gasless permit), places trades based on its algorithm, switches to new markets as they rotate, and claims winnings when markets resolve. The user can walk away.
 
 For 24/7 operation without keeping a laptop open, use `/railway-deploy` to deploy to Railway (free $5 credit for 30 days).
 
@@ -245,6 +245,7 @@ Outcome.YES = 0, Outcome.NO = 1
 ```python
 # Public (no auth required)
 client.get_quick_market("BTC")           # Current 15-min market
+client.get_quick_market("BTC", interval=60)  # Current 1-hour market
 client.get_orderbook(market_id)          # Orderbook snapshot
 client.get_trades(market_id)             # Recent trades
 client.get_markets()                     # All markets
@@ -274,8 +275,8 @@ client.batch_claim_winnings(addrs)       # Claim from multiple markets at once
 
 For a deeper explanation aimed at newcomers, see `docs/prediction-markets.md`.
 
-- **Market:** A 15-min binary question about BTC's price. A new one opens every 15 minutes. Each market has a unique `market_id` (hex string) that changes on rotation.
-- **Strike price:** The BTC price threshold set when the market opens. If BTC ends above it, YES wins. Below, NO wins. This is the anchor that every trading decision revolves around.
+- **Market:** A binary question about an asset's price over a fixed interval (15-min or 1-hour). New markets open on each interval's schedule. Each market has a unique `market_id` (hex string) that changes on rotation.
+- **Strike price:** The asset price threshold set when the market opens. If the asset ends above it, YES wins. Below, NO wins. This is the anchor that every trading decision revolves around.
 - **Settlement address:** The on-chain contract that holds USDC collateral and executes trades. There's one per chain, shared across all markets. Requires a one-time gasless approval before the bot can trade.
 - **Contract address:** A per-market contract for outcome tokens (ERC1155). Only needed when claiming winnings after a market resolves — not during trading.
 - **Gasless:** The SDK is fully API-routed — all operations (approvals, claims, balance checks) go through Turbine's API, which handles on-chain submission via a relayer. Users sign messages with their private key (free, off-chain) and never need RPC access, web3, or native gas tokens (no ETH, MATIC, or AVAX). Only USDC is needed.

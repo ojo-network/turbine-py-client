@@ -6,11 +6,11 @@ argument-hint: "[algorithm]"
 
 # Create a Turbine Trading Bot
 
-Here's what you're helping the user build: **a Python file that automatically trades on Turbine's BTC, ETH, and SOL prediction markets.**
+Here's what you're helping the user build: **a Python file that automatically trades on Turbine's BTC, ETH, SOL, and XRP prediction markets.**
 
-Every 15 minutes, Turbine opens new markets asking "Will BTC/ETH/SOL be above $X at [time]?" The user's bot watches these markets and places trades — buying YES shares if it thinks the price will be above the strike, or NO shares if it thinks it will be below. When the market resolves 15 minutes later, winning shares pay out $1.00.
+Turbine opens new markets on rolling intervals (15-minute and 1-hour) asking "Will BTC/ETH/SOL/XRP be above $X at [time]?" The user's bot watches these markets and places trades — buying YES shares if it thinks the price will be above the strike, or NO shares if it thinks it will be below. When the market resolves, winning shares pay out $1.00.
 
-**A trading bot is a single Python file.** When you run `python my_bot.py`, it connects to Turbine, starts watching the current markets for all configured assets, and executes trades according to its strategy. It handles everything automatically — market rotation every 15 minutes, gasless USDC approval, order management, and claiming winnings. Use `--assets BTC,ETH,SOL` to choose which assets to trade (default: all three).
+**A trading bot is a single Python file.** When you run `python my_bot.py`, it connects to Turbine, starts watching the current markets for all configured assets and intervals, and executes trades according to its strategy. It handles everything automatically — market rotation, gasless USDC approval, order management, and claiming winnings. Use `--assets BTC,ETH,SOL,XRP` to choose which assets to trade (default: all four) and `--intervals 15,60` to choose which intervals to trade (default: both).
 
 **Different strategies = different Python files.** A Price Action bot and a Momentum bot are two separate files. Each one implements its own signal logic (the "should I buy YES, buy NO, or hold?" decision) while sharing the same underlying infrastructure for connecting to Turbine, managing orders, and handling the market lifecycle.
 
@@ -82,11 +82,11 @@ Before jumping into algorithm selection, make sure the user understands what the
 
 Explain clearly:
 
-> **Here's what we're building:** A Python bot that trades on Turbine's BTC, ETH, and SOL prediction markets.
+> **Here's what we're building:** A Python bot that trades on Turbine's BTC, ETH, SOL, and XRP prediction markets.
 >
-> Every 15 minutes, new markets open: *"Will BTC/ETH/SOL be above $X?"* Your bot will decide whether to buy YES (bet price stays above) or NO (bet price goes below), based on a strategy you choose. If your bot is right, each share pays out $1.00. If it's wrong, you lose what you paid.
+> New markets open on rolling intervals (every 15 minutes and every hour): *"Will BTC/ETH/SOL/XRP be above $X?"* Your bot will decide whether to buy YES (bet price stays above) or NO (bet price goes below), based on a strategy you choose. If your bot is right, each share pays out $1.00. If it's wrong, you lose what you paid.
 >
-> The bot handles everything automatically — connecting to Turbine, placing trades on all configured assets simultaneously, switching to new markets every 15 minutes, and claiming winnings. You just pick the strategy and run it.
+> The bot handles everything automatically — connecting to Turbine, placing trades on all configured assets and intervals simultaneously, switching to new markets as they rotate, and claiming winnings. You just pick the strategy and run it.
 >
 > Each strategy is a separate Python file. You can create multiple bots with different strategies and compare how they perform.
 
@@ -275,7 +275,8 @@ After generating, walk the user through the key parameters they can tweak:
 **IMPORTANT — use exactly these defaults. Do not increase them:**
 - `--order-size` — **$1.00** (one dollar per trade)
 - `--max-position` — **$5.00** (five dollars maximum at risk per asset per market)
-- `--assets` — **BTC,ETH,SOL** (which assets to trade; comma-separated)
+- `--assets` — **BTC,ETH,SOL,XRP** (which assets to trade; comma-separated)
+- `--intervals` — **15,60** (which intervals in minutes to trade; comma-separated)
 
 This is real USDC on Polygon mainnet. Keep defaults small. The user can always increase once they see the bot working and understand the risk.
 

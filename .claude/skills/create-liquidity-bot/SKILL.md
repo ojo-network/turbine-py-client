@@ -6,13 +6,13 @@ argument-hint: "[style]"
 
 # Create a Turbine Liquidity Bot (Market Maker)
 
-Here's what you're helping the user build: **a Python file that provides liquidity on Turbine's Bitcoin prediction markets by quoting both sides of the order book.**
+Here's what you're helping the user build: **a Python file that provides liquidity on Turbine's BTC, ETH, SOL, and XRP prediction markets by quoting both sides of the order book.**
 
 Unlike directional trading bots that bet on outcomes, a **market maker** (MM) places both buy and sell orders — offering to trade with anyone. The MM earns from the **spread** (the gap between its buy and sell prices) and from **maker rebates** (Turbine rewards resting orders that get filled).
 
 > **Good news for market makers:** Turbine enforces a $1 minimum on taker orders, but **maker orders are exempt**. Since MM bots place resting (maker) orders, they can use any order size — including the small sizes typical of multi-level quoting strategies.
 
-Every 15 minutes, Turbine opens a new market asking "Will BTC be above $X at [time]?" The user's MM bot quotes both YES and NO outcomes with multi-level bid/ask ladders, dynamically adjusting prices based on the live BTC price from Pyth Network. When someone trades against the MM's resting orders, the MM collects the spread — and earns rebates on top.
+Turbine opens new markets on rolling intervals (15-minute and 1-hour) asking "Will BTC/ETH/SOL/XRP be above $X at [time]?" The user's MM bot quotes both YES and NO outcomes with multi-level bid/ask ladders, dynamically adjusting prices based on live asset prices from Pyth Network. When someone trades against the MM's resting orders, the MM collects the spread — and earns rebates on top.
 
 **A liquidity bot is a single Python file.** When you run `python my_mm_bot.py`, it connects to Turbine, starts quoting the current BTC market on both sides, and manages its orders automatically — refreshing quotes as prices move, handling market rotation every 15 minutes, approving USDC gaslessly, and claiming winnings.
 
@@ -157,7 +157,8 @@ Walk the user through the key parameters for their chosen style. These directly 
 | `--levels` | **6** | Price levels per side (geometric distribution concentrates at best price). |
 | `--base-vol` | **0.03** (3%) | Base daily volatility for the probability model. Higher = slower probability movement. |
 | `--asset-vol` | *(optional)* | Per-asset volatility overrides, e.g. `--asset-vol BTC=0.025 ETH=0.035 SOL=0.05` |
-| `--assets` | **BTC,ETH,SOL** | Which assets to trade. Can specify a subset. |
+| `--assets` | **BTC,ETH,SOL,XRP** | Which assets to trade. Can specify a subset. |
+| `--intervals` | **15,60** | Which intervals in minutes to trade. |
 
 Tell the user: "I've set proven defaults — $60 allocation with a 1.2% base spread. This is real USDC. Start by watching how it behaves, then adjust once you're comfortable."
 
