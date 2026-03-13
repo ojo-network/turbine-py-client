@@ -1,9 +1,9 @@
 """
 Turbine Price Action Bot
 
-Trades BTC, ETH, SOL, and XRP prediction markets across multiple intervals
-(15-minute and 1-hour) using real-time price data from Pyth Network. USDC is
-approved gaslessly via a one-time max permit per settlement contract — no native
+Trades BTC, ETH, SOL, XRP, and OIL prediction markets across multiple intervals
+(15-minute, 1-hour, and daily) using real-time price data from Pyth Network. USDC
+is approved gaslessly via a one-time max permit per settlement contract — no native
 gas required, no per-order permit overhead.
 
 Algorithm: Fetches real-time prices from Pyth Network (same oracle Turbine uses)
@@ -13,8 +13,8 @@ Algorithm: Fetches real-time prices from Pyth Network (same oracle Turbine uses)
            - Confidence scales with distance from strike price
 
 Features:
-- Multi-asset: trades BTC, ETH, SOL, and XRP simultaneously (configurable via --assets)
-- Multi-interval: trades 15-minute and 1-hour markets (configurable via --intervals)
+- Multi-asset: trades BTC, ETH, SOL, XRP, and OIL simultaneously (configurable via --assets)
+- Per-asset intervals: crypto assets trade 15m/60m, OIL trades daily (1440m)
 - Order size and max position configured in USDC terms (per trading unit)
 - Auto-approves USDC gaslessly when entering a new market
 - Automatic market transition when markets rotate
@@ -32,9 +32,9 @@ Usage:
     TURBINE_PRIVATE_KEY=0x... python examples/price_action_bot.py \\
         --assets BTC,ETH --intervals 15
 
-    # Trade all assets on both 15-min and 1-hour intervals
+    # Per-asset interval overrides
     TURBINE_PRIVATE_KEY=0x... python examples/price_action_bot.py \\
-        --assets BTC,ETH,SOL,XRP --intervals 15,60
+        --asset-intervals OIL=1440 BTC=15,60
 """
 
 import argparse
@@ -82,12 +82,21 @@ PYTH_FEED_IDS = {
     "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
     "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
     "XRP": "0xec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8",
+    "OIL": "0x925ca92ff005ae943c158e3563f59698ce7e75c5a8c8dd43303a0a154887b3e6",
 }
 
 # Supported assets
 SUPPORTED_ASSETS = list(PYTH_FEED_IDS.keys())
-SUPPORTED_INTERVALS = [15, 60]
-DEFAULT_INTERVALS = "15,60"
+SUPPORTED_INTERVALS = [15, 60, 1440]
+
+# Default intervals per asset (prevents invalid cross-products like OIL-15 or BTC-1440)
+DEFAULT_ASSET_INTERVALS: dict[str, list[int]] = {
+    "BTC": [15, 60],
+    "ETH": [15, 60],
+    "SOL": [15, 60],
+    "XRP": [15, 60],
+    "OIL": [1440],
+}
 
 
 def get_or_create_api_credentials(env_path: Path = None):
@@ -164,8 +173,9 @@ class AssetState:
 
 
 class PriceActionBot:
-    """Price action trader for BTC, ETH, SOL, and XRP prediction markets across multiple intervals.
+    """Price action trader for BTC, ETH, SOL, XRP, and OIL prediction markets.
 
+    Supports per-asset interval mapping to prevent invalid combos (e.g., OIL-15 or BTC-1440).
     Tracks positions in USDC terms per trading unit (asset + interval). USDC is approved
     gaslessly for new markets via one-time max EIP-2612 permit submitted through the relayer.
     """
@@ -175,13 +185,19 @@ class PriceActionBot:
         client: TurbineClient,
         assets: list[str],
         intervals: list[int] | None = None,
+        asset_intervals: dict[str, list[int]] | None = None,
         order_size_usdc: float = DEFAULT_ORDER_SIZE_USDC,
         max_position_usdc: float = DEFAULT_MAX_POSITION_USDC,
     ):
         self.client = client
         self.assets = assets
-        self.intervals = intervals or [15]
-        self.trading_units = [(asset, interval) for asset in assets for interval in self.intervals]
+        self.intervals = intervals or [15, 60]
+        self.asset_intervals = asset_intervals or DEFAULT_ASSET_INTERVALS
+        # Build trading units using per-asset intervals
+        self.trading_units = []
+        for asset in assets:
+            for interval in self.asset_intervals.get(asset, self.intervals):
+                self.trading_units.append((asset, interval))
         self.order_size_usdc = order_size_usdc
         self.max_position_usdc = max_position_usdc
         self.running = True
@@ -854,7 +870,7 @@ class PriceActionBot:
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Turbine price action bot for BTC, ETH, SOL, and XRP prediction markets (15-min and 1-hour)"
+        description="Turbine price action bot for BTC, ETH, SOL, XRP, and OIL prediction markets"
     )
     parser.add_argument(
         "-s", "--order-size",
@@ -877,8 +893,13 @@ async def main():
     parser.add_argument(
         "-i", "--intervals",
         type=str,
-        default=DEFAULT_INTERVALS,
-        help=f"Comma-separated intervals in minutes (default: {DEFAULT_INTERVALS})"
+        default=None,
+        help="Comma-separated default intervals in minutes (overrides DEFAULT_ASSET_INTERVALS for assets without --asset-intervals)"
+    )
+    parser.add_argument(
+        "--asset-intervals", nargs="*", metavar="ASSET=INTERVALS",
+        help="Per-asset interval overrides (e.g., OIL=1440 BTC=15,60). "
+             "Assets not listed use --intervals or built-in defaults."
     )
     args = parser.parse_args()
 
@@ -889,9 +910,32 @@ async def main():
             print(f"Error: Unsupported asset '{asset}'. Supported: {', '.join(SUPPORTED_ASSETS)}")
             return
 
-    # Parse and validate intervals
-    intervals = [int(i.strip()) for i in args.intervals.split(",")]
-    for interval in intervals:
+    # Build per-asset interval mapping
+    intervals = [int(i.strip()) for i in args.intervals.split(",")] if args.intervals else [15, 60]
+    asset_intervals = dict(DEFAULT_ASSET_INTERVALS)
+    if args.asset_intervals:
+        for entry in args.asset_intervals:
+            if "=" not in entry:
+                print(f"Error: Invalid --asset-intervals format '{entry}'. Use ASSET=INTERVALS (e.g., OIL=1440)")
+                return
+            asset_name, intervals_str = entry.split("=", 1)
+            asset_intervals[asset_name.upper()] = [int(i) for i in intervals_str.split(",")]
+    # If --intervals was explicitly provided, override per-asset defaults for all assets
+    # that don't have an explicit --asset-intervals override
+    if args.intervals:
+        explicit_assets = set()
+        if args.asset_intervals:
+            explicit_assets = {e.split("=", 1)[0].upper() for e in args.asset_intervals}
+        for asset in assets:
+            if asset not in explicit_assets:
+                asset_intervals[asset] = intervals
+
+    # Validate all intervals
+    all_intervals = set()
+    for asset in assets:
+        for interval in asset_intervals.get(asset, intervals):
+            all_intervals.add(interval)
+    for interval in all_intervals:
         if interval not in SUPPORTED_INTERVALS:
             print(f"Error: Unsupported interval '{interval}'. Supported: {', '.join(str(i) for i in SUPPORTED_INTERVALS)}")
             return
@@ -911,14 +955,25 @@ async def main():
         api_private_key=api_private_key,
     )
 
+    # Build trading units for display
+    trading_units = []
+    for asset in assets:
+        for interval in asset_intervals.get(asset, intervals):
+            trading_units.append((asset, interval))
+
+    # Format per-asset intervals for banner
+    asset_interval_strs = []
+    for asset in assets:
+        ai = asset_intervals.get(asset, intervals)
+        asset_interval_strs.append(f"{asset} ({', '.join(str(i) + 'm' for i in ai)})")
+
     print(f"\n{'='*60}")
     print(f"TURBINE PRICE ACTION BOT")
     print(f"{'='*60}")
     print(f"Wallet: {client.address}")
     print(f"Chain: {CHAIN_ID}")
-    print(f"Assets: {', '.join(assets)}")
-    print(f"Intervals: {', '.join(str(i) + 'm' for i in intervals)}")
-    print(f"Trading units: {len(assets) * len(intervals)} ({len(assets)} assets x {len(intervals)} intervals)")
+    print(f"Assets: {', '.join(asset_interval_strs)}")
+    print(f"Trading units: {len(trading_units)}")
     print(f"Order size: ${args.order_size:.2f} USDC")
     print(f"Max position: ${args.max_position:.2f} USDC per asset")
     print(f"USDC approval: gasless (one-time max permit per settlement)")
@@ -926,9 +981,9 @@ async def main():
         usdc_balance = client.get_usdc_balance()
         balance_display = usdc_balance / 1_000_000
         print(f"USDC balance: ${balance_display:.2f}")
-        min_needed = args.order_size * len(assets) * len(intervals)
+        min_needed = args.order_size * len(trading_units)
         if balance_display < min_needed:
-            print(f"⚠️  Warning: Balance (${balance_display:.2f}) may be low for {len(assets) * len(intervals)} trading units")
+            print(f"⚠️  Warning: Balance (${balance_display:.2f}) may be low for {len(trading_units)} trading units")
             print(f"   Fund your wallet: {client.address}")
     except Exception as e:
         print(f"USDC balance: unknown ({e})")
@@ -938,6 +993,7 @@ async def main():
         client,
         assets=assets,
         intervals=intervals,
+        asset_intervals=asset_intervals,
         order_size_usdc=args.order_size,
         max_position_usdc=args.max_position,
     )

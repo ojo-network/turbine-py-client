@@ -1,10 +1,10 @@
 """
 Turbine Market Maker Bot
 
-Smart probability-based market maker for BTC, ETH, SOL, and XRP prediction
-markets across multiple intervals (15-min and 1-hour). Uses a statistical model
-(normal CDF) to compute YES/NO probabilities from real-time Pyth Network prices,
-with advanced features:
+Smart probability-based market maker for BTC, ETH, SOL, XRP, and OIL prediction
+markets across multiple intervals (15-min, 1-hour, and daily). Uses a statistical
+model (normal CDF) to compute YES/NO probabilities from real-time Pyth Network
+prices, with advanced features:
 
 Algorithm:
   - P(YES) = Φ(deviation / (volatility × √timeRemaining))
@@ -20,8 +20,8 @@ Algorithm:
   - Graceful rebalance: new orders placed BEFORE old ones cancelled
 
 Features:
-  - Multi-asset: trades BTC, ETH, SOL, and XRP simultaneously (configurable via --assets)
-  - Multi-interval: trades 15-min and 1-hour markets simultaneously (configurable via --intervals)
+  - Multi-asset: trades BTC, ETH, SOL, XRP, and OIL simultaneously (configurable via --assets)
+  - Per-asset intervals: crypto assets trade 15m/60m, OIL trades daily (1440m)
   - Statistical probability model from Pyth prices (normal CDF, not linear)
   - Price tracker with velocity, volatility, and momentum signals
   - Inventory tracking with adverse selection detection and circuit breaker
@@ -50,9 +50,10 @@ Usage:
     TURBINE_PRIVATE_KEY=0x... python examples/market_maker.py \\
         --intervals 15
 
-    # Per-asset volatility overrides
+    # Per-asset interval and volatility overrides
     TURBINE_PRIVATE_KEY=0x... python examples/market_maker.py \\
-        --asset-vol BTC=0.025 ETH=0.035 SOL=0.05 XRP=0.06
+        --asset-vol BTC=0.025 ETH=0.035 SOL=0.05 XRP=0.06 OIL=0.04 \\
+        --asset-intervals OIL=1440 BTC=15,60
 """
 
 import argparse
@@ -127,10 +128,24 @@ PYTH_FEED_IDS = {
     "ETH": "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
     "SOL": "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
     "XRP": "0xec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8",
+    "OIL": "0x925ca92ff005ae943c158e3563f59698ce7e75c5a8c8dd43303a0a154887b3e6",
 }
 SUPPORTED_ASSETS = list(PYTH_FEED_IDS.keys())
-SUPPORTED_INTERVALS = [15, 60]
-DEFAULT_INTERVALS = "15,60"
+SUPPORTED_INTERVALS = [15, 60, 1440]
+
+# Default intervals per asset (prevents invalid cross-products like OIL-15 or BTC-1440)
+DEFAULT_ASSET_INTERVALS: dict[str, list[int]] = {
+    "BTC": [15, 60],
+    "ETH": [15, 60],
+    "SOL": [15, 60],
+    "XRP": [15, 60],
+    "OIL": [1440],
+}
+
+# Default per-asset volatilities
+DEFAULT_ASSET_VOLATILITIES: dict[str, float] = {
+    "OIL": 0.04,  # Crude oil: 4% daily vol
+}
 
 
 # ============================================================
@@ -401,10 +416,10 @@ class AssetState:
 class MarketMaker:
     """Smart probability-based market maker for quick prediction markets.
 
-    Supports multiple assets (BTC, ETH, SOL, XRP) and multiple intervals
-    (15-min, 1-hour). Uses a statistical model (normal CDF) to compute fair
-    probability from live prices, with momentum tracking, inventory management,
-    adverse selection detection, and one-sided quoting.
+    Supports multiple assets (BTC, ETH, SOL, XRP, OIL) with per-asset interval
+    mapping (15-min, 1-hour, daily). Uses a statistical model (normal CDF) to
+    compute fair probability from live prices, with momentum tracking, inventory
+    management, adverse selection detection, and one-sided quoting.
     """
 
     def __init__(
@@ -412,6 +427,7 @@ class MarketMaker:
         client: TurbineClient,
         assets: list[str],
         intervals: list[int] | None = None,
+        asset_intervals: dict[str, list[int]] | None = None,
         allocation_usdc: float = DEFAULT_ALLOCATION_USDC,
         spread: float = DEFAULT_SPREAD,
         num_levels: int = DEFAULT_NUM_LEVELS,
@@ -420,8 +436,13 @@ class MarketMaker:
     ):
         self.client = client
         self.assets = assets
-        self.intervals = intervals or [15]
-        self.trading_units = [(asset, interval) for asset in assets for interval in self.intervals]
+        self.intervals = intervals or [15, 60]
+        self.asset_intervals = asset_intervals or DEFAULT_ASSET_INTERVALS
+        # Build trading units using per-asset intervals
+        self.trading_units = []
+        for asset in assets:
+            for interval in self.asset_intervals.get(asset, self.intervals):
+                self.trading_units.append((asset, interval))
         self.allocation_usdc = allocation_usdc
         self.base_spread = spread
         self.num_levels = num_levels
@@ -1302,7 +1323,7 @@ class MarketMaker:
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Smart market maker for BTC, ETH, SOL, and XRP prediction markets (15-min and 1-hour)"
+        description="Smart market maker for BTC, ETH, SOL, XRP, and OIL prediction markets"
     )
     parser.add_argument(
         "-a", "--allocation", type=float, default=DEFAULT_ALLOCATION_USDC,
@@ -1331,8 +1352,13 @@ async def main():
     parser.add_argument(
         "-i", "--intervals",
         type=str,
-        default=DEFAULT_INTERVALS,
-        help=f"Comma-separated intervals in minutes (default: {DEFAULT_INTERVALS})"
+        default=None,
+        help="Comma-separated default intervals in minutes (overrides DEFAULT_ASSET_INTERVALS for assets without --asset-intervals)"
+    )
+    parser.add_argument(
+        "--asset-intervals", nargs="*", metavar="ASSET=INTERVALS",
+        help="Per-asset interval overrides (e.g., OIL=1440 BTC=15,60). "
+             "Assets not listed use --intervals or built-in defaults."
     )
     args = parser.parse_args()
 
@@ -1343,15 +1369,38 @@ async def main():
             print(f"Error: Unsupported asset '{asset}'. Supported: {', '.join(SUPPORTED_ASSETS)}")
             return
 
-    # Parse and validate intervals
-    intervals = [int(i.strip()) for i in args.intervals.split(",")]
-    for interval in intervals:
+    # Build per-asset interval mapping
+    intervals = [int(i.strip()) for i in args.intervals.split(",")] if args.intervals else [15, 60]
+    asset_intervals = dict(DEFAULT_ASSET_INTERVALS)
+    if args.asset_intervals:
+        for entry in args.asset_intervals:
+            if "=" not in entry:
+                print(f"Error: Invalid --asset-intervals format '{entry}'. Use ASSET=INTERVALS (e.g., OIL=1440)")
+                return
+            asset_name, intervals_str = entry.split("=", 1)
+            asset_intervals[asset_name.upper()] = [int(i) for i in intervals_str.split(",")]
+    # If --intervals was explicitly provided, override per-asset defaults for all assets
+    # that don't have an explicit --asset-intervals override
+    if args.intervals:
+        explicit_assets = set()
+        if args.asset_intervals:
+            explicit_assets = {e.split("=", 1)[0].upper() for e in args.asset_intervals}
+        for asset in assets:
+            if asset not in explicit_assets:
+                asset_intervals[asset] = intervals
+
+    # Validate all intervals
+    all_intervals = set()
+    for asset in assets:
+        for interval in asset_intervals.get(asset, intervals):
+            all_intervals.add(interval)
+    for interval in all_intervals:
         if interval not in SUPPORTED_INTERVALS:
             print(f"Error: Unsupported interval '{interval}'. Supported: {', '.join(str(i) for i in SUPPORTED_INTERVALS)}")
             return
 
-    # Parse per-asset volatilities
-    asset_vols: dict[str, float] = {}
+    # Parse per-asset volatilities (merge with defaults)
+    asset_vols: dict[str, float] = dict(DEFAULT_ASSET_VOLATILITIES)
     if args.asset_vol:
         for entry in args.asset_vol:
             if "=" not in entry:
@@ -1375,14 +1424,25 @@ async def main():
         api_private_key=api_private_key,
     )
 
+    # Build trading units for display
+    trading_units = []
+    for asset in assets:
+        for interval in asset_intervals.get(asset, intervals):
+            trading_units.append((asset, interval))
+
+    # Format per-asset intervals for banner
+    asset_interval_strs = []
+    for asset in assets:
+        ai = asset_intervals.get(asset, intervals)
+        asset_interval_strs.append(f"{asset} ({', '.join(str(i) + 'm' for i in ai)})")
+
     print(f"\n{'='*60}")
     print(f"TURBINE SMART MARKET MAKER")
     print(f"{'='*60}")
     print(f"Wallet:      {client.address}")
     print(f"Chain:       {CHAIN_ID}")
-    print(f"Assets:      {', '.join(assets)}")
-    print(f"Intervals:   {', '.join(str(i) + 'm' for i in intervals)}")
-    print(f"Units:       {len(assets) * len(intervals)} ({len(assets)} assets x {len(intervals)} intervals)")
+    print(f"Assets:      {', '.join(asset_interval_strs)}")
+    print(f"Units:       {len(trading_units)}")
     print(f"Allocation:  ${args.allocation:.2f} per asset")
     print(f"Spread:      {args.spread * 100:.1f}% base (dynamic: widens on vol/momentum)")
     print(f"Levels:      {args.levels} per side")
@@ -1400,9 +1460,9 @@ async def main():
         usdc_balance = client.get_usdc_balance()
         balance_display = usdc_balance / 1_000_000
         print(f"Balance:     ${balance_display:.2f} USDC")
-        min_needed = args.allocation * len(assets) * len(intervals)
+        min_needed = args.allocation * len(trading_units)
         if balance_display < min_needed:
-            print(f"⚠️  Warning: Balance (${balance_display:.2f}) may be low for {len(assets) * len(intervals)} trading units x ${args.allocation:.2f}")
+            print(f"⚠️  Warning: Balance (${balance_display:.2f}) may be low for {len(trading_units)} trading units x ${args.allocation:.2f}")
             print(f"   Fund your wallet: {client.address}")
     except Exception as e:
         print(f"Balance:     unknown ({e})")
@@ -1429,6 +1489,7 @@ async def main():
         client,
         assets=assets,
         intervals=intervals,
+        asset_intervals=asset_intervals,
         allocation_usdc=args.allocation,
         spread=args.spread,
         num_levels=args.levels,

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Quick market assets to scan
-QUICK_MARKET_ASSETS = ["BTC", "ETH", "SOL"]
+QUICK_MARKET_ASSETS = ["BTC", "ETH", "SOL", "OIL"]
 
 
 @dataclass
