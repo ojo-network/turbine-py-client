@@ -11,6 +11,8 @@ You are helping a user deploy their Turbine trading bot to Locus for 24/7 cloud 
 
 Locus is a container platform that deploys services via a REST API. Each service costs $0.25/month from workspace credits (new accounts start with $1.00). Services get an auto-subdomain at `svc-{id}.buildwithlocus.com` with HTTPS.
 
+**API Documentation for Locus** `https://buildwithlocus.com/SKILL.md`
+
 **Base URL:** `https://api.buildwithlocus.com/v1`
 
 **Important:** The trading bot is a long-running Python process, not a web server. Locus requires a health endpoint on port 8080, so we create a lightweight wrapper that runs the bot as a subprocess and exposes a `/health` endpoint.
