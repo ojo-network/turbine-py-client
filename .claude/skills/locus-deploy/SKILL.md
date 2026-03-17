@@ -510,9 +510,13 @@ Useful commands:
   To redeploy after changes:
     git add -A && git commit -m "Update bot" && git push locus main
 
-  To check logs (if deployment fails):
+  To view runtime logs:
     curl -s -H "Authorization: Bearer $TOKEN" \
-      "{BASE_URL}/deployments/{DEPLOYMENT_ID}" | jq '.lastLogs'
+      "{BASE_URL}/services/{SERVICE_ID}/logs"
+
+  To view deployment build logs:
+    curl -s -H "Authorization: Bearer $TOKEN" \
+      "{BASE_URL}/deployments/{DEPLOYMENT_ID}/logs"
 
   To set/update environment variables:
     curl -X PATCH -H "Authorization: Bearer $TOKEN" \
