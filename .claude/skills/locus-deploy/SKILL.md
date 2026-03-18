@@ -414,10 +414,10 @@ git remote remove locus 2>/dev/null
 git remote add locus "https://x:${LOCUS_API_KEY}@git.buildwithlocus.com/${WORKSPACE_ID}/${PROJECT_ID}.git"
 ```
 
-**Important:** The deployment files (`locus_runner.py`, `Dockerfile`) need to be committed before pushing. Create a temporary commit with these files:
+**Important:** The deployment files (`locus_runner.py`, `Dockerfile`) and the bot file need to be committed before pushing — only tracked files are included in the git push archive. Create a commit with these files:
 
 ```bash
-git add locus_runner.py Dockerfile
+git add locus_runner.py Dockerfile {BOT_FILE}
 git commit -m "Add Locus deployment files"
 ```
 
