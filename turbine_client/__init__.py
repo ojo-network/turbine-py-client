@@ -37,6 +37,7 @@ from turbine_client.types import (
     UserStats,
 )
 from turbine_client.polymarket import PolymarketClient
+from turbine_client.polymarket_auth import get_polymarket_credentials, sign_clob_auth_message
 from turbine_client.ws.client import TurbineWSClient
 from turbine_client.exceptions import (
     AuthenticationError,
@@ -53,6 +54,8 @@ __all__ = [
     "TurbineClient",
     "TurbineWSClient",
     "PolymarketClient",
+    "get_polymarket_credentials",
+    "sign_clob_auth_message",
     # Types
     "AssetPrice",
     "ChainStats",
