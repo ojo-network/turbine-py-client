@@ -1,0 +1,2142 @@
+diff --git a/api/internal/polymarket/auth.go b/api/internal/polymarket/auth.go
+new file mode 100644
+index 0000000..5bd6754
+--- /dev/null
++++ b/api/internal/polymarket/auth.go
+@@ -0,0 +1,121 @@
++package polymarket
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"log"
++	"net/http"
++)
++
++type AuthHandler struct {
++	polymarketBaseURL string
++	httpClient        *http.Client
++}
++
++func NewAuthHandler(polymarketBaseURL string) *AuthHandler {
++	return &AuthHandler{
++		polymarketBaseURL: polymarketBaseURL,
++		httpClient: &http.Client{
++			Timeout: SDKTimeout,
++		},
++	}
++}
++
++type AuthRequest struct {
++	Address   string `json:"address"`
++	Signature string `json:"signature"`
++	Timestamp string `json:"timestamp"`
++	Nonce     int    `json:"nonce"`
++}
++
++func (h *AuthHandler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
++	var req AuthRequest
++	r.Body = http.MaxBytesReader(w, r.Body, 1024)
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		respondError(w, http.StatusBadRequest, "invalid request body")
++		return
++	}
++
++	if req.Address == "" || req.Signature == "" || req.Timestamp == "" {
++		respondError(w, http.StatusBadRequest, "address, signature, and timestamp are required")
++		return
++	}
++
++	polyURL := fmt.Sprintf("%s/auth/api-key", h.polymarketBaseURL)
++	polyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, polyURL, nil)
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to build auth request")
++		return
++	}
++
++	polyReq.Header.Set("POLY_ADDRESS", req.Address)
++	polyReq.Header.Set("POLY_SIGNATURE", req.Signature)
++	polyReq.Header.Set("POLY_TIMESTAMP", req.Timestamp)
++	polyReq.Header.Set("POLY_NONCE", fmt.Sprintf("%d", req.Nonce))
++
++	resp, err := h.httpClient.Do(polyReq)
++	if err != nil {
++		log.Printf("[polymarket] auth relay error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to reach Polymarket auth service")
++		return
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		respondError(w, http.StatusBadGateway, "failed to read Polymarket auth response")
++		return
++	}
++
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(resp.StatusCode)
++	w.Write(body)
++}
++
++// DeriveAPIKey handles POST /api/v1/polymarket/auth/derive
++// Note: Client sends POST to Turbine, but Turbine sends GET to Polymarket.
++// Polymarket's derive-api-key is a GET endpoint; Turbine accepts POST to carry L1 signature in body.
++func (h *AuthHandler) DeriveAPIKey(w http.ResponseWriter, r *http.Request) {
++	var req AuthRequest
++	r.Body = http.MaxBytesReader(w, r.Body, 1024)
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		respondError(w, http.StatusBadRequest, "invalid request body")
++		return
++	}
++
++	if req.Address == "" || req.Signature == "" || req.Timestamp == "" {
++		respondError(w, http.StatusBadRequest, "address, signature, and timestamp are required")
++		return
++	}
++
++	polyURL := fmt.Sprintf("%s/auth/derive-api-key", h.polymarketBaseURL)
++	polyReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, polyURL, nil)
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to build auth request")
++		return
++	}
++
++	polyReq.Header.Set("POLY_ADDRESS", req.Address)
++	polyReq.Header.Set("POLY_SIGNATURE", req.Signature)
++	polyReq.Header.Set("POLY_TIMESTAMP", req.Timestamp)
++	polyReq.Header.Set("POLY_NONCE", fmt.Sprintf("%d", req.Nonce))
++
++	resp, err := h.httpClient.Do(polyReq)
++	if err != nil {
++		log.Printf("[polymarket] auth derive error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to reach Polymarket auth service")
++		return
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		respondError(w, http.StatusBadGateway, "failed to read Polymarket auth response")
++		return
++	}
++
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(resp.StatusCode)
++	w.Write(body)
++}
+diff --git a/api/internal/polymarket/auth_test.go b/api/internal/polymarket/auth_test.go
+new file mode 100644
+index 0000000..cb95596
+--- /dev/null
++++ b/api/internal/polymarket/auth_test.go
+@@ -0,0 +1,98 @@
++package polymarket
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestAuthHandler_MissingFields(t *testing.T) {
++	ah := NewAuthHandler("https://clob.polymarket.com")
++
++	body := `{"address": "0x123"}`
++	r := httptest.NewRequest("POST", "/api/v1/polymarket/auth", strings.NewReader(body))
++	w := httptest.NewRecorder()
++
++	ah.CreateAPIKey(w, r)
++
++	if w.Code != http.StatusBadRequest {
++		t.Fatalf("status = %d, want 400. body: %s", w.Code, w.Body.String())
++	}
++}
++
++func TestAuthHandler_InvalidJSON(t *testing.T) {
++	ah := NewAuthHandler("https://clob.polymarket.com")
++
++	r := httptest.NewRequest("POST", "/api/v1/polymarket/auth", strings.NewReader("not json"))
++	w := httptest.NewRecorder()
++
++	ah.CreateAPIKey(w, r)
++
++	if w.Code != http.StatusBadRequest {
++		t.Fatalf("status = %d, want 400", w.Code)
++	}
++}
++
++func TestAuthHandler_PolymarketRelay(t *testing.T) {
++	mockPoly := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("POLY_ADDRESS") != "0xuser" {
++			t.Errorf("POLY_ADDRESS = %s, want 0xuser", r.Header.Get("POLY_ADDRESS"))
++		}
++		if r.Header.Get("POLY_SIGNATURE") != "0xsig" {
++			t.Errorf("POLY_SIGNATURE = %s, want 0xsig", r.Header.Get("POLY_SIGNATURE"))
++		}
++
++		w.Header().Set("Content-Type", "application/json")
++		json.NewEncoder(w).Encode(map[string]string{
++			"apiKey":     "new-key",
++			"secret":     "new-secret",
++			"passphrase": "new-pass",
++		})
++	}))
++	defer mockPoly.Close()
++
++	ah := NewAuthHandler(mockPoly.URL)
++
++	body := `{"address":"0xuser","signature":"0xsig","timestamp":"1711100000","nonce":0}`
++	r := httptest.NewRequest("POST", "/api/v1/polymarket/auth", strings.NewReader(body))
++	w := httptest.NewRecorder()
++
++	ah.CreateAPIKey(w, r)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200. body: %s", w.Code, w.Body.String())
++	}
++
++	var resp map[string]string
++	json.NewDecoder(w.Body).Decode(&resp)
++
++	if resp["apiKey"] != "new-key" {
++		t.Errorf("apiKey = %s, want new-key", resp["apiKey"])
++	}
++	if resp["secret"] != "new-secret" {
++		t.Errorf("secret = %s, want new-secret", resp["secret"])
++	}
++}
++
++func TestAuthHandler_PolymarketReturns403(t *testing.T) {
++	mockPoly := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusForbidden)
++		json.NewEncoder(w).Encode(map[string]string{"error": "invalid signature"})
++	}))
++	defer mockPoly.Close()
++
++	ah := NewAuthHandler(mockPoly.URL)
++
++	body := `{"address":"0xuser","signature":"0xbadsig","timestamp":"1711100000","nonce":0}`
++	r := httptest.NewRequest("POST", "/api/v1/polymarket/auth", strings.NewReader(body))
++	w := httptest.NewRecorder()
++
++	ah.CreateAPIKey(w, r)
++
++	if w.Code != http.StatusForbidden {
++		t.Fatalf("status = %d, want 403. body: %s", w.Code, w.Body.String())
++	}
++}
+diff --git a/api/internal/polymarket/client.go b/api/internal/polymarket/client.go
+new file mode 100644
+index 0000000..195277b
+--- /dev/null
++++ b/api/internal/polymarket/client.go
+@@ -0,0 +1,144 @@
++package polymarket
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"strings"
++	"time"
++)
++
++const (
++	SDKTimeout = 15 * time.Second
++)
++
++type PolymarketClient interface {
++	ListMarkets(ctx context.Context, nextCursor string) (*MarketsResponse, error)
++	GetOrderBook(ctx context.Context, tokenID string) (*OrderBookResponse, error)
++	CreateOrder(ctx context.Context, order CreateOrderRequest) (*OrderResponse, error)
++	CancelOrder(ctx context.Context, orderID string) error
++	GetOpenOrders(ctx context.Context) ([]*OrderResponse, error)
++	GetBalances(ctx context.Context) ([]*BalanceResponse, error)
++	GetPositions(ctx context.Context, walletAddress string) ([]*PositionResponse, error)
++	GetDepositAddress(ctx context.Context, walletAddress string) (*DepositAddressResponse, error)
++	GetDepositStatus(ctx context.Context, walletAddress string) (*DepositStatusResponse, error)
++}
++
++type PositionResponse struct {
++	ConditionID  string `json:"condition_id"`
++	Asset        string `json:"asset"`
++	Size         string `json:"size"`
++	AvgPrice     string `json:"avg_price"`
++	CurrentValue string `json:"current_value"`
++	InitialValue string `json:"initial_value"`
++	PnL          string `json:"pnl"`
++	PnLPercent   string `json:"pnl_percent"`
++	Outcome      string `json:"outcome"`
++	Title        string `json:"title"`
++	Redeemable   bool   `json:"redeemable"`
++}
++
++type DepositAddressResponse struct {
++	EVM  string `json:"evm"`
++	SVM  string `json:"svm,omitempty"`
++	BTC  string `json:"btc,omitempty"`
++	Note string `json:"note,omitempty"`
++}
++
++type DepositStatusResponse struct {
++	Transactions []DepositTransaction `json:"transactions"`
++}
++
++type DepositTransaction struct {
++	FromChainID string `json:"from_chain_id"`
++	FromToken   string `json:"from_token_address"`
++	FromAmount  string `json:"from_amount"`
++	ToChainID   string `json:"to_chain_id"`
++	ToToken     string `json:"to_token_address"`
++	Status      string `json:"status"`
++	TxHash      string `json:"tx_hash,omitempty"`
++}
++
++type MarketsResponse struct {
++	Markets    []PolymarketMarket `json:"markets"`
++	NextCursor string             `json:"next_cursor"`
++}
++
++type PolymarketMarket struct {
++	ConditionID string  `json:"condition_id"`
++	Question    string  `json:"question"`
++	Description string  `json:"description"`
++	Category    string  `json:"category"`
++	EndDate     string  `json:"end_date"`
++	Volume      float64 `json:"volume"`
++	Active      bool    `json:"active"`
++	Closed      bool    `json:"closed"`
++	Tokens      []Token `json:"tokens"`
++}
++
++type Token struct {
++	TokenID string  `json:"token_id"`
++	Outcome string  `json:"outcome"`
++	Price   float64 `json:"price"`
++}
++
++type OrderBookResponse struct {
++	Bids []RawPriceLevel `json:"bids"`
++	Asks []RawPriceLevel `json:"asks"`
++}
++
++type RawPriceLevel struct {
++	Price string `json:"price"`
++	Size  string `json:"size"`
++}
++
++// CreateOrderRequest represents a pre-signed Polymarket order.
++// The client (bot SDK) builds and signs the order locally using the polymarket-go-sdk,
++// then sends the full signed payload through Turbine. Turbine never has the private key.
++type CreateOrderRequest struct {
++	// Simplified fields for basic order info (used by handler for logging/response)
++	TokenID   string `json:"token_id"`
++	Side      string `json:"side"`
++	Price     string `json:"price"`
++	Size      string `json:"size"`
++	OrderType string `json:"order_type"`
++
++	// The full pre-signed order payload from the Polymarket SDK.
++	// This is the complete SignedOrder that gets forwarded to PostOrder.
++	SignedOrder json.RawMessage `json:"signed_order"`
++}
++
++type OrderResponse struct {
++	ID        string `json:"id"`
++	Status    string `json:"status"`
++	TokenID   string `json:"token_id"`
++	Side      string `json:"side"`
++	Price     string `json:"price"`
++	Size      string `json:"size"`
++	OrderType string `json:"order_type"`
++}
++
++type BalanceResponse struct {
++	TokenID string `json:"token_id"`
++	Balance string `json:"balance"`
++}
++
++func IsPolymarketRequest(r *http.Request) bool {
++	return r.URL.Query().Get("polymarket") == "true"
++}
++
++func ExtractPolymarketCreds(r *http.Request) (apiKey, secret, passphrase string, err error) {
++	apiKey = strings.TrimSpace(r.Header.Get("X-Polymarket-Key"))
++	secret = strings.TrimSpace(r.Header.Get("X-Polymarket-Secret"))
++	passphrase = strings.TrimSpace(r.Header.Get("X-Polymarket-Passphrase"))
++
++	r.Header.Del("X-Polymarket-Key")
++	r.Header.Del("X-Polymarket-Secret")
++	r.Header.Del("X-Polymarket-Passphrase")
++
++	if apiKey == "" || secret == "" || passphrase == "" {
++		return "", "", "", errors.New("missing Polymarket credentials: X-Polymarket-Key, X-Polymarket-Secret, and X-Polymarket-Passphrase headers are required")
++	}
++	return
++}
+diff --git a/api/internal/polymarket/client_test.go b/api/internal/polymarket/client_test.go
+new file mode 100644
+index 0000000..3b7b1f7
+--- /dev/null
++++ b/api/internal/polymarket/client_test.go
+@@ -0,0 +1,86 @@
++package polymarket
++
++import (
++	"net/http/httptest"
++	"testing"
++)
++
++func TestExtractPolymarketCreds_Success(t *testing.T) {
++	r := httptest.NewRequest("GET", "/test", nil)
++	r.Header.Set("X-Polymarket-Key", "test-key")
++	r.Header.Set("X-Polymarket-Secret", "test-secret")
++	r.Header.Set("X-Polymarket-Passphrase", "test-passphrase")
++
++	key, secret, passphrase, err := ExtractPolymarketCreds(r)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if key != "test-key" || secret != "test-secret" || passphrase != "test-passphrase" {
++		t.Fatalf("got key=%s secret=%s passphrase=%s", key, secret, passphrase)
++	}
++
++	if r.Header.Get("X-Polymarket-Key") != "" {
++		t.Fatal("X-Polymarket-Key header not scrubbed")
++	}
++	if r.Header.Get("X-Polymarket-Secret") != "" {
++		t.Fatal("X-Polymarket-Secret header not scrubbed")
++	}
++	if r.Header.Get("X-Polymarket-Passphrase") != "" {
++		t.Fatal("X-Polymarket-Passphrase header not scrubbed")
++	}
++}
++
++func TestExtractPolymarketCreds_MissingKey(t *testing.T) {
++	r := httptest.NewRequest("GET", "/test", nil)
++	r.Header.Set("X-Polymarket-Secret", "test-secret")
++	r.Header.Set("X-Polymarket-Passphrase", "test-passphrase")
++
++	_, _, _, err := ExtractPolymarketCreds(r)
++	if err == nil {
++		t.Fatal("expected error for missing key")
++	}
++}
++
++func TestExtractPolymarketCreds_MissingSecret(t *testing.T) {
++	r := httptest.NewRequest("GET", "/test", nil)
++	r.Header.Set("X-Polymarket-Key", "test-key")
++	r.Header.Set("X-Polymarket-Passphrase", "test-passphrase")
++
++	_, _, _, err := ExtractPolymarketCreds(r)
++	if err == nil {
++		t.Fatal("expected error for missing secret")
++	}
++}
++
++func TestExtractPolymarketCreds_MissingPassphrase(t *testing.T) {
++	r := httptest.NewRequest("GET", "/test", nil)
++	r.Header.Set("X-Polymarket-Key", "test-key")
++	r.Header.Set("X-Polymarket-Secret", "test-secret")
++
++	_, _, _, err := ExtractPolymarketCreds(r)
++	if err == nil {
++		t.Fatal("expected error for missing passphrase")
++	}
++}
++
++func TestIsPolymarketRequest(t *testing.T) {
++	tests := []struct {
++		name     string
++		query    string
++		expected bool
++	}{
++		{"polymarket=true", "polymarket=true", true},
++		{"polymarket=false", "polymarket=false", false},
++		{"no param", "", false},
++		{"other param", "foo=bar", false},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			r := httptest.NewRequest("GET", "/test?"+tt.query, nil)
++			if got := IsPolymarketRequest(r); got != tt.expected {
++				t.Fatalf("IsPolymarketRequest() = %v, want %v", got, tt.expected)
++			}
++		})
++	}
++}
+diff --git a/api/internal/polymarket/convert.go b/api/internal/polymarket/convert.go
+new file mode 100644
+index 0000000..818209e
+--- /dev/null
++++ b/api/internal/polymarket/convert.go
+@@ -0,0 +1,73 @@
++package polymarket
++
++import (
++	"math"
++	"strconv"
++	"time"
++
++	"github.com/turbine/clob-api/pkg/types"
++)
++
++type PolymarketMarketResponse struct {
++	ID          string  `json:"id"`
++	ChainID     int64   `json:"chainId"`
++	Question    string  `json:"question"`
++	Description string  `json:"description,omitempty"`
++	Category    string  `json:"category,omitempty"`
++	Expiration  int64   `json:"expiration"`
++	Resolved    bool    `json:"resolved"`
++	Volume      int64   `json:"volume"`
++	Provider    string  `json:"provider"`
++	Tokens      []Token `json:"tokens,omitempty"`
++}
++
++func ConvertMarketToResponse(pm PolymarketMarket) PolymarketMarketResponse {
++	var expiration int64
++	if pm.EndDate != "" {
++		if t, err := time.Parse(time.RFC3339, pm.EndDate); err == nil {
++			expiration = t.Unix()
++		}
++	}
++
++	volume := int64(math.Round(pm.Volume * 1e6))
++
++	return PolymarketMarketResponse{
++		ID:          pm.ConditionID,
++		ChainID:     137,
++		Question:    pm.Question,
++		Description: pm.Description,
++		Category:    pm.Category,
++		Expiration:  expiration,
++		Resolved:    pm.Closed,
++		Volume:      volume,
++		Provider:    "polymarket",
++		Tokens:      pm.Tokens,
++	}
++}
++
++func ConvertOrderBookToSnapshot(marketID string, ob OrderBookResponse) types.OrderBookSnapshot {
++	bids := make([]types.PriceLevel, len(ob.Bids))
++	for i, b := range ob.Bids {
++		bids[i] = parsePriceLevel(b)
++	}
++
++	asks := make([]types.PriceLevel, len(ob.Asks))
++	for i, a := range ob.Asks {
++		asks[i] = parsePriceLevel(a)
++	}
++
++	return types.OrderBookSnapshot{
++		Bids: bids,
++		Asks: asks,
++	}
++}
++
++func parsePriceLevel(pl RawPriceLevel) types.PriceLevel {
++	price, _ := strconv.ParseFloat(pl.Price, 64)
++	size, _ := strconv.ParseFloat(pl.Size, 64)
++
++	return types.PriceLevel{
++		Price: uint64(math.Round(price * 1e6)),
++		Size:  uint64(math.Round(size * 1e6)),
++	}
++}
+diff --git a/api/internal/polymarket/convert_test.go b/api/internal/polymarket/convert_test.go
+new file mode 100644
+index 0000000..fd3d714
+--- /dev/null
++++ b/api/internal/polymarket/convert_test.go
+@@ -0,0 +1,91 @@
++package polymarket
++
++import (
++	"testing"
++)
++
++func TestConvertMarketToResponse(t *testing.T) {
++	pm := PolymarketMarket{
++		ConditionID: "0xabc123",
++		Question:    "Will BTC hit 100k?",
++		Description: "Bitcoin price prediction",
++		Category:    "Crypto",
++		EndDate:     "2026-12-31T00:00:00Z",
++		Volume:      1500000.50,
++		Active:      true,
++		Closed:      false,
++		Tokens: []Token{
++			{TokenID: "token-yes", Outcome: "Yes", Price: 0.65},
++			{TokenID: "token-no", Outcome: "No", Price: 0.35},
++		},
++	}
++
++	resp := ConvertMarketToResponse(pm)
++
++	if resp.ID != "0xabc123" {
++		t.Errorf("ID = %s, want 0xabc123", resp.ID)
++	}
++	if resp.ChainID != 137 {
++		t.Errorf("ChainID = %d, want 137", resp.ChainID)
++	}
++	if resp.Question != "Will BTC hit 100k?" {
++		t.Errorf("Question = %s", resp.Question)
++	}
++	if resp.Description != "Bitcoin price prediction" {
++		t.Errorf("Description = %s", resp.Description)
++	}
++	if resp.Category != "Crypto" {
++		t.Errorf("Category = %s", resp.Category)
++	}
++	if resp.Resolved != false {
++		t.Error("Resolved should be false for active market")
++	}
++	if resp.Provider != "polymarket" {
++		t.Errorf("Provider = %s, want polymarket", resp.Provider)
++	}
++	if resp.Volume != 1_500_000_500_000 {
++		t.Errorf("Volume = %d, want 1500000500000", resp.Volume)
++	}
++}
++
++func TestConvertMarketToResponse_Closed(t *testing.T) {
++	pm := PolymarketMarket{
++		ConditionID: "0xdef456",
++		Question:    "Resolved market?",
++		Closed:      true,
++		Active:      false,
++	}
++
++	resp := ConvertMarketToResponse(pm)
++
++	if resp.Resolved != true {
++		t.Error("Resolved should be true for closed market")
++	}
++}
++
++func TestConvertOrderBookToSnapshot(t *testing.T) {
++	ob := OrderBookResponse{
++		Bids: []RawPriceLevel{
++			{Price: "0.60", Size: "100"},
++			{Price: "0.55", Size: "200"},
++		},
++		Asks: []RawPriceLevel{
++			{Price: "0.65", Size: "150"},
++		},
++	}
++
++	snapshot := ConvertOrderBookToSnapshot("market-123", ob)
++
++	if len(snapshot.Bids) != 2 {
++		t.Fatalf("expected 2 bids, got %d", len(snapshot.Bids))
++	}
++	if len(snapshot.Asks) != 1 {
++		t.Fatalf("expected 1 ask, got %d", len(snapshot.Asks))
++	}
++	if snapshot.Bids[0].Price != 600000 {
++		t.Errorf("bid price = %d, want 600000", snapshot.Bids[0].Price)
++	}
++	if snapshot.Asks[0].Size != 150000000 {
++		t.Errorf("ask size = %d, want 150000000", snapshot.Asks[0].Size)
++	}
++}
+diff --git a/api/internal/polymarket/deposit.go b/api/internal/polymarket/deposit.go
+new file mode 100644
+index 0000000..4977daa
+--- /dev/null
++++ b/api/internal/polymarket/deposit.go
+@@ -0,0 +1,171 @@
++package polymarket
++
++import (
++	"context"
++	"crypto/ecdsa"
++	"fmt"
++	"math/big"
++	"sync"
++
++	"github.com/ethereum/go-ethereum"
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/core/types"
++	"github.com/ethereum/go-ethereum/crypto"
++	"github.com/ethereum/go-ethereum/ethclient"
++)
++
++// PolygonDepositRelayer relays gasless USDC deposits to Polymarket on Polygon.
++// It uses Turbine's hot wallet to pay gas for two operations:
++//   1. USDC.permit() — grants Turbine's address allowance to spend user's USDC
++//   2. USDC.transferFrom() — moves USDC from user to Polymarket's deposit address
++type PolygonDepositRelayer struct {
++	client      *ethclient.Client
++	privateKey  *ecdsa.PrivateKey
++	chainID     *big.Int
++	usdcAddress common.Address
++	nonceMu     sync.Mutex
++}
++
++// NewPolygonDepositRelayer creates a deposit relayer using an existing Polygon RPC connection
++// and Turbine's hot wallet private key (same key used for settlement/relaying).
++func NewPolygonDepositRelayer(client *ethclient.Client, privateKey *ecdsa.PrivateKey, chainID int64, usdcAddress common.Address) *PolygonDepositRelayer {
++	return &PolygonDepositRelayer{
++		client:      client,
++		privateKey:  privateKey,
++		chainID:     big.NewInt(chainID),
++		usdcAddress: usdcAddress,
++	}
++}
++
++// RelayDeposit executes a gasless deposit in two on-chain transactions:
++//   1. permit: approve Turbine's relayer to spend user's USDC
++//   2. transferFrom: move USDC from user to Polymarket's deposit address
++func (r *PolygonDepositRelayer) RelayDeposit(ctx context.Context, req GaslessDepositRequest, depositAddress string) (string, error) {
++	ownerAddr := common.HexToAddress(req.Owner)
++	relayerAddr := crypto.PubkeyToAddress(r.privateKey.PublicKey)
++	depositAddr := common.HexToAddress(depositAddress)
++
++	amount := new(big.Int)
++	if _, ok := amount.SetString(req.Amount, 10); !ok {
++		return "", fmt.Errorf("invalid amount: %s", req.Amount)
++	}
++	if amount.Sign() <= 0 {
++		return "", fmt.Errorf("amount must be positive")
++	}
++
++	deadline := new(big.Int)
++	if _, ok := deadline.SetString(req.Deadline, 10); !ok {
++		return "", fmt.Errorf("invalid deadline: %s", req.Deadline)
++	}
++
++	// Validate signature components
++	if len(req.R) != 66 || len(req.S) != 66 {
++		return "", fmt.Errorf("invalid signature format (r: %d chars, s: %d chars, expected 66 each)", len(req.R), len(req.S))
++	}
++
++	rBytes := common.FromHex(req.R)
++	sBytes := common.FromHex(req.S)
++	var r32, s32 [32]byte
++	copy(r32[32-len(rBytes):], rBytes)
++	copy(s32[32-len(sBytes):], sBytes)
++
++	// Step 1: Submit permit (approve relayer to spend user's USDC)
++	permitData := encodePermit(ownerAddr, relayerAddr, amount, deadline, req.V, r32, s32)
++	_, err := r.sendTransaction(ctx, r.usdcAddress, permitData)
++	if err != nil {
++		return "", fmt.Errorf("permit failed: %w", err)
++	}
++
++	// Step 2: Submit transferFrom (move USDC from user to Polymarket deposit address)
++	transferData := encodeTransferFrom(ownerAddr, depositAddr, amount)
++	txHash, err := r.sendTransaction(ctx, r.usdcAddress, transferData)
++	if err != nil {
++		return "", fmt.Errorf("transferFrom failed: %w", err)
++	}
++
++	return txHash, nil
++}
++
++func (r *PolygonDepositRelayer) sendTransaction(ctx context.Context, to common.Address, data []byte) (string, error) {
++	r.nonceMu.Lock()
++	defer r.nonceMu.Unlock()
++
++	fromAddress := crypto.PubkeyToAddress(r.privateKey.PublicKey)
++	nonce, err := r.client.PendingNonceAt(ctx, fromAddress)
++	if err != nil {
++		return "", fmt.Errorf("failed to get nonce: %w", err)
++	}
++
++	gasLimit, err := r.client.EstimateGas(ctx, ethereum.CallMsg{
++		From: fromAddress,
++		To:   &to,
++		Data: data,
++	})
++	if err != nil {
++		// Fallback gas limit for permit/transfer
++		gasLimit = 100000
++	}
++
++	maxFeePerGas, err := r.client.SuggestGasPrice(ctx)
++	if err != nil {
++		return "", fmt.Errorf("failed to get gas price: %w", err)
++	}
++
++	gasTipCap, err := r.client.SuggestGasTipCap(ctx)
++	if err != nil {
++		return "", fmt.Errorf("failed to get gas tip: %w", err)
++	}
++	if gasTipCap.Cmp(maxFeePerGas) > 0 {
++		gasTipCap = new(big.Int).Set(maxFeePerGas)
++	}
++
++	tx := types.NewTx(&types.DynamicFeeTx{
++		ChainID:   r.chainID,
++		Nonce:     nonce,
++		GasTipCap: gasTipCap,
++		GasFeeCap: maxFeePerGas,
++		Gas:       gasLimit,
++		To:        &to,
++		Value:     big.NewInt(0),
++		Data:      data,
++	})
++
++	signedTx, err := types.SignTx(tx, types.LatestSignerForChainID(r.chainID), r.privateKey)
++	if err != nil {
++		return "", fmt.Errorf("failed to sign tx: %w", err)
++	}
++
++	if err := r.client.SendTransaction(ctx, signedTx); err != nil {
++		return "", fmt.Errorf("failed to send tx: %w", err)
++	}
++
++	return signedTx.Hash().Hex(), nil
++}
++
++// encodePermit encodes USDC.permit(owner, spender, value, deadline, v, r, s)
++func encodePermit(owner, spender common.Address, value, deadline *big.Int, v uint8, r, s [32]byte) []byte {
++	selector := crypto.Keccak256([]byte("permit(address,address,uint256,uint256,uint8,bytes32,bytes32)"))[:4]
++
++	data := make([]byte, 0, 4+7*32)
++	data = append(data, selector...)
++	data = append(data, common.LeftPadBytes(owner.Bytes(), 32)...)
++	data = append(data, common.LeftPadBytes(spender.Bytes(), 32)...)
++	data = append(data, common.LeftPadBytes(value.Bytes(), 32)...)
++	data = append(data, common.LeftPadBytes(deadline.Bytes(), 32)...)
++	data = append(data, common.LeftPadBytes([]byte{v}, 32)...)
++	data = append(data, r[:]...)
++	data = append(data, s[:]...)
++	return data
++}
++
++// encodeTransferFrom encodes USDC.transferFrom(from, to, amount)
++func encodeTransferFrom(from, to common.Address, amount *big.Int) []byte {
++	selector := crypto.Keccak256([]byte("transferFrom(address,address,uint256)"))[:4]
++
++	data := make([]byte, 0, 4+3*32)
++	data = append(data, selector...)
++	data = append(data, common.LeftPadBytes(from.Bytes(), 32)...)
++	data = append(data, common.LeftPadBytes(to.Bytes(), 32)...)
++	data = append(data, common.LeftPadBytes(amount.Bytes(), 32)...)
++	return data
++}
+diff --git a/api/internal/polymarket/handler.go b/api/internal/polymarket/handler.go
+new file mode 100644
+index 0000000..e603125
+--- /dev/null
++++ b/api/internal/polymarket/handler.go
+@@ -0,0 +1,382 @@
++package polymarket
++
++import (
++	"context"
++	"encoding/json"
++	"log"
++	"net/http"
++	"strings"
++	"time"
++
++	"github.com/go-chi/chi/v5"
++)
++
++type ClientFactory interface {
++	NewClient(apiKey, secret, passphrase string) (PolymarketClient, error)
++}
++
++// DepositRelayer handles the on-chain permit + transferFrom for gasless deposits.
++type DepositRelayer interface {
++	RelayDeposit(ctx context.Context, req GaslessDepositRequest, depositAddress string) (txHash string, err error)
++}
++
++// GaslessDepositRequest is the request body for gasless Polymarket deposits.
++// User signs an EIP-2612 USDC permit off-chain, Turbine relays the permit + transfer.
++type GaslessDepositRequest struct {
++	Owner    string `json:"owner"`    // User's wallet address
++	Amount   string `json:"amount"`   // USDC amount (6 decimals, e.g. "1000000" = $1)
++	Deadline string `json:"deadline"` // Permit deadline (unix timestamp)
++	V        uint8  `json:"v"`        // Permit signature v
++	R        string `json:"r"`        // Permit signature r (0x-prefixed hex)
++	S        string `json:"s"`        // Permit signature s (0x-prefixed hex)
++}
++
++type Handler struct {
++	clientFactory  ClientFactory
++	depositRelayer DepositRelayer // Optional — nil if deposit relay not configured
++}
++
++func NewHandler(factory ClientFactory) *Handler {
++	return &Handler{clientFactory: factory}
++}
++
++// SetDepositRelayer injects the deposit relayer for gasless Polymarket deposits.
++func (h *Handler) SetDepositRelayer(dr DepositRelayer) {
++	h.depositRelayer = dr
++}
++
++func (h *Handler) ListMarkets(w http.ResponseWriter, r *http.Request) {
++	ctx, cancel := context.WithTimeout(r.Context(), SDKTimeout)
++	defer cancel()
++
++	cursor := r.URL.Query().Get("next_cursor")
++
++	client, err := h.clientFactory.NewClient("", "", "")
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to create Polymarket client")
++		return
++	}
++
++	result, err := client.ListMarkets(ctx, cursor)
++	if err != nil {
++		log.Printf("[polymarket] ListMarkets error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to fetch Polymarket markets")
++		return
++	}
++
++	markets := make([]PolymarketMarketResponse, len(result.Markets))
++	for i, m := range result.Markets {
++		markets[i] = ConvertMarketToResponse(m)
++	}
++
++	respondJSON(w, http.StatusOK, map[string]interface{}{
++		"markets":     markets,
++		"count":       len(markets),
++		"next_cursor": result.NextCursor,
++	})
++}
++
++func (h *Handler) GetOrderBook(w http.ResponseWriter, r *http.Request) {
++	ctx, cancel := context.WithTimeout(r.Context(), SDKTimeout)
++	defer cancel()
++
++	tokenID := chi.URLParam(r, "marketId")
++	if tokenID == "" {
++		respondError(w, http.StatusBadRequest, "missing marketId")
++		return
++	}
++
++	client, err := h.clientFactory.NewClient("", "", "")
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to create Polymarket client")
++		return
++	}
++
++	ob, err := client.GetOrderBook(ctx, tokenID)
++	if err != nil {
++		log.Printf("[polymarket] GetOrderBook error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to fetch Polymarket orderbook")
++		return
++	}
++
++	snapshot := ConvertOrderBookToSnapshot(tokenID, *ob)
++	respondJSON(w, http.StatusOK, snapshot)
++}
++
++func (h *Handler) SubmitOrder(w http.ResponseWriter, r *http.Request) {
++	apiKey, secret, passphrase, err := ExtractPolymarketCreds(r)
++	if err != nil {
++		respondError(w, http.StatusUnauthorized, err.Error())
++		return
++	}
++
++	ctx, cancel := context.WithTimeout(r.Context(), SDKTimeout)
++	defer cancel()
++
++	var req CreateOrderRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		respondError(w, http.StatusBadRequest, "invalid request body")
++		return
++	}
++
++	client, err := h.clientFactory.NewClient(apiKey, secret, passphrase)
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to create Polymarket client")
++		return
++	}
++
++	result, err := client.CreateOrder(ctx, req)
++	if err != nil {
++		log.Printf("[polymarket] CreateOrder error: %v", err)
++		status, msg := mapPolymarketError(err)
++		respondError(w, status, "failed to place Polymarket order: "+msg)
++		return
++	}
++
++	respondJSON(w, http.StatusOK, result)
++}
++
++func (h *Handler) CancelOrder(w http.ResponseWriter, r *http.Request) {
++	apiKey, secret, passphrase, err := ExtractPolymarketCreds(r)
++	if err != nil {
++		respondError(w, http.StatusUnauthorized, err.Error())
++		return
++	}
++
++	ctx, cancel := context.WithTimeout(r.Context(), SDKTimeout)
++	defer cancel()
++
++	orderID := chi.URLParam(r, "hash")
++	if orderID == "" {
++		respondError(w, http.StatusBadRequest, "missing order ID")
++		return
++	}
++
++	client, err := h.clientFactory.NewClient(apiKey, secret, passphrase)
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to create Polymarket client")
++		return
++	}
++
++	if err := client.CancelOrder(ctx, orderID); err != nil {
++		log.Printf("[polymarket] CancelOrder error: %v", err)
++		status, msg := mapPolymarketError(err)
++		respondError(w, status, "failed to cancel Polymarket order: "+msg)
++		return
++	}
++
++	respondJSON(w, http.StatusOK, map[string]string{
++		"status":  "cancelled",
++		"orderID": orderID,
++	})
++}
++
++func (h *Handler) GetUserOrders(w http.ResponseWriter, r *http.Request) {
++	apiKey, secret, passphrase, err := ExtractPolymarketCreds(r)
++	if err != nil {
++		respondError(w, http.StatusUnauthorized, err.Error())
++		return
++	}
++
++	ctx, cancel := context.WithTimeout(r.Context(), SDKTimeout)
++	defer cancel()
++
++	client, err := h.clientFactory.NewClient(apiKey, secret, passphrase)
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to create Polymarket client")
++		return
++	}
++
++	orders, err := client.GetOpenOrders(ctx)
++	if err != nil {
++		log.Printf("[polymarket] GetOpenOrders error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to fetch Polymarket orders")
++		return
++	}
++
++	respondJSON(w, http.StatusOK, map[string]interface{}{
++		"orders": orders,
++		"count":  len(orders),
++	})
++}
++
++func (h *Handler) GetUserPositions(w http.ResponseWriter, r *http.Request) {
++	apiKey, secret, passphrase, err := ExtractPolymarketCreds(r)
++	if err != nil {
++		respondError(w, http.StatusUnauthorized, err.Error())
++		return
++	}
++
++	ctx, cancel := context.WithTimeout(r.Context(), SDKTimeout)
++	defer cancel()
++
++	client, err := h.clientFactory.NewClient(apiKey, secret, passphrase)
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to create Polymarket client")
++		return
++	}
++
++	balances, err := client.GetBalances(ctx)
++	if err != nil {
++		log.Printf("[polymarket] GetBalances error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to fetch Polymarket positions")
++		return
++	}
++
++	respondJSON(w, http.StatusOK, map[string]interface{}{
++		"positions": balances,
++		"count":     len(balances),
++	})
++}
++
++// GetDepositAddress handles POST /api/v1/polymarket/deposit-address
++// Returns the Polymarket deposit address for a given wallet.
++// The client then sends a standard ERC20 USDC transfer to this address on Polygon.
++// No Polymarket API credentials needed — just the wallet address.
++func (h *Handler) GetDepositAddress(w http.ResponseWriter, r *http.Request) {
++	ctx, cancel := context.WithTimeout(r.Context(), SDKTimeout)
++	defer cancel()
++
++	var req struct {
++		Address string `json:"address"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
++		respondError(w, http.StatusBadRequest, "address is required")
++		return
++	}
++
++	client, err := h.clientFactory.NewClient("", "", "")
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to create Polymarket client")
++		return
++	}
++
++	resp, err := client.GetDepositAddress(ctx, req.Address)
++	if err != nil {
++		log.Printf("[polymarket] GetDepositAddress error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to get Polymarket deposit address")
++		return
++	}
++
++	respondJSON(w, http.StatusOK, resp)
++}
++
++// GetDepositStatus handles GET /api/v1/polymarket/deposit-status/{address}
++// Returns the status of deposits for a given wallet address.
++func (h *Handler) GetDepositStatus(w http.ResponseWriter, r *http.Request) {
++	ctx, cancel := context.WithTimeout(r.Context(), SDKTimeout)
++	defer cancel()
++
++	address := chi.URLParam(r, "address")
++	if address == "" {
++		respondError(w, http.StatusBadRequest, "address is required")
++		return
++	}
++
++	client, err := h.clientFactory.NewClient("", "", "")
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to create Polymarket client")
++		return
++	}
++
++	resp, err := client.GetDepositStatus(ctx, address)
++	if err != nil {
++		log.Printf("[polymarket] GetDepositStatus error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to get deposit status")
++		return
++	}
++
++	respondJSON(w, http.StatusOK, resp)
++}
++
++// SubmitGaslessDeposit handles POST /api/v1/polymarket/deposit
++// Two-step gasless deposit: permit (approve) + transferFrom to Polymarket deposit address.
++// User signs an EIP-2612 USDC permit off-chain. Turbine relays both the permit and the
++// transfer, paying gas from its own hot wallet. Same pattern as existing gasless trading.
++func (h *Handler) SubmitGaslessDeposit(w http.ResponseWriter, r *http.Request) {
++	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
++	defer cancel()
++
++	var req GaslessDepositRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		respondError(w, http.StatusBadRequest, "invalid request body")
++		return
++	}
++
++	if req.Owner == "" || req.Amount == "" {
++		respondError(w, http.StatusBadRequest, "owner and amount are required")
++		return
++	}
++	if req.V == 0 && req.R == "" && req.S == "" {
++		respondError(w, http.StatusBadRequest, "EIP-2612 permit signature (v, r, s) is required")
++		return
++	}
++
++	if h.depositRelayer == nil {
++		respondError(w, http.StatusNotImplemented, "Polymarket deposit relayer not configured")
++		return
++	}
++
++	// Step 1: Get the Polymarket deposit address for this user
++	client, err := h.clientFactory.NewClient("", "", "")
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to create Polymarket client")
++		return
++	}
++
++	depositAddr, err := client.GetDepositAddress(ctx, req.Owner)
++	if err != nil {
++		log.Printf("[polymarket] GetDepositAddress error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to get Polymarket deposit address")
++		return
++	}
++	if depositAddr.EVM == "" {
++		respondError(w, http.StatusBadGateway, "Polymarket returned empty deposit address")
++		return
++	}
++
++	// Step 2: Relay the permit + transferFrom via Turbine's relayer
++	txHash, err := h.depositRelayer.RelayDeposit(ctx, req, depositAddr.EVM)
++	if err != nil {
++		log.Printf("[polymarket] RelayDeposit error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to relay deposit: "+err.Error())
++		return
++	}
++
++	log.Printf("[polymarket] Gasless deposit relayed: owner=%s amount=%s deposit_addr=%s tx=%s",
++		req.Owner, req.Amount, depositAddr.EVM, txHash)
++
++	respondJSON(w, http.StatusOK, map[string]string{
++		"success":         "true",
++		"tx_hash":         txHash,
++		"deposit_address": depositAddr.EVM,
++	})
++}
++
++func mapPolymarketError(err error) (int, string) {
++	msg := err.Error()
++	switch {
++	case strings.Contains(msg, "rate limit") || strings.Contains(msg, "429"):
++		return http.StatusTooManyRequests, "Polymarket rate limit exceeded, try again later"
++	case strings.Contains(msg, "unauthorized") || strings.Contains(msg, "401"):
++		return http.StatusUnauthorized, "Polymarket credentials are invalid or expired"
++	case strings.Contains(msg, "forbidden") || strings.Contains(msg, "403"):
++		return http.StatusForbidden, "Polymarket access denied"
++	case strings.Contains(msg, "insufficient"):
++		return http.StatusBadRequest, "insufficient funds for this order"
++	default:
++		return http.StatusBadGateway, msg
++	}
++}
++
++func respondJSON(w http.ResponseWriter, status int, data interface{}) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	json.NewEncoder(w).Encode(data)
++}
++
++func respondError(w http.ResponseWriter, status int, message string) {
++	respondJSON(w, status, map[string]string{
++		"error": message,
++	})
++}
+diff --git a/api/internal/polymarket/handler_test.go b/api/internal/polymarket/handler_test.go
+new file mode 100644
+index 0000000..b60f0bb
+--- /dev/null
++++ b/api/internal/polymarket/handler_test.go
+@@ -0,0 +1,236 @@
++package polymarket
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/go-chi/chi/v5"
++)
++
++type mockClient struct {
++	markets    *MarketsResponse
++	orderBook  *OrderBookResponse
++	order      *OrderResponse
++	openOrders []*OrderResponse
++	balances   []*BalanceResponse
++	err        error
++}
++
++func (m *mockClient) ListMarkets(ctx context.Context, cursor string) (*MarketsResponse, error) {
++	return m.markets, m.err
++}
++func (m *mockClient) GetOrderBook(ctx context.Context, tokenID string) (*OrderBookResponse, error) {
++	return m.orderBook, m.err
++}
++func (m *mockClient) CreateOrder(ctx context.Context, order CreateOrderRequest) (*OrderResponse, error) {
++	return m.order, m.err
++}
++func (m *mockClient) CancelOrder(ctx context.Context, orderID string) error {
++	return m.err
++}
++func (m *mockClient) GetOpenOrders(ctx context.Context) ([]*OrderResponse, error) {
++	return m.openOrders, m.err
++}
++func (m *mockClient) GetBalances(ctx context.Context) ([]*BalanceResponse, error) {
++	return m.balances, m.err
++}
++func (m *mockClient) GetPositions(ctx context.Context, walletAddress string) ([]*PositionResponse, error) {
++	return nil, m.err
++}
++func (m *mockClient) GetDepositAddress(ctx context.Context, walletAddress string) (*DepositAddressResponse, error) {
++	return &DepositAddressResponse{EVM: "0xdeposit"}, m.err
++}
++func (m *mockClient) GetDepositStatus(ctx context.Context, walletAddress string) (*DepositStatusResponse, error) {
++	return &DepositStatusResponse{}, m.err
++}
++
++// mockDepositRelayer for testing
++type mockDepositRelayer struct {
++	txHash string
++	err    error
++}
++
++func (m *mockDepositRelayer) RelayDeposit(ctx context.Context, req GaslessDepositRequest, depositAddress string) (string, error) {
++	return m.txHash, m.err
++}
++
++type mockClientFactory struct {
++	client PolymarketClient
++	err    error
++}
++
++func (f *mockClientFactory) NewClient(apiKey, secret, passphrase string) (PolymarketClient, error) {
++	return f.client, f.err
++}
++
++func TestHandler_ListMarkets(t *testing.T) {
++	mock := &mockClient{
++		markets: &MarketsResponse{
++			Markets: []PolymarketMarket{
++				{ConditionID: "0xabc", Question: "Test market?", Volume: 1000, Active: true},
++			},
++			NextCursor: "cursor-2",
++		},
++	}
++	h := NewHandler(&mockClientFactory{client: mock})
++
++	r := httptest.NewRequest("GET", "/api/v1/markets?polymarket=true", nil)
++	w := httptest.NewRecorder()
++
++	h.ListMarkets(w, r)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200", w.Code)
++	}
++
++	var resp map[string]interface{}
++	json.NewDecoder(w.Body).Decode(&resp)
++	markets := resp["markets"].([]interface{})
++	if len(markets) != 1 {
++		t.Fatalf("expected 1 market, got %d", len(markets))
++	}
++}
++
++func TestHandler_SubmitOrder_MissingCreds(t *testing.T) {
++	h := NewHandler(&mockClientFactory{client: &mockClient{}})
++
++	body := `{"token_id":"123","side":"BUY","price":"0.65","size":"100","order_type":"GTC"}`
++	r := httptest.NewRequest("POST", "/api/v1/orders?polymarket=true", strings.NewReader(body))
++	w := httptest.NewRecorder()
++
++	h.SubmitOrder(w, r)
++
++	if w.Code != http.StatusUnauthorized {
++		t.Fatalf("status = %d, want 401", w.Code)
++	}
++}
++
++func TestHandler_SubmitOrder_Success(t *testing.T) {
++	mock := &mockClient{
++		order: &OrderResponse{ID: "order-1", Status: "LIVE", Side: "BUY", Price: "0.65", Size: "100"},
++	}
++	h := NewHandler(&mockClientFactory{client: mock})
++
++	body := `{"token_id":"123","side":"BUY","price":"0.65","size":"100","order_type":"GTC","signature":"0xabc"}`
++	r := httptest.NewRequest("POST", "/api/v1/orders?polymarket=true", strings.NewReader(body))
++	r.Header.Set("X-Polymarket-Key", "key")
++	r.Header.Set("X-Polymarket-Secret", "secret")
++	r.Header.Set("X-Polymarket-Passphrase", "pass")
++	w := httptest.NewRecorder()
++
++	h.SubmitOrder(w, r)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200. body: %s", w.Code, w.Body.String())
++	}
++}
++
++func TestHandler_CancelOrder_Success(t *testing.T) {
++	mock := &mockClient{}
++	h := NewHandler(&mockClientFactory{client: mock})
++
++	r := httptest.NewRequest("DELETE", "/api/v1/orders/order-123?polymarket=true", nil)
++	r.Header.Set("X-Polymarket-Key", "key")
++	r.Header.Set("X-Polymarket-Secret", "secret")
++	r.Header.Set("X-Polymarket-Passphrase", "pass")
++	w := httptest.NewRecorder()
++
++	rctx := newChiContext(r, map[string]string{"hash": "order-123"})
++	h.CancelOrder(w, rctx)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200", w.Code)
++	}
++}
++
++func TestHandler_GetOrderBook_Success(t *testing.T) {
++	mock := &mockClient{
++		orderBook: &OrderBookResponse{
++			Bids: []RawPriceLevel{{Price: "0.60", Size: "100"}},
++			Asks: []RawPriceLevel{{Price: "0.65", Size: "50"}},
++		},
++	}
++	h := NewHandler(&mockClientFactory{client: mock})
++
++	r := httptest.NewRequest("GET", "/api/v1/orderbook/token-123?polymarket=true", nil)
++	rctx := newChiContext(r, map[string]string{"marketId": "token-123"})
++	w := httptest.NewRecorder()
++
++	h.GetOrderBook(w, rctx)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200", w.Code)
++	}
++}
++
++func TestHandler_GetUserOrders_Success(t *testing.T) {
++	mock := &mockClient{
++		openOrders: []*OrderResponse{
++			{ID: "order-1", Status: "LIVE", Side: "BUY", Price: "0.65", Size: "100"},
++		},
++	}
++	h := NewHandler(&mockClientFactory{client: mock})
++
++	r := httptest.NewRequest("GET", "/api/v1/orders?polymarket=true", nil)
++	r.Header.Set("X-Polymarket-Key", "key")
++	r.Header.Set("X-Polymarket-Secret", "secret")
++	r.Header.Set("X-Polymarket-Passphrase", "pass")
++	w := httptest.NewRecorder()
++
++	h.GetUserOrders(w, r)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200. body: %s", w.Code, w.Body.String())
++	}
++}
++
++func TestHandler_GetUserPositions_Success(t *testing.T) {
++	mock := &mockClient{
++		balances: []*BalanceResponse{
++			{TokenID: "token-1", Balance: "150.5"},
++		},
++	}
++	h := NewHandler(&mockClientFactory{client: mock})
++
++	r := httptest.NewRequest("GET", "/api/v1/users/0xuser/positions?polymarket=true", nil)
++	r.Header.Set("X-Polymarket-Key", "key")
++	r.Header.Set("X-Polymarket-Secret", "secret")
++	r.Header.Set("X-Polymarket-Passphrase", "pass")
++	w := httptest.NewRecorder()
++
++	h.GetUserPositions(w, r)
++
++	if w.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200. body: %s", w.Code, w.Body.String())
++	}
++}
++
++func TestHandler_ClientFactoryError(t *testing.T) {
++	h := NewHandler(&mockClientFactory{err: fmt.Errorf("factory error")})
++
++	body := `{"token_id":"123","side":"BUY","price":"0.65","size":"100","order_type":"GTC","signature":"0xabc"}`
++	r := httptest.NewRequest("POST", "/api/v1/orders?polymarket=true", strings.NewReader(body))
++	r.Header.Set("X-Polymarket-Key", "key")
++	r.Header.Set("X-Polymarket-Secret", "secret")
++	r.Header.Set("X-Polymarket-Passphrase", "pass")
++	w := httptest.NewRecorder()
++
++	h.SubmitOrder(w, r)
++
++	if w.Code != http.StatusInternalServerError {
++		t.Fatalf("status = %d, want 500", w.Code)
++	}
++}
++
++func newChiContext(r *http.Request, params map[string]string) *http.Request {
++	chiCtx := new(chi.Context)
++	for k, v := range params {
++		chiCtx.URLParams.Add(k, v)
++	}
++	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, chiCtx))
++}
+diff --git a/api/internal/polymarket/onboard.go b/api/internal/polymarket/onboard.go
+new file mode 100644
+index 0000000..0dbfb00
+--- /dev/null
++++ b/api/internal/polymarket/onboard.go
+@@ -0,0 +1,393 @@
++package polymarket
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"log"
++	"math/big"
++	"net/http"
++	"os"
++
++	"github.com/GoPolymarket/polymarket-go-sdk/pkg/auth"
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/crypto"
++)
++
++// Polymarket contract addresses on Polygon mainnet
++var (
++	PolymarketExchange     = common.HexToAddress("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
++	PolymarketNegRisk      = common.HexToAddress("0xC5d563A36AE78145C45a50134d48A1215220f80a")
++	PolymarketUSDC         = common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
++	PolymarketCTF          = common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
++	PolymarketRelayerURL   = "https://relayer-v2.polymarket.com"
++)
++
++// OnboardingStatus represents the full state of a user's Polymarket setup.
++type OnboardingStatus struct {
++	EOA        string `json:"eoa"`
++	SafeWallet string `json:"safe_wallet"`
++
++	// Onboarding stages
++	SafeDeployed       bool `json:"safe_deployed"`
++	USDCApproved       bool `json:"usdc_exchange_approved"`
++	USDCNegRiskApproved bool `json:"usdc_neg_risk_approved"`
++	CTFApproved        bool `json:"ctf_exchange_approved"`
++	CTFNegRiskApproved bool `json:"ctf_neg_risk_approved"`
++
++	// Human-readable stage
++	Stage    string `json:"stage"`    // "deploy_safe", "approve_usdc", "approve_ctf", "ready"
++	NextStep string `json:"next_step"` // Description of what to do next
++	Ready    bool   `json:"ready"`    // True if all steps are complete
++}
++
++// OnboardHandler handles Polymarket user onboarding.
++type OnboardHandler struct {
++	relayerURL string
++	httpClient *http.Client
++}
++
++func NewOnboardHandler() *OnboardHandler {
++	return &OnboardHandler{
++		relayerURL: PolymarketRelayerURL,
++		httpClient: &http.Client{Timeout: SDKTimeout},
++	}
++}
++
++// GetOnboardingStatus handles GET /api/v1/polymarket/onboard/status?address=0x...
++// Returns the full onboarding state: Safe deployment, USDC allowances, CTF approvals.
++func (h *OnboardHandler) GetOnboardingStatus(w http.ResponseWriter, r *http.Request) {
++	ctx, cancel := context.WithTimeout(r.Context(), SDKTimeout)
++	defer cancel()
++
++	address := r.URL.Query().Get("address")
++	if address == "" || !common.IsHexAddress(address) {
++		respondError(w, http.StatusBadRequest, "valid address query param is required")
++		return
++	}
++
++	eoa := common.HexToAddress(address)
++	safeAddr, err := auth.DeriveSafeWallet(eoa)
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to derive safe wallet: "+err.Error())
++		return
++	}
++
++	status := OnboardingStatus{
++		EOA:        eoa.Hex(),
++		SafeWallet: safeAddr.Hex(),
++	}
++
++	// Step 1: Check Safe deployment
++	deployed, err := h.isSafeDeployed(ctx, safeAddr)
++	if err != nil {
++		log.Printf("[polymarket] check safe deployed error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to check Safe deployment status")
++		return
++	}
++	status.SafeDeployed = deployed
++
++	if !deployed {
++		status.Stage = "deploy_safe"
++		status.NextStep = "Deploy Safe wallet via POST /polymarket/onboard/relay"
++		respondJSON(w, http.StatusOK, status)
++		return
++	}
++
++	// Step 2: Check USDC allowances (only if Safe is deployed)
++	status.USDCApproved = h.checkERC20Allowance(ctx, PolymarketUSDC, safeAddr, PolymarketExchange)
++	status.USDCNegRiskApproved = h.checkERC20Allowance(ctx, PolymarketUSDC, safeAddr, PolymarketNegRisk)
++
++	if !status.USDCApproved || !status.USDCNegRiskApproved {
++		status.Stage = "approve_usdc"
++		status.NextStep = "Approve USDC spending for exchange contracts via POST /polymarket/onboard/relay"
++		respondJSON(w, http.StatusOK, status)
++		return
++	}
++
++	// Step 3: Check CTF approvals
++	status.CTFApproved = h.checkCTFApproval(ctx, PolymarketCTF, safeAddr, PolymarketExchange)
++	status.CTFNegRiskApproved = h.checkCTFApproval(ctx, PolymarketCTF, safeAddr, PolymarketNegRisk)
++
++	if !status.CTFApproved || !status.CTFNegRiskApproved {
++		status.Stage = "approve_ctf"
++		status.NextStep = "Approve CTF (conditional tokens) for exchange contracts via POST /polymarket/onboard/relay"
++		respondJSON(w, http.StatusOK, status)
++		return
++	}
++
++	// All done
++	status.Stage = "ready"
++	status.NextStep = "Create API key via POST /polymarket/auth, then trade!"
++	status.Ready = true
++	respondJSON(w, http.StatusOK, status)
++}
++
++// GetSafeWallet handles GET /api/v1/polymarket/onboard/safe-wallet?address=0x...
++// Derives and returns the Safe wallet address for an EOA.
++func (h *OnboardHandler) GetSafeWallet(w http.ResponseWriter, r *http.Request) {
++	address := r.URL.Query().Get("address")
++	if address == "" || !common.IsHexAddress(address) {
++		respondError(w, http.StatusBadRequest, "valid address query param is required")
++		return
++	}
++
++	eoa := common.HexToAddress(address)
++	safeAddr, err := auth.DeriveSafeWallet(eoa)
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to derive safe wallet: "+err.Error())
++		return
++	}
++
++	respondJSON(w, http.StatusOK, map[string]string{
++		"eoa":         eoa.Hex(),
++		"safe_wallet": safeAddr.Hex(),
++	})
++}
++
++// SubmitRelayerTx handles POST /api/v1/polymarket/onboard/relay
++// Forwards a pre-signed Safe transaction to Polymarket's relayer.
++// Used for: Safe deployment, USDC approval, CTF approval.
++// The client builds and signs the Safe transaction, Turbine forwards it.
++func (h *OnboardHandler) SubmitRelayerTx(w http.ResponseWriter, r *http.Request) {
++	ctx, cancel := context.WithTimeout(r.Context(), 30*SDKTimeout)
++	defer cancel()
++
++	// Read the raw request body and forward to Polymarket's relayer
++	r.Body = http.MaxBytesReader(w, r.Body, 10*1024) // 10KB limit
++	body, err := io.ReadAll(r.Body)
++	if err != nil {
++		respondError(w, http.StatusBadRequest, "failed to read request body")
++		return
++	}
++
++	// Validate it's valid JSON
++	var check map[string]interface{}
++	if err := json.Unmarshal(body, &check); err != nil {
++		respondError(w, http.StatusBadRequest, "invalid JSON body")
++		return
++	}
++
++	// Validate required fields
++	requiredFields := []string{"from", "to", "data", "signature", "type"}
++	for _, field := range requiredFields {
++		if _, ok := check[field]; !ok {
++			respondError(w, http.StatusBadRequest, fmt.Sprintf("missing required field: %s", field))
++			return
++		}
++	}
++
++	// Forward to Polymarket's relayer
++	relayURL := fmt.Sprintf("%s/submit", h.relayerURL)
++	relayReq, err := http.NewRequestWithContext(ctx, http.MethodPost, relayURL, io.NopCloser(
++		jsonReader(body),
++	))
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to build relay request")
++		return
++	}
++	relayReq.Header.Set("Content-Type", "application/json")
++
++	// Forward any Polymarket auth headers the client sends
++	for _, header := range []string{"POLY_BUILDER_API_KEY", "POLY_BUILDER_TIMESTAMP", "POLY_BUILDER_PASSPHRASE", "POLY_BUILDER_SIGNATURE", "RELAYER_API_KEY", "RELAYER_API_KEY_ADDRESS"} {
++		if v := r.Header.Get(header); v != "" {
++			relayReq.Header.Set(header, v)
++		}
++	}
++
++	resp, err := h.httpClient.Do(relayReq)
++	if err != nil {
++		log.Printf("[polymarket] relayer submit error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to reach Polymarket relayer")
++		return
++	}
++	defer resp.Body.Close()
++
++	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		respondError(w, http.StatusBadGateway, "failed to read relayer response")
++		return
++	}
++
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(resp.StatusCode)
++	w.Write(respBody)
++}
++
++// GetRelayerNonce handles GET /api/v1/polymarket/onboard/nonce?address=0x...&type=SAFE
++// Returns the relayer address and current nonce for building Safe transactions.
++func (h *OnboardHandler) GetRelayerNonce(w http.ResponseWriter, r *http.Request) {
++	ctx, cancel := context.WithTimeout(r.Context(), SDKTimeout)
++	defer cancel()
++
++	address := r.URL.Query().Get("address")
++	txType := r.URL.Query().Get("type")
++	if address == "" {
++		respondError(w, http.StatusBadRequest, "address query param is required")
++		return
++	}
++	if txType == "" {
++		txType = "SAFE"
++	}
++
++	url := fmt.Sprintf("%s/relay-payload?address=%s&type=%s", h.relayerURL, address, txType)
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "failed to build request")
++		return
++	}
++
++	resp, err := h.httpClient.Do(req)
++	if err != nil {
++		log.Printf("[polymarket] relayer nonce error: %v", err)
++		respondError(w, http.StatusBadGateway, "failed to reach Polymarket relayer")
++		return
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		respondError(w, http.StatusBadGateway, "failed to read relayer response")
++		return
++	}
++
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(resp.StatusCode)
++	w.Write(body)
++}
++
++// GetContractAddresses handles GET /api/v1/polymarket/onboard/contracts
++// Returns the Polymarket contract addresses needed for approvals.
++func (h *OnboardHandler) GetContractAddresses(w http.ResponseWriter, r *http.Request) {
++	respondJSON(w, http.StatusOK, map[string]string{
++		"exchange":       PolymarketExchange.Hex(),
++		"neg_risk":       PolymarketNegRisk.Hex(),
++		"usdc":           PolymarketUSDC.Hex(),
++		"ctf":            PolymarketCTF.Hex(),
++		"relayer":        PolymarketRelayerURL,
++	})
++}
++
++func (h *OnboardHandler) isSafeDeployed(ctx context.Context, safeAddr common.Address) (bool, error) {
++	url := fmt.Sprintf("%s/deployed?address=%s", h.relayerURL, safeAddr.Hex())
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		return false, err
++	}
++
++	resp, err := h.httpClient.Do(req)
++	if err != nil {
++		return false, err
++	}
++	defer resp.Body.Close()
++
++	var result struct {
++		Deployed bool `json:"deployed"`
++	}
++	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
++		return false, err
++	}
++	return result.Deployed, nil
++}
++
++// checkERC20Allowance checks if owner has approved spender for any amount of the token.
++func (h *OnboardHandler) checkERC20Allowance(ctx context.Context, token, owner, spender common.Address) bool {
++	// allowance(address,address) selector
++	selector := crypto.Keccak256([]byte("allowance(address,address)"))[:4]
++	data := make([]byte, 0, 68)
++	data = append(data, selector...)
++	data = append(data, common.LeftPadBytes(owner.Bytes(), 32)...)
++	data = append(data, common.LeftPadBytes(spender.Bytes(), 32)...)
++
++	result, err := h.ethCall(ctx, token, data)
++	if err != nil {
++		log.Printf("[polymarket] checkERC20Allowance error: %v", err)
++		return false
++	}
++
++	allowance := new(big.Int).SetBytes(result)
++	return allowance.Sign() > 0
++}
++
++// checkCTFApproval checks if owner has setApprovalForAll for operator on the CTF contract.
++func (h *OnboardHandler) checkCTFApproval(ctx context.Context, ctfAddr, owner, operator common.Address) bool {
++	// isApprovedForAll(address,address) selector
++	selector := crypto.Keccak256([]byte("isApprovedForAll(address,address)"))[:4]
++	data := make([]byte, 0, 68)
++	data = append(data, selector...)
++	data = append(data, common.LeftPadBytes(owner.Bytes(), 32)...)
++	data = append(data, common.LeftPadBytes(operator.Bytes(), 32)...)
++
++	result, err := h.ethCall(ctx, ctfAddr, data)
++	if err != nil {
++		log.Printf("[polymarket] checkCTFApproval error: %v", err)
++		return false
++	}
++
++	return new(big.Int).SetBytes(result).Int64() == 1
++}
++
++// ethCall performs a read-only eth_call against a Polygon RPC.
++func (h *OnboardHandler) ethCall(ctx context.Context, to common.Address, calldata []byte) ([]byte, error) {
++	rpcURL := os.Getenv("POLYGON_RPC_URL")
++	if rpcURL == "" {
++		rpcURL = "https://polygon.drpc.org"
++	}
++
++	payload := fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"%s","data":"0x%x"},"latest"],"id":1}`,
++		to.Hex(), calldata)
++
++	req, err := http.NewRequestWithContext(ctx, "POST", rpcURL, bytesReader([]byte(payload)))
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++
++	resp, err := h.httpClient.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, err
++	}
++
++	var rpcResp struct {
++		Result string          `json:"result"`
++		Error  json.RawMessage `json:"error"`
++	}
++	if err := json.Unmarshal(body, &rpcResp); err != nil {
++		return nil, fmt.Errorf("bad rpc response: %s", string(body))
++	}
++	if len(rpcResp.Error) > 0 && string(rpcResp.Error) != "null" {
++		return nil, fmt.Errorf("rpc error: %s", string(rpcResp.Error))
++	}
++
++	return common.FromHex(rpcResp.Result), nil
++}
++
++// jsonReader wraps bytes in a reader for http request body
++func jsonReader(data []byte) io.Reader {
++	return io.NopCloser(bytesReader(data))
++}
++
++type bytesReaderImpl struct {
++	data []byte
++	pos  int
++}
++
++func bytesReader(data []byte) *bytesReaderImpl {
++	return &bytesReaderImpl{data: data}
++}
++
++func (r *bytesReaderImpl) Read(p []byte) (n int, err error) {
++	if r.pos >= len(r.data) {
++		return 0, io.EOF
++	}
++	n = copy(p, r.data[r.pos:])
++	r.pos += n
++	return
++}
+diff --git a/api/internal/polymarket/sdk.go b/api/internal/polymarket/sdk.go
+new file mode 100644
+index 0000000..5ae82db
+--- /dev/null
++++ b/api/internal/polymarket/sdk.go
+@@ -0,0 +1,281 @@
++package polymarket
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"strconv"
++
++	polymarket "github.com/GoPolymarket/polymarket-go-sdk"
++	"github.com/GoPolymarket/polymarket-go-sdk/pkg/auth"
++	"github.com/GoPolymarket/polymarket-go-sdk/pkg/bridge"
++	"github.com/GoPolymarket/polymarket-go-sdk/pkg/clob/clobtypes"
++	"github.com/GoPolymarket/polymarket-go-sdk/pkg/data"
++	"github.com/ethereum/go-ethereum/common"
++)
++
++// SDKClientFactory creates real Polymarket SDK clients from per-request credentials.
++type SDKClientFactory struct{}
++
++func NewSDKClientFactory() *SDKClientFactory {
++	return &SDKClientFactory{}
++}
++
++// NewClient creates an ephemeral Polymarket SDK client.
++// For public endpoints (empty credentials), returns an unauthenticated client.
++// For authenticated endpoints, creates a client with L2 (HMAC) auth via API key.
++func (f *SDKClientFactory) NewClient(apiKey, secret, passphrase string) (PolymarketClient, error) {
++	client := polymarket.NewClient()
++
++	if apiKey != "" && secret != "" && passphrase != "" {
++		creds := &auth.APIKey{
++			Key:        apiKey,
++			Secret:     secret,
++			Passphrase: passphrase,
++		}
++		// nil signer is fine — L2 operations (orders, cancel, balances) use HMAC auth
++		// from the API key, not EIP-712 signatures. The signer is only needed for L1
++		// operations like creating API keys, which we handle via the auth relay endpoint.
++		client = client.WithAuth(nil, creds)
++	}
++
++	return &sdkClient{client: client}, nil
++}
++
++// safeSignatureType is Gnosis Safe (2). Polymarket uses Safe wallets for all
++// new accounts, so balance/order queries need this signature type to hit the
++// correct wallet.
++var safeSignatureType = int(auth.SignatureGnosisSafe)
++
++type sdkClient struct {
++	client *polymarket.Client
++}
++
++// ListMarkets fetches markets from Polymarket's CLOB API.
++func (c *sdkClient) ListMarkets(ctx context.Context, nextCursor string) (*MarketsResponse, error) {
++	req := &clobtypes.MarketsRequest{
++		Limit: 100,
++	}
++	if nextCursor != "" {
++		req.Cursor = nextCursor
++	}
++
++	resp, err := c.client.CLOB.Markets(ctx, req)
++	if err != nil {
++		return nil, fmt.Errorf("polymarket markets: %w", err)
++	}
++
++	markets := make([]PolymarketMarket, len(resp.Data))
++	for i, m := range resp.Data {
++		vol, _ := strconv.ParseFloat(m.Volume, 64)
++		tokens := make([]Token, len(m.Tokens))
++		for j, t := range m.Tokens {
++			tokens[j] = Token{
++				TokenID: t.TokenID,
++				Outcome: t.Outcome,
++				Price:   t.Price,
++			}
++		}
++		markets[i] = PolymarketMarket{
++			ConditionID: m.ConditionID,
++			Question:    m.Question,
++			EndDate:     m.EndDate,
++			Volume:      vol,
++			Active:      m.Active,
++			Closed:      m.Closed,
++			Tokens:      tokens,
++		}
++	}
++
++	return &MarketsResponse{
++		Markets:    markets,
++		NextCursor: resp.NextCursor,
++	}, nil
++}
++
++// GetOrderBook fetches the L2 orderbook for a token.
++func (c *sdkClient) GetOrderBook(ctx context.Context, tokenID string) (*OrderBookResponse, error) {
++	req := &clobtypes.BookRequest{
++		TokenID: tokenID,
++	}
++
++	resp, err := c.client.CLOB.OrderBook(ctx, req)
++	if err != nil {
++		return nil, fmt.Errorf("polymarket orderbook: %w", err)
++	}
++
++	bids := make([]RawPriceLevel, len(resp.Bids))
++	for i, b := range resp.Bids {
++		bids[i] = RawPriceLevel{Price: b.Price, Size: b.Size}
++	}
++	asks := make([]RawPriceLevel, len(resp.Asks))
++	for i, a := range resp.Asks {
++		asks[i] = RawPriceLevel{Price: a.Price, Size: a.Size}
++	}
++
++	return &OrderBookResponse{Bids: bids, Asks: asks}, nil
++}
++
++// CreateOrder submits a pre-signed order to Polymarket via PostOrder.
++// The order must be signed client-side — Turbine never has access to private keys.
++func (c *sdkClient) CreateOrder(ctx context.Context, order CreateOrderRequest) (*OrderResponse, error) {
++	if len(order.SignedOrder) == 0 {
++		return nil, fmt.Errorf("signed_order is required: client must sign the order locally and include the full signed payload")
++	}
++
++	var signedOrder clobtypes.SignedOrder
++	if err := json.Unmarshal(order.SignedOrder, &signedOrder); err != nil {
++		return nil, fmt.Errorf("invalid signed_order: %w", err)
++	}
++
++	resp, err := c.client.CLOB.WithSignatureType(auth.SignatureGnosisSafe).PostOrder(ctx, &signedOrder)
++	if err != nil {
++		return nil, fmt.Errorf("polymarket post order: %w", err)
++	}
++
++	return &OrderResponse{
++		ID:        resp.ID,
++		Status:    resp.Status,
++		TokenID:   resp.AssetID,
++		Side:      resp.Side,
++		Price:     resp.Price,
++		Size:      resp.OriginalSize,
++		OrderType: resp.OrderType,
++	}, nil
++}
++
++// CancelOrder cancels an order on Polymarket.
++func (c *sdkClient) CancelOrder(ctx context.Context, orderID string) error {
++	req := &clobtypes.CancelOrderRequest{
++		OrderID: orderID,
++	}
++
++	_, err := c.client.CLOB.WithSignatureType(auth.SignatureGnosisSafe).CancelOrder(ctx, req)
++	if err != nil {
++		return fmt.Errorf("polymarket cancel order: %w", err)
++	}
++	return nil
++}
++
++// GetOpenOrders fetches the user's open orders from their Safe wallet.
++func (c *sdkClient) GetOpenOrders(ctx context.Context) ([]*OrderResponse, error) {
++	resp, err := c.client.CLOB.WithSignatureType(auth.SignatureGnosisSafe).Orders(ctx, &clobtypes.OrdersRequest{})
++	if err != nil {
++		return nil, fmt.Errorf("polymarket orders: %w", err)
++	}
++
++	orders := make([]*OrderResponse, len(resp.Data))
++	for i, o := range resp.Data {
++		orders[i] = &OrderResponse{
++			ID:        o.ID,
++			Status:    o.Status,
++			TokenID:   o.AssetID,
++			Side:      o.Side,
++			Price:     o.Price,
++			Size:      o.OriginalSize,
++			OrderType: o.OrderType,
++		}
++	}
++	return orders, nil
++}
++
++// GetBalances fetches the user's USDC (collateral) balance from their Safe wallet.
++func (c *sdkClient) GetBalances(ctx context.Context) ([]*BalanceResponse, error) {
++	req := &clobtypes.BalanceAllowanceRequest{
++		AssetType:     clobtypes.AssetTypeCollateral,
++		SignatureType: &safeSignatureType,
++	}
++
++	resp, err := c.client.CLOB.WithSignatureType(auth.SignatureGnosisSafe).BalanceAllowance(ctx, req)
++	if err != nil {
++		return nil, fmt.Errorf("polymarket balance: %w", err)
++	}
++
++	return []*BalanceResponse{
++		{
++			TokenID: "USDC",
++			Balance: resp.Balance,
++		},
++	}, nil
++}
++
++// GetPositions fetches user's open positions from Polymarket's Data API.
++// Automatically derives the Safe wallet from the EOA since Polymarket stores
++// positions in Safe wallets, not EOAs.
++func (c *sdkClient) GetPositions(ctx context.Context, walletAddress string) ([]*PositionResponse, error) {
++	eoa := common.HexToAddress(walletAddress)
++
++	// Derive Safe wallet — positions live here, not on the EOA
++	safeAddr, err := auth.DeriveSafeWallet(eoa)
++	if err != nil {
++		// Fallback to EOA if derivation fails
++		safeAddr = eoa
++	}
++
++	resp, err := c.client.Data.Positions(ctx, &data.PositionsRequest{
++		User: safeAddr,
++	})
++	if err != nil {
++		return nil, fmt.Errorf("polymarket positions: %w", err)
++	}
++
++	positions := make([]*PositionResponse, len(resp))
++	for i, p := range resp {
++		positions[i] = &PositionResponse{
++			ConditionID:  p.ConditionID.Hex(),
++			Asset:        p.Asset.String(),
++			Size:         p.Size.String(),
++			AvgPrice:     p.AvgPrice.String(),
++			CurrentValue: p.CurrentValue.String(),
++			InitialValue: p.InitialValue.String(),
++			PnL:          p.CashPnl.String(),
++			PnLPercent:   p.PercentPnl.String(),
++			Outcome:      p.Outcome,
++			Title:        p.Title,
++			Redeemable:   p.Redeemable,
++		}
++	}
++	return positions, nil
++}
++
++// GetDepositAddress returns the Polymarket deposit address for a wallet.
++func (c *sdkClient) GetDepositAddress(ctx context.Context, walletAddress string) (*DepositAddressResponse, error) {
++	resp, err := c.client.Bridge.DepositAddress(ctx, &bridge.DepositRequest{
++		Address: walletAddress,
++	})
++	if err != nil {
++		return nil, fmt.Errorf("polymarket deposit address: %w", err)
++	}
++
++	return &DepositAddressResponse{
++		EVM:  resp.Address.EVM,
++		SVM:  resp.Address.SVM,
++		BTC:  resp.Address.BTC,
++		Note: resp.Note,
++	}, nil
++}
++
++// GetDepositStatus returns deposit transaction status for a wallet.
++func (c *sdkClient) GetDepositStatus(ctx context.Context, walletAddress string) (*DepositStatusResponse, error) {
++	resp, err := c.client.Bridge.Status(ctx, &bridge.StatusRequest{
++		Address: walletAddress,
++	})
++	if err != nil {
++		return nil, fmt.Errorf("polymarket deposit status: %w", err)
++	}
++
++	txs := make([]DepositTransaction, len(resp.Transactions))
++	for i, t := range resp.Transactions {
++		txs[i] = DepositTransaction{
++			FromChainID: t.FromChainID,
++			FromToken:   t.FromTokenAddress,
++			FromAmount:  t.FromAmountBaseUnit,
++			ToChainID:   t.ToChainID,
++			ToToken:     t.ToTokenAddress,
++			Status:      t.Status,
++			TxHash:      t.TxHash,
++		}
++	}
++
++	return &DepositStatusResponse{Transactions: txs}, nil
++}

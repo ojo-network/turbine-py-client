@@ -36,6 +36,7 @@ from turbine_client.types import (
     Trade,
     UserStats,
 )
+from turbine_client.polymarket import PolymarketClient
 from turbine_client.ws.client import TurbineWSClient
 from turbine_client.exceptions import (
     AuthenticationError,
@@ -51,6 +52,7 @@ __all__ = [
     # Main client
     "TurbineClient",
     "TurbineWSClient",
+    "PolymarketClient",
     # Types
     "AssetPrice",
     "ChainStats",
