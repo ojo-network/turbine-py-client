@@ -9,9 +9,11 @@ argument-hint: "[bot-filename]"
 
 You are helping a user deploy their Turbine trading bot to Locus for 24/7 cloud operation.
 
-This skill authenticates with Locus using the user's existing Turbine wallet via x402 (Polygon USDC payment). No separate Locus API key is needed — the user's TURBINE_PRIVATE_KEY handles everything.
+This skill authenticates with Locus using the user's existing Turbine wallet via x402 (Polygon USDC payment). No separate Locus account or API key is needed — the wallet payment creates a workspace and returns a JWT that works for all API calls.
 
 Locus is a container platform that deploys services via a REST API. Each service costs $0.25/month from workspace credits. New workspaces start with $6.00 in credits (x402 sign-up costs 0.001 USDC). Services get an auto-subdomain at `svc-{id}.buildwithlocus.com` with HTTPS.
+
+**Auth flow:** x402 wallet payment (0.001 USDC) → creates workspace + JWT → use JWT for all API calls (projects, services, source upload, deployments).
 
 **API Documentation for Locus** `https://buildwithlocus.com/SKILL.md`
 
@@ -197,39 +199,51 @@ Run the x402 sign-up script:
 python scripts/locus_x402.py sign-up
 ```
 
-The script:
-1. POSTs to Locus's x402-sign-up endpoint
-2. Gets 402 response with payment requirements
-3. Signs an EIP-3009 USDC payment authorization with TURBINE_PRIVATE_KEY
-4. Retries with the signed payment
+The script performs the x402 handshake:
+1. POSTs to Locus's `/auth/x402-sign-up` endpoint with empty body `{}`
+2. Gets 402 response with `PAYMENT-REQUIRED` header (base64-encoded JSON with x402 V2 payment requirements in `accepts` array: scheme, network `eip155:137`, amount `1000`, USDC asset address, recipient `payTo` address)
+3. Signs an EIP-3009 `TransferWithAuthorization` typed-data message using TURBINE_PRIVATE_KEY (no on-chain tx needed)
+4. Retries the POST with the signed payment in the `PAYMENT-SIGNATURE` header (base64-encoded V2 PaymentPayload with `payload`, `accepted` echoing back the requirements)
 5. Returns a JWT (saved to /tmp/locus-token.txt) and workspace info
 
-**Parse the JSON output** to extract: `jwt`, `workspaceId`, `isNewWorkspace`, `claimUrl`, `creditBalance`.
+**Parse the JSON output** to extract: `jwt`, `workspaceId`, `isNewWorkspace`, `claimUrl`.
 
 Tell the user the result:
 - If `isNewWorkspace: true`: "Created new Locus workspace: {workspaceId}. Starting credit balance: $6.00."
 - If `isNewWorkspace: false`: "Reconnected to existing workspace: {workspaceId}."
 
-If the response includes a `claimUrl`, tell the user:
-"You can optionally link an email to your Locus workspace for a permanent API key:
-  {claimUrl}
-This isn't required — your wallet works for authentication."
+If the response includes a `claimUrl`, mention it as optional:
+> "You can optionally link an email to your workspace for free token refreshes and a permanent API key:
+>   {claimUrl}
+> This is NOT required — your wallet handles everything."
 
 If the script fails:
 - Check that TURBINE_PRIVATE_KEY is set correctly in .env
 - Ensure the wallet has at least 0.001 USDC on Polygon
 - Show the error output and STOP
 
+**Get the workspace ID:**
+
+```bash
+TOKEN=$(cat /tmp/locus-token.txt)
+
+WORKSPACE_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  https://api.buildwithlocus.com/v1/auth/whoami | jq -r '.workspaceId')
+
+echo "Workspace ID: $WORKSPACE_ID"
+```
+
+Save `WORKSPACE_ID` for later use.
+
 **Check billing balance:**
 
 ```bash
 TOKEN=$(cat /tmp/locus-token.txt)
 curl -s -H "Authorization: Bearer $TOKEN" \
-  $BASE_URL/billing/balance | jq '{creditBalance, totalServices, status}'
+  https://api.buildwithlocus.com/v1/billing/balance | jq '{creditBalance, totalServices, status}'
 ```
 
-If `creditBalance` < 0.25, offer x402 top-up:
-"Insufficient credits ($X.XX). Each service costs $0.25/month."
+New workspaces start with $6.00 in credits. If `creditBalance` < 0.25, offer x402 top-up:
 
 Use `AskUserQuestion` with options: "Top up $5 from wallet" / "Top up $1 from wallet" / "I'll add credits manually"
 
@@ -239,20 +253,49 @@ If they choose to top up:
 python scripts/locus_x402.py top-up <amount>
 ```
 
+The top-up also returns a fresh JWT (30-day expiry), which the script saves to `/tmp/locus-token.txt`.
+
 Tell the user: "Authenticated with Locus. Credit balance: $X.XX"
+
+**JWT refresh:** The JWT expires after 30 days. To refresh, either:
+- Call `python scripts/locus_x402.py sign-up` again (costs 0.001 USDC, returns new JWT for same workspace)
+- Call `python scripts/locus_x402.py top-up <amount>` (also returns a fresh JWT)
+- If they claimed their workspace: use `POST /v1/auth/exchange` with the `claw_` API key (free)
 
 ---
 
 ## Step 4: Create Project, Environment, and Service
 
-Run these API calls sequentially, communicating each step to the user:
+**IMPORTANT:** The claimed workspace may already have projects from a previous deployment. Always check for existing projects first before creating new ones.
 
-**Create a project:**
+### Check for existing projects:
 
 ```bash
 TOKEN=$(cat /tmp/locus-token.txt)
 
-PROJECT=$(curl -s -X POST $BASE_URL/projects \
+PROJECTS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  https://api.buildwithlocus.com/v1/projects)
+
+echo "$PROJECTS" | jq '.projects[] | {id, name}'
+```
+
+If a project named "turbine-bot" already exists, **reuse it**. Extract its `PROJECT_ID` and skip project creation. Also check its environments:
+
+```bash
+PROJECT_ID="<existing project id>"
+
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://api.buildwithlocus.com/v1/projects/$PROJECT_ID/environments" | jq '.environments[] | {id, name}'
+```
+
+If an environment exists, reuse it. Extract its `ENV_ID` and skip environment creation.
+
+### Create a project (only if none exists):
+
+```bash
+TOKEN=$(cat /tmp/locus-token.txt)
+
+PROJECT=$(curl -s -X POST https://api.buildwithlocus.com/v1/projects \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name": "turbine-bot", "description": "Turbine prediction market trading bot"}')
@@ -261,12 +304,10 @@ PROJECT_ID=$(echo $PROJECT | jq -r '.id')
 echo "Project ID: $PROJECT_ID"
 ```
 
-If the project creation fails, check the error. If a project named "turbine-bot" already exists, list projects and ask the user whether to reuse it or create a new one with a different name.
-
-**Create an environment:**
+### Create an environment (only if none exists):
 
 ```bash
-ENV=$(curl -s -X POST $BASE_URL/projects/$PROJECT_ID/environments \
+ENV=$(curl -s -X POST https://api.buildwithlocus.com/v1/projects/$PROJECT_ID/environments \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name": "production", "type": "production"}')
@@ -275,10 +316,12 @@ ENV_ID=$(echo $ENV | jq -r '.id')
 echo "Environment ID: $ENV_ID"
 ```
 
-**Create a service:**
+### Create a service (only if none exists):
+
+If service creation returns `"Service \"trading-bot\" already exists in this environment"`, the service already exists. You'll need the service ID for env vars and monitoring. Since there's no direct list-services endpoint, the service ID can be obtained from the deployment output in Step 6 (the git push response includes deployment details with `serviceId`). Alternatively, try creating the service and if it already exists, proceed to Step 5.
 
 ```bash
-SERVICE=$(curl -s -X POST $BASE_URL/services \
+SERVICE=$(curl -s -X POST https://api.buildwithlocus.com/v1/services \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -308,7 +351,7 @@ echo "Service URL: $SERVICE_URL"
 
 Tell the user:
 ```
-Project created: turbine-bot
+Project: turbine-bot
 Environment: production
 Service: trading-bot
 URL (once deployed): {SERVICE_URL}
@@ -379,60 +422,96 @@ If they choose to run locally, tell them to run `python {BOT_FILE}`, wait for it
 
 ---
 
-## Step 6: Deploy via Git Push
+## Step 6: Upload Source and Deploy
 
-Set up the Locus git remote and push the code.
+There are two ways to deploy code to Locus. **Try source upload first** (works with JWT, no extra account needed). If it fails, fall back to git push.
 
-**Get the workspace ID:**
+### Primary: Source Upload (JWT auth)
+
+Create a tar.gz archive of the deployment files, upload via API, then trigger a deployment:
 
 ```bash
+# Create source archive (exclude non-essential files)
+tar czf /tmp/turbine-bot-source.tar.gz \
+  --exclude='.venv' --exclude='__pycache__' --exclude='.git' \
+  --exclude='node_modules' --exclude='.env' --exclude='*.egg-info' \
+  --exclude='.DS_Store' --exclude='data' \
+  pyproject.toml turbine_client/ {BOT_FILE} locus_runner.py Dockerfile
+
 TOKEN=$(cat /tmp/locus-token.txt)
 
-WORKSPACE_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
-  $BASE_URL/auth/whoami | jq -r '.workspaceId')
+# Upload source
+UPLOAD=$(curl -s -X POST https://api.buildwithlocus.com/v1/sources/upload \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@/tmp/turbine-bot-source.tar.gz")
 
-echo "Workspace ID: $WORKSPACE_ID"
+S3_KEY=$(echo $UPLOAD | jq -r '.s3Key // .key // empty')
+echo "Source uploaded: $S3_KEY"
 ```
 
-**Add the Locus git remote:**
-
-Check if a `locus` remote already exists first. If it does, update it. If not, add it.
+If source upload succeeds, trigger a deployment:
 
 ```bash
-# Remove existing locus remote if present
+DEPLOY=$(curl -s -X POST https://api.buildwithlocus.com/v1/deployments \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"serviceId": "'"$SERVICE_ID"'", "source": {"type": "s3", "s3Key": "'"$S3_KEY"'"}}')
+
+DEPLOYMENT_ID=$(echo $DEPLOY | jq -r '.id')
+echo "Deployment triggered: $DEPLOYMENT_ID"
+```
+
+Clean up:
+```bash
+rm /tmp/turbine-bot-source.tar.gz
+```
+
+### Fallback: Git Push (requires `claw_` API key)
+
+If source upload fails with 403, the user needs a `claw_` API key for git push deployment. This requires claiming their workspace.
+
+Tell the user:
+> "Source upload isn't available for your account. To deploy via git push, you'll need to claim your Locus workspace.
+> Visit your claim URL: {claimUrl}
+> After claiming, you'll get a `claw_` API key. Paste it back here."
+
+Once they have the `claw_` key:
+
+```bash
+# Exchange claw_ key for JWT to get the workspace ID
+CLAW_KEY="<user's key>"
+CLAW_TOKEN=$(curl -s -X POST https://api.buildwithlocus.com/v1/auth/exchange \
+  -H "Content-Type: application/json" \
+  -d '{"apiKey": "'"$CLAW_KEY"'"}' | jq -r '.token')
+
+# IMPORTANT: The claimed workspace may differ from the x402 workspace.
+# Use the claw_ key's workspace and re-check for existing projects.
+CLAW_WORKSPACE=$(curl -s -H "Authorization: Bearer $CLAW_TOKEN" \
+  https://api.buildwithlocus.com/v1/auth/whoami | jq -r '.workspaceId')
+
+# If workspace differs, save the new JWT and re-run Steps 4-5 with it
+echo "$CLAW_TOKEN" > /tmp/locus-token.txt
+```
+
+Set up git remote and push:
+
+```bash
 git remote remove locus 2>/dev/null
+git remote add locus "https://x:${CLAW_KEY}@git.buildwithlocus.com/${CLAW_WORKSPACE}/${PROJECT_ID}.git"
 
-TOKEN=$(cat /tmp/locus-token.txt)
-git remote add locus "https://x:${TOKEN}@git.buildwithlocus.com/${WORKSPACE_ID}/${PROJECT_ID}.git"
-```
-
-**Important:** The deployment files (`locus_runner.py`, `Dockerfile`) and the bot file need to be committed before pushing — only tracked files are included in the git push archive. Create a commit with these files:
-
-```bash
+# Deployment files must be committed
 git add locus_runner.py Dockerfile {BOT_FILE}
 git commit -m "Add Locus deployment files"
-```
 
-**Push to deploy:**
-
-Tell the user: "Pushing code to Locus. This will upload the source and trigger a build. Builds typically take 3-7 minutes."
-
-```bash
 git push locus main
 ```
 
-If the push fails:
-- Authentication error → Your JWT may have expired. Refresh it:
-    ```bash
-    python scripts/locus_x402.py sign-up
-    TOKEN=$(cat /tmp/locus-token.txt)
-    git remote set-url locus "https://x:${TOKEN}@git.buildwithlocus.com/${WORKSPACE_ID}/${PROJECT_ID}.git"
-    git push locus main
-    ```
-- Branch error → Try `git push locus HEAD:main` if on a different branch
-- Remote error → Verify workspace and project IDs
+Extract the deployment ID from the push output:
+```
+  -> trading-bot [deploy_xxxxx]
+```
 
-After the push, note the deployment IDs from the push output.
+**IMPORTANT for redeployments:** When using git push, always push via `git push locus main` to redeploy. Do NOT use `POST /v1/deployments` alone — it does not include source code and will fail.
 
 ---
 
@@ -465,25 +544,42 @@ Keep the user informed at each check:
 - `building` → "Building Docker image from source..."
 - `deploying` → "Container is starting, running health checks..."
 - `healthy` → "Deployment is live!"
-- `failed` → Check logs and report the error
+- `failed` → **Don't panic — check the service runtime status first (see below)**
 
-**If deployment fails**, fetch the last logs:
+**IMPORTANT: "failed" deployment does NOT always mean the bot isn't running.** The ECS health check may time out during the initial credential registration and USDC approval phase (which can take 30-60 seconds), causing the deployment to be marked as "failed" even though the container is running successfully.
+
+**If deployment shows `failed`, check the actual service status:**
+
+```bash
+TOKEN=$(cat /tmp/locus-token.txt)
+
+# Check if the service is actually running
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://api.buildwithlocus.com/v1/services/$SERVICE_ID?include=runtime" | jq '.runtime_instances'
+
+# Check the public health endpoint directly
+curl -s -w "\nHTTP: %{http_code}\n" "https://svc-${SERVICE_ID#svc_}.buildwithlocus.com/health"
+```
+
+If `runtime_instances.status` is `"running"` and/or the health endpoint returns 200, **the bot IS running** despite the "failed" deployment status. Tell the user it's live and skip to Step 8.
+
+**If the service is genuinely not running**, fetch the deployment logs:
 
 ```bash
 TOKEN=$(cat /tmp/locus-token.txt)
 
 curl -s -H "Authorization: Bearer $TOKEN" \
-  "$BASE_URL/deployments/$DEPLOYMENT_ID" | jq '.lastLogs'
+  "https://api.buildwithlocus.com/v1/deployments/$DEPLOYMENT_ID/logs" | jq '.logs[-20:][].message'
 ```
 
 Common failure causes:
-- **Health check timeout:** The `/health` endpoint didn't respond in time. Check that `locus_runner.py` is starting the health server before the bot.
+- **Health check timeout during startup:** The bot's initial credential registration and USDC approval can take time. The health endpoint starts immediately but ECS may declare the task unhealthy before the bot stabilizes. This is usually recoverable — the container keeps running.
 - **Dependency install failed:** Missing packages in `pyproject.toml`.
 - **Dockerfile error:** Check the build logs for syntax issues.
 
 Help the user fix the issue and redeploy with another `git push locus main`.
 
-**IMPORTANT:** After deployment reaches `healthy`, the public URL may return 503 for up to 60 seconds while service discovery registers the container. This is normal. Tell the user to wait before testing the URL.
+**IMPORTANT:** After deployment reaches `healthy` (or the service shows as running), the public URL may return 503 for up to 60 seconds while service discovery registers the container. This is normal. Tell the user to wait before testing the URL.
 
 ---
 
@@ -543,21 +639,18 @@ Track your bot's performance on the leaderboard:
 
 If the user wants to redeploy after making changes to their bot:
 
+**If using source upload (primary path):**
+1. Make changes to the bot file
+2. Re-run Step 6 source upload (create new tar.gz, upload, trigger deployment)
+3. The JWT may need refreshing if >30 days old: `python scripts/locus_x402.py sign-up`
+
+**If using git push (fallback path):**
 1. Make changes to the bot file
 2. Commit the changes: `git add {BOT_FILE} && git commit -m "Update trading strategy"`
 3. Push to Locus: `git push locus main`
 4. Monitor the deployment as in Step 7
 
 The service URL stays the same — Locus does a rolling update with zero downtime.
-
-**If git push fails with authentication error:**
-Your JWT may have expired (30-day lifetime). Refresh it:
-```bash
-python scripts/locus_x402.py sign-up
-TOKEN=$(cat /tmp/locus-token.txt)
-git remote set-url locus "https://x:${TOKEN}@git.buildwithlocus.com/${WORKSPACE_ID}/${PROJECT_ID}.git"
-git push locus main
-```
 
 ---
 

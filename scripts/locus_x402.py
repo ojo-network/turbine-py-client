@@ -42,13 +42,24 @@ def _load_private_key() -> str:
 
 
 def _sign_transfer_authorization(
-    account, recipient: str, value: int, asset: str
+    account, accept: dict
 ) -> dict:
-    """Sign an EIP-3009 TransferWithAuthorization typed-data message.
+    """Sign an EIP-3009 TransferWithAuthorization and build x402 V2 payload.
 
-    Follows the same pattern as turbine_client/client.py:1353-1403
-    but uses TransferWithAuthorization instead of Permit.
+    Args:
+        account: eth_account Account object.
+        accept: The selected entry from the 402 response's "accepts" array.
+
+    Returns:
+        Complete x402 V2 PaymentPayload dict ready for base64 encoding.
     """
+    recipient = accept["payTo"]
+    amount = int(accept["amount"])
+    asset = accept["asset"]
+    extra = accept.get("extra", {})
+    name = extra.get("name", USDC_NAME)
+    version = extra.get("version", USDC_VERSION)
+
     nonce = "0x" + secrets.token_hex(32)  # EIP-3009 uses random bytes32 nonce
     valid_after = 0
     valid_before = int(time.time()) + 3600  # 1 hour
@@ -72,15 +83,15 @@ def _sign_transfer_authorization(
         },
         "primaryType": "TransferWithAuthorization",
         "domain": {
-            "name": USDC_NAME,
-            "version": USDC_VERSION,
+            "name": name,
+            "version": version,
             "chainId": POLYGON_CHAIN_ID,
             "verifyingContract": asset,
         },
         "message": {
             "from": account.address,
             "to": recipient,
-            "value": value,
+            "value": amount,
             "validAfter": valid_after,
             "validBefore": valid_before,
             "nonce": nonce,
@@ -89,21 +100,21 @@ def _sign_transfer_authorization(
 
     signed = Account.sign_typed_data(account.key, full_message=typed_data)
 
+    # x402 V2 PaymentPayload: must include "accepted" echoing back the requirements
     return {
         "x402Version": 2,
-        "scheme": "exact",
-        "network": "eip155:137",
         "payload": {
             "signature": "0x" + signed.signature.hex(),
             "authorization": {
                 "from": account.address,
                 "to": recipient,
-                "value": str(value),
+                "value": str(amount),
                 "validAfter": str(valid_after),
                 "validBefore": str(valid_before),
                 "nonce": nonce,
             },
         },
+        "accepted": accept,
     }
 
 
@@ -128,20 +139,19 @@ def _x402_handshake(endpoint: str, body: dict, private_key: str) -> dict:
         print(f"Headers: {dict(resp.headers)}", file=sys.stderr)
         sys.exit(1)
 
+    # x402 V2: payment options are in the "accepts" array
     requirements = json.loads(base64.b64decode(raw))
-    recipient = requirements["recipient"]
-    amount = int(requirements["maxAmountRequired"])
-    asset = requirements["asset"]
+    accept = requirements["accepts"][0]
 
-    # Sign EIP-3009 TransferWithAuthorization
-    payment = _sign_transfer_authorization(account, recipient, amount, asset)
+    # Sign EIP-3009 TransferWithAuthorization and build V2 payload
+    payment = _sign_transfer_authorization(account, accept)
     payment_header = base64.b64encode(json.dumps(payment).encode()).decode()
 
-    # Retry with signed payment
+    # Retry with signed payment in PAYMENT-SIGNATURE header
     resp = httpx.post(
         f"{BASE_URL}{endpoint}",
         json=body,
-        headers={"payment-signature": payment_header},
+        headers={"PAYMENT-SIGNATURE": payment_header},
         timeout=30,
     )
 
