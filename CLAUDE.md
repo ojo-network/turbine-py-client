@@ -2,7 +2,7 @@
 
 ## What Turbine Is
 
-Turbine is a trustless prediction markets platform built by Ojo. It lets anyone trade on whether BTC, ETH, SOL, or XRP will go up or down across multiple timeframes (15-minute and 1-hour markets).
+Turbine is a trustless prediction markets platform built by Ojo. It lets anyone trade on whether BTC, ETH, SOL, XRP, or OIL will go up or down across multiple timeframes (15-minute, 1-hour, and daily markets).
 
 Markets open on a rolling schedule with a simple question: *"Will BTC be above $97,250 at 3:15 PM?"* Traders buy shares that represent their answer:
 
@@ -13,7 +13,7 @@ Shares are priced between $0.01 and $0.99, reflecting the market's confidence in
 
 **A concrete example:** You think BTC will stay above the strike. You buy a YES share at $0.60. If BTC ends above the strike, you get $1.00 back — a $0.40 profit. If it drops below, you lose your $0.60. The further the price is from 50/50, the cheaper the bet but the less likely you are to win.
 
-**Currently live:** BTC, ETH, SOL, and XRP Quick Markets in both 15-minute and 1-hour intervals.
+**Currently live:** BTC, ETH, SOL, and XRP Quick Markets in 15-minute and 1-hour intervals, plus OIL (crude oil) daily markets.
 
 **Platform:** https://beta.turbinefi.com (in beta)
 
@@ -72,10 +72,10 @@ The typical user journey:
 2. Clone this repo and set up a Python environment
 3. Create a crypto wallet (MetaMask), configure `.env` with their private key
 4. Fund the wallet with USDC (~$10 minimum on Polygon mainnet)
-5. Use Claude Code (via the `/market-maker` skill) to generate a trading bot
+5. Use Claude Code (via `/create-bot` or `/create-liquidity-bot`) to generate a trading bot
 6. Run the bot — it trades automatically, switching to new markets as intervals rotate
 7. Compete in weekly PnL competitions or hackathon events
-8. Optionally deploy to Railway for 24/7 operation (`/railway-deploy`)
+8. Optionally deploy to the cloud for 24/7 operation (`/locus-deploy` or `/railway-deploy`)
 
 ## Who Uses This
 
@@ -123,7 +123,10 @@ docs/                        # Documentation
 tests/                       # SDK test suite (pytest)
 scripts/                     # Deployment and setup scripts
 .claude/skills/              # Claude Code skills
-  market-maker/SKILL.md      # /market-maker — generate a new trading bot
+  setup/SKILL.md             # /setup — environment, wallet, credentials setup
+  create-bot/SKILL.md        # /create-bot — generate a directional trading bot
+  create-liquidity-bot/SKILL.md  # /create-liquidity-bot — generate a market maker bot
+  locus-deploy/SKILL.md      # /locus-deploy — deploy bot to Locus ($0.25/mo)
   railway-deploy/SKILL.md    # /railway-deploy — deploy bot to Railway
 ```
 
@@ -180,7 +183,7 @@ No native gas tokens (MATIC, AVAX) are needed. Everything is gasless. Default bo
 > **Note:** Taker orders (orders that fill immediately against resting orders) must be at least **$1 USDC** (size × price ≥ $1). Maker orders (resting limit orders that provide liquidity) have no minimum. The API enforces this — the SDK does not.
 
 ### 4. Build a Bot
-The fastest path is the `/market-maker` skill — it walks the user through algorithm selection and generates a complete trading bot.
+The fastest path is the `/create-bot` skill — it walks the user through algorithm selection and generates a complete trading bot. For market making strategies, use `/create-liquidity-bot`.
 
 Alternatively, they can study `examples/price_action_bot.py` directly. This is the canonical reference implementation: 787 lines covering every aspect of the bot lifecycle (credentials, market management, USDC approval, order execution, position tracking, claiming winnings).
 
@@ -192,7 +195,9 @@ python my_bot.py
 ```
 Once running, the bot handles everything automatically: connects to the current markets for all configured assets and intervals, approves USDC (one-time gasless permit), places trades based on its algorithm, switches to new markets as they rotate, and claims winnings when markets resolve. The user can walk away.
 
-For 24/7 operation without keeping a laptop open, use `/railway-deploy` to deploy to Railway (free $5 credit for 30 days).
+For 24/7 operation without keeping a laptop open, deploy to the cloud:
+- `/locus-deploy` — deploy to Locus ($0.25/month from workspace credits, new accounts start with $1.00)
+- `/railway-deploy` — deploy to Railway (free $5 credit for 30 days)
 
 ## Helping a User Build a Strategy
 
@@ -246,6 +251,7 @@ Outcome.YES = 0, Outcome.NO = 1
 # Public (no auth required)
 client.get_quick_market("BTC")           # Current 15-min market
 client.get_quick_market("BTC", interval=60)  # Current 1-hour market
+client.get_quick_market("OIL", interval=1440)  # Current daily OIL market
 client.get_orderbook(market_id)          # Orderbook snapshot
 client.get_trades(market_id)             # Recent trades
 client.get_markets()                     # All markets
@@ -275,14 +281,14 @@ client.batch_claim_winnings(addrs)       # Claim from multiple markets at once
 
 For a deeper explanation aimed at newcomers, see `docs/prediction-markets.md`.
 
-- **Market:** A binary question about an asset's price over a fixed interval (15-min or 1-hour). New markets open on each interval's schedule. Each market has a unique `market_id` (hex string) that changes on rotation.
+- **Market:** A binary question about an asset's price over a fixed interval (15-min, 1-hour, or daily). New markets open on each interval's schedule. Each market has a unique `market_id` (hex string) that changes on rotation.
 - **Strike price:** The asset price threshold set when the market opens. If the asset ends above it, YES wins. Below, NO wins. This is the anchor that every trading decision revolves around.
 - **Settlement address:** The on-chain contract that holds USDC collateral and executes trades. There's one per chain, shared across all markets. Requires a one-time gasless approval before the bot can trade.
 - **Contract address:** A per-market contract for outcome tokens (ERC1155). Only needed when claiming winnings after a market resolves — not during trading.
 - **Gasless:** The SDK is fully API-routed — all operations (approvals, claims, balance checks) go through Turbine's API, which handles on-chain submission via a relayer. Users sign messages with their private key (free, off-chain) and never need RPC access, web3, or native gas tokens (no ETH, MATIC, or AVAX). Only USDC is needed.
 - **USDC approval:** A one-time gasless EIP-2612 permit via the API's `/relayer/usdc-permit` endpoint. Returns a dict with `tx_hash`. Once approved, all future orders on that chain reuse the allowance. No per-trade approval overhead.
 - **UMA Oracle:** The decentralized oracle that resolves markets. After a market expires, UMA checks BTC's price and declares whether YES or NO wins. This is trustless — no single party controls the outcome.
-- **Pyth Network:** Provides real-time BTC price data. This is the same feed Turbine uses for market resolution, which is why the Price Action strategy (which trades based on Pyth data) is recommended — the bot's signal aligns with how winners are determined.
+- **Pyth Network:** Provides real-time price data for all assets (BTC, ETH, SOL, XRP, OIL). This is the same feed Turbine uses for market resolution, which is why the Price Action strategy (which trades based on Pyth data) is recommended — the bot's signal aligns with how winners are determined.
 
 ## Files to Never Modify
 

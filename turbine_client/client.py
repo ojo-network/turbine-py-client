@@ -19,6 +19,7 @@ from turbine_client.discovery import (
 )
 from turbine_client.types import (
     AssetPrice,
+    BotMetadata,
     ClaimablePosition,
     FailedClaim,
     FailedTrade,
@@ -413,7 +414,10 @@ class TurbineClient:
     # =========================================================================
 
     def create_order(
-        self, order_args: OrderArgs, settlement_address: Optional[str] = None
+        self,
+        order_args: OrderArgs,
+        settlement_address: Optional[str] = None,
+        bot_metadata: Optional[BotMetadata] = None,
     ) -> SignedOrder:
         """Create and sign an order.
 
@@ -421,6 +425,7 @@ class TurbineClient:
             order_args: The order arguments.
             settlement_address: Optional settlement contract address. If not provided,
                                will be fetched from the market.
+            bot_metadata: Optional Bot Studio metadata (bot_id and extra_fee_bps).
 
         Returns:
             A signed order ready for submission.
@@ -436,9 +441,11 @@ class TurbineClient:
             market = self.get_market(order_args.market_id)
             settlement_address = market.settlement_address
 
-        return self._order_builder.create_order_from_args(
+        signed_order = self._order_builder.create_order_from_args(
             order_args, settlement_address=settlement_address
         )
+        signed_order.bot_metadata = bot_metadata
+        return signed_order
 
     def create_limit_buy(
         self,
@@ -448,6 +455,7 @@ class TurbineClient:
         size: int,
         expiration: Optional[int] = None,
         settlement_address: Optional[str] = None,
+        bot_metadata: Optional[BotMetadata] = None,
     ) -> SignedOrder:
         """Create a limit buy order.
 
@@ -459,6 +467,7 @@ class TurbineClient:
             expiration: Optional expiration timestamp.
             settlement_address: Optional settlement contract address. If not provided,
                                will be fetched from the market.
+            bot_metadata: Optional Bot Studio metadata (bot_id and extra_fee_bps).
 
         Returns:
             A signed buy order.
@@ -471,7 +480,7 @@ class TurbineClient:
             market = self.get_market(market_id)
             settlement_address = market.settlement_address
 
-        return self._order_builder.create_limit_buy(
+        signed_order = self._order_builder.create_limit_buy(
             market_id=market_id,
             outcome=outcome,
             price=price,
@@ -479,6 +488,8 @@ class TurbineClient:
             expiration=expiration,
             settlement_address=settlement_address,
         )
+        signed_order.bot_metadata = bot_metadata
+        return signed_order
 
     def create_limit_sell(
         self,
@@ -488,6 +499,7 @@ class TurbineClient:
         size: int,
         expiration: Optional[int] = None,
         settlement_address: Optional[str] = None,
+        bot_metadata: Optional[BotMetadata] = None,
     ) -> SignedOrder:
         """Create a limit sell order.
 
@@ -499,6 +511,7 @@ class TurbineClient:
             expiration: Optional expiration timestamp.
             settlement_address: Optional settlement contract address. If not provided,
                                will be fetched from the market.
+            bot_metadata: Optional Bot Studio metadata (bot_id and extra_fee_bps).
 
         Returns:
             A signed sell order.
@@ -511,7 +524,7 @@ class TurbineClient:
             market = self.get_market(market_id)
             settlement_address = market.settlement_address
 
-        return self._order_builder.create_limit_sell(
+        signed_order = self._order_builder.create_limit_sell(
             market_id=market_id,
             outcome=outcome,
             price=price,
@@ -519,6 +532,8 @@ class TurbineClient:
             expiration=expiration,
             settlement_address=settlement_address,
         )
+        signed_order.bot_metadata = bot_metadata
+        return signed_order
 
     # =========================================================================
     # Authenticated Endpoints (Requires Bearer Token)

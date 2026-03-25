@@ -68,6 +68,21 @@ class PermitSignature:
 
 
 @dataclass
+class BotMetadata:
+    """Metadata for Bot Studio bot orders."""
+
+    bot_id: str
+    extra_fee_bps: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for API submission."""
+        return {
+            "bot_id": self.bot_id,
+            "extra_fee_bps": self.extra_fee_bps,
+        }
+
+
+@dataclass
 class SignedOrder:
     """A signed order ready for submission."""
 
@@ -83,6 +98,7 @@ class SignedOrder:
     signature: str
     order_hash: str
     permit_signature: Optional["PermitSignature"] = None
+    bot_metadata: Optional["BotMetadata"] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for API submission."""
@@ -104,6 +120,8 @@ class SignedOrder:
         }
         if self.permit_signature:
             result["permitSignature"] = self.permit_signature.to_dict()
+        if self.bot_metadata:
+            result["bot_metadata"] = self.bot_metadata.to_dict()
         return result
 
 

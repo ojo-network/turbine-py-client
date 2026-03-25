@@ -12,6 +12,7 @@ from turbine_client.discovery import (
 )
 from turbine_client.types import (
     AssetPrice,
+    BotMetadata,
     ChainStats,
     ClaimablePosition,
     FailedClaim,
@@ -52,6 +53,7 @@ __all__ = [
     "TurbineClient",
     "TurbineWSClient",
     # Types
+    "BotMetadata",
     "AssetPrice",
     "ChainStats",
     "ClaimablePosition",
