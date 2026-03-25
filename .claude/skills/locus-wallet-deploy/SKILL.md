@@ -13,7 +13,7 @@ This skill authenticates with Locus using the user's existing Turbine wallet via
 
 Locus is a container platform that deploys services via a REST API. Each service costs $0.25/month from workspace credits. New workspaces start with $6.00 in credits (x402 sign-up costs 0.001 USDC). Services get an auto-subdomain at `svc-{id}.buildwithlocus.com` with HTTPS.
 
-**Auth flow:** x402 wallet payment (0.001 USDC) → creates workspace + JWT → use JWT for all API calls (projects, services, source upload, deployments).
+**Auth flow:** x402 wallet payment (0.001 USDC) → creates workspace + JWT → use JWT for all API calls AND git push deployment.
 
 **API Documentation for Locus** `https://buildwithlocus.com/SKILL.md`
 
@@ -257,16 +257,15 @@ The top-up also returns a fresh JWT (30-day expiry), which the script saves to `
 
 Tell the user: "Authenticated with Locus. Credit balance: $X.XX"
 
-**JWT refresh:** The JWT expires after 30 days. To refresh, either:
+**JWT refresh:** The JWT expires after 30 days. To refresh:
 - Call `python scripts/locus_x402.py sign-up` again (costs 0.001 USDC, returns new JWT for same workspace)
 - Call `python scripts/locus_x402.py top-up <amount>` (also returns a fresh JWT)
-- If they claimed their workspace: use `POST /v1/auth/exchange` with the `claw_` API key (free)
 
 ---
 
 ## Step 4: Create Project, Environment, and Service
 
-**IMPORTANT:** The claimed workspace may already have projects from a previous deployment. Always check for existing projects first before creating new ones.
+**IMPORTANT:** The workspace may already have projects from a previous deployment. Always check for existing projects first before creating new ones.
 
 ### Check for existing projects:
 
@@ -422,96 +421,65 @@ If they choose to run locally, tell them to run `python {BOT_FILE}`, wait for it
 
 ---
 
-## Step 6: Upload Source and Deploy
+## Step 6: Deploy via Git Push
 
-There are two ways to deploy code to Locus. **Try source upload first** (works with JWT, no extra account needed). If it fails, fall back to git push.
+Deploy code to Locus using git push with the JWT from Step 3. No `claw_` API key or Locus account needed — the git server accepts JWTs directly.
 
-### Primary: Source Upload (JWT auth)
+**Add the Locus git remote:**
 
-Create a tar.gz archive of the deployment files, upload via API, then trigger a deployment:
+Use the `WORKSPACE_ID` and `PROJECT_ID` from earlier steps, and the JWT as the password:
 
 ```bash
-# Create source archive (exclude non-essential files)
-tar czf /tmp/turbine-bot-source.tar.gz \
-  --exclude='.venv' --exclude='__pycache__' --exclude='.git' \
-  --exclude='node_modules' --exclude='.env' --exclude='*.egg-info' \
-  --exclude='.DS_Store' --exclude='data' \
-  pyproject.toml turbine_client/ {BOT_FILE} locus_runner.py Dockerfile
-
 TOKEN=$(cat /tmp/locus-token.txt)
 
-# Upload source
-UPLOAD=$(curl -s -X POST https://api.buildwithlocus.com/v1/sources/upload \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "file=@/tmp/turbine-bot-source.tar.gz")
-
-S3_KEY=$(echo $UPLOAD | jq -r '.s3Key // .key // empty')
-echo "Source uploaded: $S3_KEY"
-```
-
-If source upload succeeds, trigger a deployment:
-
-```bash
-DEPLOY=$(curl -s -X POST https://api.buildwithlocus.com/v1/deployments \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"serviceId": "'"$SERVICE_ID"'", "source": {"type": "s3", "s3Key": "'"$S3_KEY"'"}}')
-
-DEPLOYMENT_ID=$(echo $DEPLOY | jq -r '.id')
-echo "Deployment triggered: $DEPLOYMENT_ID"
-```
-
-Clean up:
-```bash
-rm /tmp/turbine-bot-source.tar.gz
-```
-
-### Fallback: Git Push (requires `claw_` API key)
-
-If source upload fails with 403, the user needs a `claw_` API key for git push deployment. This requires claiming their workspace.
-
-Tell the user:
-> "Source upload isn't available for your account. To deploy via git push, you'll need to claim your Locus workspace.
-> Visit your claim URL: {claimUrl}
-> After claiming, you'll get a `claw_` API key. Paste it back here."
-
-Once they have the `claw_` key:
-
-```bash
-# Exchange claw_ key for JWT to get the workspace ID
-CLAW_KEY="<user's key>"
-CLAW_TOKEN=$(curl -s -X POST https://api.buildwithlocus.com/v1/auth/exchange \
-  -H "Content-Type: application/json" \
-  -d '{"apiKey": "'"$CLAW_KEY"'"}' | jq -r '.token')
-
-# IMPORTANT: The claimed workspace may differ from the x402 workspace.
-# Use the claw_ key's workspace and re-check for existing projects.
-CLAW_WORKSPACE=$(curl -s -H "Authorization: Bearer $CLAW_TOKEN" \
-  https://api.buildwithlocus.com/v1/auth/whoami | jq -r '.workspaceId')
-
-# If workspace differs, save the new JWT and re-run Steps 4-5 with it
-echo "$CLAW_TOKEN" > /tmp/locus-token.txt
-```
-
-Set up git remote and push:
-
-```bash
+# Remove existing locus remote if present
 git remote remove locus 2>/dev/null
-git remote add locus "https://x:${CLAW_KEY}@git.buildwithlocus.com/${CLAW_WORKSPACE}/${PROJECT_ID}.git"
 
-# Deployment files must be committed
+git remote add locus "https://x:${TOKEN}@git.buildwithlocus.com/${WORKSPACE_ID}/${PROJECT_ID}.git"
+```
+
+**Important:** The deployment files (`locus_runner.py`, `Dockerfile`) and the bot file need to be committed before pushing — only tracked files are included in the git push archive. Create a commit with these files:
+
+```bash
 git add locus_runner.py Dockerfile {BOT_FILE}
 git commit -m "Add Locus deployment files"
+```
 
+**Push to deploy:**
+
+Tell the user: "Pushing code to Locus. This will upload the source and trigger a build. Builds typically take 3-7 minutes."
+
+```bash
 git push locus main
 ```
 
-Extract the deployment ID from the push output:
+The push output includes deployment IDs. The output looks like:
 ```
   -> trading-bot [deploy_xxxxx]
 ```
 
-**IMPORTANT for redeployments:** When using git push, always push via `git push locus main` to redeploy. Do NOT use `POST /v1/deployments` alone — it does not include source code and will fail.
+Extract the deployment ID from this output. If you need the `SERVICE_ID` and don't have it yet (e.g., if the service already existed), query the deployment:
+
+```bash
+TOKEN=$(cat /tmp/locus-token.txt)
+DEPLOYMENT_ID="<from push output>"
+
+SERVICE_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://api.buildwithlocus.com/v1/deployments/$DEPLOYMENT_ID" | jq -r '.serviceId')
+```
+
+**If the push fails:**
+- **Authentication error (403):** The JWT may have expired (30-day lifetime). Refresh it and update the remote:
+    ```bash
+    python scripts/locus_x402.py sign-up
+    TOKEN=$(cat /tmp/locus-token.txt)
+    git remote set-url locus "https://x:${TOKEN}@git.buildwithlocus.com/${WORKSPACE_ID}/${PROJECT_ID}.git"
+    git push locus main
+    ```
+- **Branch error:** Try `git push locus HEAD:main` if on a different branch
+- **Remote error:** Verify workspace and project IDs
+
+**IMPORTANT for redeployments:** Always use `git push locus main` to redeploy. Do NOT use `POST /v1/deployments` alone — it does not include source code and will fail with a build error.
 
 ---
 
@@ -623,9 +591,9 @@ Useful commands:
 
   To refresh your Locus auth token (expires every 30 days):
     python scripts/locus_x402.py sign-up
-
-  To get a permanent Locus API key (optional):
-    Visit your claim URL (shown during first setup) to link an email.
+    # Then update the git remote with the new token:
+    TOKEN=$(cat /tmp/locus-token.txt)
+    git remote set-url locus "https://x:${TOKEN}@git.buildwithlocus.com/${WORKSPACE_ID}/${PROJECT_ID}.git"
 
 Locus costs $0.25/month per service from your credit balance.
 
@@ -639,18 +607,20 @@ Track your bot's performance on the leaderboard:
 
 If the user wants to redeploy after making changes to their bot:
 
-**If using source upload (primary path):**
-1. Make changes to the bot file
-2. Re-run Step 6 source upload (create new tar.gz, upload, trigger deployment)
-3. The JWT may need refreshing if >30 days old: `python scripts/locus_x402.py sign-up`
-
-**If using git push (fallback path):**
 1. Make changes to the bot file
 2. Commit the changes: `git add {BOT_FILE} && git commit -m "Update trading strategy"`
 3. Push to Locus: `git push locus main`
 4. Monitor the deployment as in Step 7
 
 The service URL stays the same — Locus does a rolling update with zero downtime.
+
+**If git push fails with 403**, the JWT may have expired. Refresh and update the remote:
+```bash
+python scripts/locus_x402.py sign-up
+TOKEN=$(cat /tmp/locus-token.txt)
+git remote set-url locus "https://x:${TOKEN}@git.buildwithlocus.com/${WORKSPACE_ID}/${PROJECT_ID}.git"
+git push locus main
+```
 
 ---
 
