@@ -662,13 +662,13 @@ class TurbineClient:
 
     def get_positions(
         self,
-        market_id: str,
+        market_address: str,
         user_address: Optional[str] = None,
     ) -> List[Position]:
         """Get positions for a market.
 
         Args:
-            market_id: The market ID.
+            market_address: The market contract address (e.g. qm.contract_address).
             user_address: Optional user address to filter.
 
         Returns:
@@ -678,7 +678,7 @@ class TurbineClient:
             AuthenticationError: If no auth is configured.
         """
         self._require_auth()
-        endpoint = ENDPOINTS["positions"].format(market_id=market_id)
+        endpoint = ENDPOINTS["positions"].format(market_address=market_address)
         params = {}
         if user_address:
             params["user"] = user_address
